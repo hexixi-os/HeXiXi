@@ -1,5 +1,8 @@
 # rCore（rCore-Tutorial-v3）本地部署说明
 
+> **历史记录**：这是 wonder-world 2026-11-04 在自己机器上的部署笔记，系统、用户名、路径都和现在不同（当前环境见 [开发环境版本](../dev-env-info.md)）。
+> 第四章「为了让它能编译改了什么」仍然有参考价值；其余部分仅供参考。当前的构建方法见 [BUILD.md](BUILD.md)。
+
 > 部署方式：WSL2 + Ubuntu 24.04，发行版装在 **D 盘**。
 > 部署日期：2026-11-04
 
@@ -10,7 +13,7 @@
 | WSL 发行版 | `Ubuntu-24.04`（WSL 2.7.12，内核 6.18） |
 | 虚拟磁盘 | `D:\wsl\Ubuntu-24.04\ext4.vhdx`（初始 1.4 GB，动态增长） |
 | 代码仓库 | WSL 内 `~/rCore-Tutorial-v3`（即 `\\wsl.localhost\Ubuntu-24.04\home\rc\rCore-Tutorial-v3`） |
-| 登录用户 | `rc`，密码 `Rcore#2026`（建议 `passwd` 改掉） |
+| 登录用户 | `rc`（密码已从文档中移除） |
 | 默认用户 | 已写入 `/etc/wsl.conf` 的 `[user] default=rc` |
 
 进入方式（PowerShell）：
