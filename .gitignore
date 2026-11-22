@@ -12,6 +12,7 @@ user/target/*
 user/.idea/*
 easy-fs/target/*
 easy-fs-fuse/target/*
-tools/
+tools/kflash.py
 pushall.sh
-.vscode/*.logkernel-rv
+.vscode/*.log
+kernel-rv
