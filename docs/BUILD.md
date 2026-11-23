@@ -1,7 +1,7 @@
 # 构建与运行
 
 这份讲环境安装、编译内核、在本地镜像上跑 usertests。
-评测测试盘的构建、运行和判分见 [开发与测试指南](开发与测试指南.md)。
+评测测试盘的构建、运行和判分见 [开发与测试指南](DEVELOPMENT.md)。
 
 ## 支持环境
 
@@ -104,7 +104,7 @@ touch user/src/bin/initproc.rs
 make -C os build
 ```
 
-已实测：usertests 能启动并跑一大批用例，但跑到 `race_adder_arg` 时内核会 panic，详见 [测试状态](测试状态.md)。
+已实测：usertests 能启动并跑一大批用例，但跑到 `race_adder_arg` 时内核会 panic，详见 [测试状态](TEST_STATUS.md)。
 不带 `TEST=1` 时 `initproc` 会启动 `user_shell`，这条路径 Martyr 没有实测。
 
 ## 常见问题

@@ -38,11 +38,12 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m <mem> -nographic -smp <sm
 - 盘里有 `lua` 和 `date.lua` 时，直接逐个 fork+exec `lua` 去跑每个 `.lua`，不走 `lua_testcode.sh`。
 - 盘里没有 `busybox` 时，退回内置的迷你 shell，只支持少量语法。
 
-盘是**平铺**布局：`busybox`、`*_testcode.sh`、各测试程序、`oscomp_runner` 都在根目录。
+**注意**：上面是 wonder-world 文档和本地模拟盘采用的**平铺**布局（`busybox`、`*_testcode.sh`、测试程序、`oscomp_runner` 都在根目录）。
+真实官方盘的根目录是 `musl/`、`glibc/`、`lib/`、`lib64/`，盘里没有 `oscomp_runner`，脚本标记带 `-musl`/`-glibc` 后缀，当前的 `oscomp_runner` 对接方式在真实盘上不成立。详见 [开发与测试指南](DEVELOPMENT.md) 第 6 节。
 
 ## 在本地复现
 
-构建、运行、判分的完整步骤见 [开发与测试指南](开发与测试指南.md)。当前各组的得分见 [测试状态](测试状态.md)。
+构建、运行、判分的完整步骤见 [开发与测试指南](DEVELOPMENT.md)。当前各组的得分见 [测试状态](TEST_STATUS.md)。
 
 ## 已知限制
 

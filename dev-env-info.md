@@ -1,6 +1,6 @@
 # 开发环境版本
 
-实测可用的组合（2026-11-22，WSL2）。安装步骤见 [docs/BUILD.md](docs/BUILD.md)，用法见 [docs/开发与测试指南.md](docs/开发与测试指南.md)。
+实测可用的组合（2026-11-22，WSL2）。安装步骤见 [docs/BUILD.md](docs/BUILD.md)，用法见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 
 | 组件 | 版本 |
 |---|---|

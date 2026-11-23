@@ -2,16 +2,27 @@
 
 最后更新：2026-11-22，测试人：Martyr。内核基于提交 `3bf874f`，加上 `fs/ext4.rs` 的稀疏文件修复（未提交）。
 
+## 先看这个：模拟盘分数不等于评测机分数
+
+下面的「Martyr 实测」都是在**本地模拟盘**（平铺布局，自建）上测的。Martyr 另外用官方 Docker 镜像生成了**真实官方盘**，并用当前内核按官方 QEMU 参数启动：
+
+- 内核能识别 EXT4 并列出根目录（`glibc`、`lib`、`lib64`、`musl`）。
+- 随后在 `os/src/task/mod.rs:190` panic（`Option::unwrap()` 为 `None`）：内核要从盘里读 `oscomp_runner` 或 `initproc`，官方盘根目录没有它们。**一个测试都没跑**。
+- `glibc` 目录读出 `ino=131073 size=0`，疑似读第二个块组的 inode 有问题，未确认。
+- glibc 那一套需要动态链接，内核不支持。
+
+所以**真实官方盘上的得分目前是 0**。差异对照和生成方法见 [开发与测试指南](DEVELOPMENT.md) 第 6 节。
+
 **怎么读这张表**：
 
 - 「Martyr 实测」是 Martyr 用官方判分方式跑出来的，可信。
-- 「wonder-world 记录」来自 [适配改动说明](适配改动说明.md) 第 17 章，是 wonder-world 在自己机器上的结果，**没有经 Martyr 复现**。而且那些数字多数只表示「脚本跑到了 END」，不等于得分，不要当成绩用。
+- 「wonder-world 记录」来自 [适配改动说明](ADAPTATION_NOTES.md) 第 17 章，是 wonder-world 在自己机器上的结果，**没有经 Martyr 复现**。而且那些数字多数只表示「脚本跑到了 END」，不等于得分，不要当成绩用。
 
 ## 总表
 
 | 组 | Martyr 实测 | wonder-world 记录（未复现） | 测试盘脚本 |
 |---|---|---|---|
-| basic | **96/102**（28/32 个用例满分） | 称 32/32 | 有，全套 |
+| basic | **96/102**（28/32 个用例满分，仅限本地模拟盘） | 称 32/32 | 有，全套 |
 | lua | 未测 | 称 9/9 | `build_lua.sh`（已写，没跑过） |
 | busybox | 未测 | 55 条命令 52 条成功 | 只有 `build_busybox.sh`（构建二进制），缺组盘脚本 |
 | libc-test | 未测 | 94 个用例，88 Pass | `build_libctest.sh`（旧脚本，路径没对齐 `env.sh`） |
@@ -26,7 +37,7 @@
 「旧脚本」指 wonder-world 留下的 4 个脚本，仍引用 `$HOME/rCore-Tutorial-v3` 和 `fsroot`，没有改成用 `tools/oscomp/env.sh`，Martyr 没试跑过。
 「缺」指仓库里没有这个脚本，wonder-world 的文档提到过但没提交。
 
-## basic 的 4 个失败（Martyr 实测）
+## basic 的 4 个失败（Martyr 实测，本地模拟盘）
 
 | 用例 | 得分 | 现象 |
 |---|---|---|
@@ -36,6 +47,8 @@
 | unlink | 1/2 | 输出了 `unlink error` |
 
 原因还没查。
+
+**结果不稳定**：同一张盘、同一个内核，连续 3 次运行中 2 次是 96/102，1 次是 92/102（`test_pipe` 得 0/4，断言 `[2, 3] (>=)` 失败）。`test_pipe` 存在偶发失败，原因未查，所以 96/102 只是典型值，不是确定值。
 
 ## 其他已知问题（Martyr 发现）
 

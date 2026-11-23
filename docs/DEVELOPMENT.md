@@ -1,6 +1,7 @@
 # 开发与测试指南
 
 所有命令都在 WSL 的 Ubuntu 里执行，仓库在 `~/HeXiXi`。Windows 里用 `wsl -d Ubuntu` 进入。
+各工具和测试套件的官方地址见 [参考链接](REFERENCES.md)。
 
 ## 1. 项目怎么运转
 
@@ -60,7 +61,7 @@ QEMU（RISC-V64，-machine virt）
 
 ## 4. 日常开发
 
-### 第一次：构建 basic 测试盘并打分
+### 第一次：构建 basic 本地模拟盘并打分
 
 ```bash
 cd ~/HeXiXi
@@ -68,10 +69,10 @@ tools/oscomp/setup.sh                 # 幂等，已有的会跳过
 tools/oscomp/build_runner.sh
 tools/oscomp/build_busybox.sh
 tools/oscomp/build_tests.sh
-tools/oscomp/make_official_image.sh   # 产出 ~/oscomp-work/official/disk.img
+tools/oscomp/make_local_image.sh   # 产出 ~/oscomp-work/local/disk.img
 make -C os build
-tools/oscomp/run_group.sh ~/oscomp-work/official/disk.img 256M 200 ~/oscomp-work/official/basic.log
-tools/oscomp/score_basic.sh ~/oscomp-work/official/basic.log
+tools/oscomp/run_group.sh ~/oscomp-work/local/disk.img 256M 200 ~/oscomp-work/local/basic.log
+tools/oscomp/score_basic.sh ~/oscomp-work/local/basic.log
 ```
 
 `run_group.sh` 参数依次是：磁盘镜像、内存、超时秒数、日志路径。它跑完会汇总组标记、是否正常关机、有没有 panic。
@@ -81,7 +82,7 @@ tools/oscomp/score_basic.sh ~/oscomp-work/official/basic.log
 | 改动 | 需要执行 |
 |---|---|
 | 内核（`os/`） | `make -C os build`，然后重新 `run_group.sh`，不用重新打盘 |
-| `oscomp_runner.rs` | `build_runner.sh`，再重新打盘（`make_official_image.sh` 等） |
+| `oscomp_runner.rs` | `build_runner.sh`，再重新打盘（`make_local_image.sh` 等） |
 | 测试程序或脚本 | 重新构建并打盘 |
 
 ### 调试
@@ -128,16 +129,72 @@ tools/oscomp/score_basic.sh ~/oscomp-work/official/basic.log
 
 **注意**：「跑到 END 标记」只说明脚本走完了，不等于得分。每组的真实得分要按上表的格式去数。目前只有 basic 有可靠的打分工具。
 
-## 6. 给新的测试组做盘
+## 6. 官方评测盘与本地模拟盘
+
+**我们日常测的是本地模拟盘，不是官方评测盘，两者有差异，模拟盘上的分数不等于评测机分数。**
+
+| 方面 | 官方评测盘 | 本地模拟盘 |
+|---|---|---|
+| 生成方式 | 官方 Docker 镜像里跑 `make`：`dd` 建 4 GB 文件，`mkfs.ext4`，挂载后 `cp -rL` | `mkfs.ext4 -d` 从目录生成，64 MB |
+| 根目录 | `musl/`、`glibc/`、`lib/`、`lib64/` 四个目录 | 平铺：脚本、程序、busybox 都在根目录 |
+| 脚本里的标记 | `#### OS COMP TEST GROUP START basic-musl ####`（带 `-musl`/`-glibc` 后缀） | 无后缀 |
+| `oscomp_runner` | 盘里没有 | 放在根目录 |
+| 编译器 | 容器里的 musl GCC 12.2 / glibc 交叉编译器 | musl.cc 的 GCC 11.2.1，只有 musl 一套 |
+| QEMU | 9.2.1，带网卡和第二块盘 `disk.img` | 10.2.1，只有一块盘 |
+
+官方的运行命令见 [oscomp-evaluation.md](oscomp-evaluation.md)。
+
+**当前内核在真实官方盘上起不来**：启动时找不到 `oscomp_runner`/`initproc`，在 `os/src/task/mod.rs:190` panic；另外 `glibc` 目录的 inode 读出来大小为 0，疑似读第二个块组的 inode 有问题。详见 [测试状态](TEST_STATUS.md)。
+
+### 生成真实官方盘
+
+需要 Docker Desktop（在 Windows 里运行，WSL 里没有装 docker）。构建产物约 1 GB 压缩、4 GB 解压，耗时十几分钟，注意 D 盘空间。官方套件 `~/testsuits` 要先用 `setup.sh` 准备好。
+
+```powershell
+docker pull alicesama/os-contest-image:v0.2
+docker volume create oscomp-code
+wsl -d Ubuntu -e bash -c "tar -C ~/testsuits --exclude=.git -cf - ." | docker run --rm -i -v oscomp-code:/code --entrypoint bash alicesama/os-contest-image:v0.2 -c "tar -C /code -xf -"
+```
+
+官方套件的 `iperf/` 目录没有 `Makefile`，官方 `clean` 会失败，所以先放一个只含空 `clean` 的占位文件，再跑官方 `make`（要 `--privileged`，因为要 `mount`）：
+
+```powershell
+docker run -d --name oscomp-build --privileged -v oscomp-code:/code -w /code --entrypoint bash alicesama/os-contest-image:v0.2 -c "printf 'clean:\n\t@true\n' > iperf/Makefile; make 2>&1 | tee /code/official-build.log; echo BUILD_EXIT=`${PIPESTATUS[0]} >> /code/official-build.log"
+```
+
+构建完成后日志末尾是 `BUILD_EXIT=0`，产物是卷里的 `/code/sdcard-riscv64.img.gz`。取回 WSL：
+
+```powershell
+docker run --rm -v oscomp-code:/code --entrypoint cat alicesama/os-contest-image:v0.2 /code/sdcard-riscv64.img.gz | wsl -d Ubuntu -e bash -c "mkdir -p ~/oscomp-work/official-real && cat > ~/oscomp-work/official-real/sdcard-riscv64.img.gz"
+```
+
+```bash
+cd ~/oscomp-work/official-real && gunzip -k sdcard-riscv64.img.gz
+truncate -s 64M disk.img       # 官方命令里的第二块盘，随便给个空文件
+qemu-system-riscv64 -machine virt -kernel ~/HeXiXi/os/target/riscv64gc-unknown-none-elf/release/os.bin   -m 1G -nographic -smp 1 -bios default   -drive file=sdcard-riscv64.img,if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0   -no-reboot -device virtio-net-device,netdev=net -netdev user,id=net -rtc base=utc   -drive file=disk.img,if=none,format=raw,id=x1 -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+```
+
+Docker 环境和 WSL 环境是两套互相独立的环境，只通过文件传递产物：
+
+| | Docker 容器 | WSL Ubuntu |
+|---|---|---|
+| 作用 | 只负责生成官方测试盘 | 编译内核、跑 QEMU、日常开发 |
+| 系统 | Debian 12（官方镜像） | Ubuntu 26.04 |
+| 工具 | musl/glibc 交叉编译器、QEMU 9.2.1，没有 Rust | Rust、QEMU 10.2.1、`~/HeXiXi` |
+| 数据 | Docker 卷 `oscomp-code` | `~/oscomp-work/`、`~/testsuits` |
+
+官方盘只需生成一次；改内核不用再碰 Docker。清理空间：`docker volume rm oscomp-code`（官方盘已另存在 WSL 时才可删）。
+
+## 7. 给新的测试组做盘
 
 套路都一样，参考 `tools/oscomp/build_lua.sh`：
 
 1. 用 musl 交叉编译器（`env.sh` 里的 `$CC`，必须 `-static -no-pie`）编出测试程序。
-2. 建一个 rootfs 目录，放入：`$SUITE/scripts/<组>/` 下的脚本、测试程序、busybox、`oscomp_runner`、`tmp/`、`var/tmp/`。盘是**平铺**布局，都放根目录。
+2. 建一个 rootfs 目录，放入：`$SUITE/scripts/<组>/` 下的脚本、测试程序、busybox、`oscomp_runner`、`tmp/`、`var/tmp/`。本地模拟盘是**平铺**布局，都放根目录（真实官方盘不是，见第 6 节）。
 3. 调用 `mkimage <rootfs> <输出.img> <大小MB> <卷标>` 生成 EXT4 镜像（不需要 root）。
 4. 用 `run_group.sh` 启动。lmbench 要 1G 内存，其余 256M 够用。
 
-## 7. 踩过的坑
+## 8. 踩过的坑
 
 | 现象 | 原因和处理 |
 |---|---|
