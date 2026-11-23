@@ -8,13 +8,15 @@
 
 DOCKER_NAME ?= rcore-tutorial-v3
 KERNEL_BIN := os/target/riscv64gc-unknown-none-elf/release/os.bin
+KERNEL_OUT ?= kernel-rv
 
 all: kernel-rv
 
 kernel-rv:
-	$(MAKE) -C os build
-	cp $(KERNEL_BIN) kernel-rv
-	@echo "kernel-rv: $$(stat -c%s kernel-rv) bytes"
+	$(MAKE) -C os env
+	$(MAKE) -C os kernel-bin BOARD=qemu OSCOMP=1
+	cp $(KERNEL_BIN) "$(KERNEL_OUT)"
+	@echo "$(KERNEL_OUT): $$(wc -c < "$(KERNEL_OUT)") bytes"
 
 clean-user:
 	$(MAKE) -C os clean

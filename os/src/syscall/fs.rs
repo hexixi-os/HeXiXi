@@ -200,13 +200,23 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, _flags: u32) -> isize {
     newfd as isize
 }
 
-/// chdir(49)：easy-fs 无目录，仅记录字符串
+/// chdir(49)：更新工作目录，支持相对路径和上级目录。
 pub fn sys_chdir(path: *const u8) -> isize {
     let token = current_user_token();
     let path = translated_str(token, path);
-    let p = alloc::string::String::from(path.trim_start_matches("./").trim_start_matches('/'));
+    let resolved = crate::fs::resolve_path(&path);
+    let mut components = alloc::vec::Vec::new();
+    for component in resolved.split('/') {
+        match component {
+            "" | "." => (),
+            ".." => {
+                components.pop();
+            }
+            name => components.push(name),
+        }
+    }
     let process = current_process();
-    process.inner_exclusive_access().cwd = alloc::string::String::from(p.as_str());
+    process.inner_exclusive_access().cwd = components.join("/");
     0
 }
 

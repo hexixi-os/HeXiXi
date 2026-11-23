@@ -42,6 +42,8 @@ TEST ?=
 
 build: env switch-check $(KERNEL_BIN) fs-img 
 
+kernel-bin: $(KERNEL_BIN)
+
 switch-check:
 ifeq ($(BOARD), qemu)
 	(which last-qemu) || (rm -f last-k210 && touch last-qemu && make clean)
@@ -70,10 +72,18 @@ fs-img: $(APPS)
 
 $(APPS):
 
+FEATURES := board_$(BOARD)
+ifeq ($(BOARD):$(OSCOMP),qemu:1)
+FEATURES += oscomp_runner
+kernel: oscomp-runner
+oscomp-runner:
+	$(MAKE) -C ../user oscomp-runner
+endif
+
 kernel:
 	@echo Platform: $(BOARD)
 	@cp src/linker-$(BOARD).ld src/linker.ld
-	@cargo build --release --features "board_$(BOARD)"
+	@cargo build --release --features "$(FEATURES)"
 	@rm src/linker.ld
 
 clean:
@@ -122,4 +132,4 @@ gdbserver: build
 gdbclient:
 	@riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: build env kernel clean disasm disasm-vim run-inner switch-check fs-img gdbserver gdbclient
+.PHONY: build env kernel-bin kernel oscomp-runner clean disasm disasm-vim run-inner switch-check fs-img gdbserver gdbclient

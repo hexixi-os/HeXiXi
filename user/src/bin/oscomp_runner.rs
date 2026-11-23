@@ -20,7 +20,7 @@ extern crate user_lib;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use user_lib::{close, exec, exit, fork, open, read, waitpid, OpenFlags};
+use user_lib::{chdir, close, exec, exit, fork, open, read, waitpid, OpenFlags};
 
 /// NUL 结尾字符串，内核按 C 字符串解析路径
 struct CStr(Vec<u8>);
@@ -270,8 +270,37 @@ impl Shell {
     }
 }
 
+fn run_with_busybox(script: &str) -> i32 {
+    let pid = fork();
+    if pid == 0 {
+        let script = CStr::new(script);
+        let args = [
+            b"busybox\0".as_ptr(),
+            b"sh\0".as_ptr(),
+            script.ptr(),
+            core::ptr::null(),
+        ];
+        exec("busybox\0", &args);
+        exit(126);
+    }
+    let mut code = 0;
+    if pid < 0 || waitpid(pid as usize, &mut code) != pid {
+        return 1;
+    }
+    code
+}
+
 #[no_mangle]
 pub fn main(_argc: usize, _argv: &[&str]) -> i32 {
+    if exists("/musl/basic_testcode.sh") {
+        if chdir("/musl\0") != 0 || !exists("busybox") || !exists("basic_testcode.sh") {
+            println!("[oscomp] missing BusyBox or basic_testcode.sh in /musl");
+            return 1;
+        }
+        println!("[oscomp] running /musl/basic_testcode.sh");
+        return run_with_busybox("basic_testcode.sh");
+    }
+
     const SCRIPTS: &[&str] = &[
         "basic_testcode.sh",
         "lua_testcode.sh",
@@ -325,19 +354,7 @@ pub fn main(_argc: usize, _argv: &[&str]) -> i32 {
             if !exists(script) {
                 continue;
             }
-            let pid = fork();
-            if pid == 0 {
-                let path = CStr::new("busybox");
-                let a0 = CStr::new("busybox");
-                let a1 = CStr::new("sh");
-                let a2 = CStr::new(script);
-                let argv: [*const u8; 4] = [a0.ptr(), a1.ptr(), a2.ptr(), core::ptr::null()];
-                exec(path.as_str(), &argv);
-                exit(-1);
-            } else if pid > 0 {
-                let mut code = 0;
-                waitpid(pid as usize, &mut code);
-            }
+            run_with_busybox(script);
         }
         return 0;
     }

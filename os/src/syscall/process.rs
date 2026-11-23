@@ -71,16 +71,22 @@ pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
             // argv = [解释器, 可选解释器参数(缺省用 basename), 脚本, ...原参数]
             let (prog, interp_arg, interp_data) = if let Some(d) = crate::fs::read_file_all(interp_name) {
                 (alloc::string::String::from(interp_name), extra.map(|s| alloc::string::String::from(s)), d)
-            } else if crate::fs::exists("busybox") {
+            } else if let Some((prog, data)) = crate::fs::read_file_all("busybox")
+                .map(|data| ("busybox", data))
+                .or_else(|| {
+                    if interp == "/bin/sh" {
+                        crate::fs::read_file_all("musl/busybox").map(|data| ("/musl/busybox", data))
+                    } else {
+                        None
+                    }
+                })
+            {
                 // 回退到 busybox 时用 sh 解释（#!/bin/bash 也能跑）
                 let arg = match extra {
                     Some(s) => alloc::string::String::from(s),
                     None => alloc::string::String::from("sh"),
                 };
-                match crate::fs::read_file_all("busybox") {
-                    Some(d) => (alloc::string::String::from("busybox"), Some(arg), d),
-                    None => return -1,
-                }
+                (String::from(prog), Some(arg), data)
             } else {
                 return -1;
             };

@@ -23,7 +23,10 @@ binary: elf
 
 build: binary
 
+oscomp-runner:
+	cargo build --release --target-dir target --bin oscomp_runner
+
 clean:
 	@cargo clean
 
-.PHONY: elf binary build clean
+.PHONY: elf binary build oscomp-runner clean
