@@ -25,7 +25,7 @@ pub struct ProcessControlBlockInner {
     pub memory_set: MemorySet,
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
-    pub exit_code: i32,
+    pub wait_status: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     pub signals: SignalFlags,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
@@ -115,7 +115,7 @@ impl ProcessControlBlock {
                     memory_set,
                     parent: None,
                     children: Vec::new(),
-                    exit_code: 0,
+                    wait_status: 0,
                     fd_table: vec![
                         // 0 -> stdin
                         Some(Arc::new(Stdin)),
@@ -196,6 +196,7 @@ impl ProcessControlBlock {
             let mut pinner = self.inner_exclusive_access();
             pinner.brk_base = heap_base;
             pinner.brk = heap_base;
+            pinner.mmap_top = 0x1000_0000;
         }
         // ---- 构造 Linux 进程启动栈 ----
         // 低地址 -> 高地址：argc | argv[..] | NULL | NULL(envp) | auxv | 字符串/程序头/随机数
@@ -340,7 +341,7 @@ impl ProcessControlBlock {
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
-                    exit_code: 0,
+                    wait_status: 0,
                     fd_table: new_fd_table,
                     signals: SignalFlags::empty(),
                     tasks: Vec::new(),

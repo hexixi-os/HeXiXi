@@ -8,7 +8,7 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
-use self::id::TaskUserRes;
+pub(crate) use self::id::TaskUserRes;
 use crate::fs::{open_file, OpenFlags};
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
@@ -57,6 +57,14 @@ pub fn block_current_and_run_next() {
 use crate::board::QEMUExit;
 
 pub fn exit_current_and_run_next(exit_code: i32) {
+    exit_current_with_status(exit_code, exit_code << 8);
+}
+
+pub fn exit_current_by_signal(signal: i32) {
+    exit_current_with_status(-signal, signal);
+}
+
+fn exit_current_with_status(exit_code: i32, wait_status: i32) {
     let task = take_current_task().unwrap();
     let mut task_inner = task.inner_exclusive_access();
     let process = task.process.upgrade().unwrap();
@@ -92,7 +100,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         // mark this process as a zombie process
         process_inner.is_zombie = true;
         // record exit code of main process
-        process_inner.exit_code = exit_code;
+        process_inner.wait_status = wait_status;
         // 子进程退出 → 给父进程投递 SIGCHLD。
         // libc-test 的 runtest 在 fork 之后用 sigtimedwait(SIGCHLD) 等子进程结束，
         // 不投递的话每次测试都要空等 5s 超时。
@@ -217,10 +225,10 @@ pub fn check_kill_current() {
         )
     };
     if kill {
-        exit_current_and_run_next(-9);
+        exit_current_by_signal(9);
     }
     if term {
-        exit_current_and_run_next(-15);
+        exit_current_by_signal(15);
     }
 }
 

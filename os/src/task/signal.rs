@@ -30,6 +30,8 @@ impl SignalFlags {
             Some((-6, "Aborted, SIGABRT=6"))
         } else if self.contains(Self::SIGFPE) {
             Some((-8, "Erroneous Arithmetic Operation, SIGFPE=8"))
+        } else if self.contains(Self::SIGBUS) {
+            Some((-7, "Bus error, SIGBUS=7"))
         } else if self.contains(Self::SIGSEGV) {
             Some((-11, "Segmentation Fault, SIGSEGV=11"))
         } else {

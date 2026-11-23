@@ -1,5 +1,5 @@
 use crate::fs::{make_pipe, open_file, OpenFlags};
-use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, UserBuffer};
+use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission, UserBuffer};
 use crate::task::{current_process, current_user_token};
 use alloc::sync::Arc;
 
@@ -17,7 +17,10 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
         let file = file.clone();
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
-        file.write(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize
+        match translated_byte_buffer(token, buf, len, MapPermission::R) {
+            Some(buffers) => file.write(UserBuffer::new(buffers)) as isize,
+            None => -14,
+        }
     } else {
         -1
     }
@@ -37,7 +40,10 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
         }
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
-        file.read(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize
+        match translated_byte_buffer(token, buf, len, MapPermission::W) {
+            Some(buffers) => file.read(UserBuffer::new(buffers)) as isize,
+            None => -14,
+        }
     } else {
         -1
     }
@@ -47,17 +53,17 @@ pub fn sys_open(path: *const u8, flags: u32) -> isize {
     let process = current_process();
     let token = current_user_token();
     let path = translated_str(token, path);
-    if let Some(inode) = crate::fs::open_dyn(path.as_str(), OpenFlags::from_bits(flags).unwrap()) {
-        let mut inner = process.inner_exclusive_access();
-        let fd = match inner.alloc_fd() {
-            Some(fd) => fd,
-            None => return -24, // EMFILE
-        };
-        inner.fd_table[fd] = Some(inode);
-        fd as isize
-    } else {
-        -1
-    }
+    let inode = match crate::fs::open_dyn(path.as_str(), OpenFlags::from_bits(flags).unwrap()) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    let mut inner = process.inner_exclusive_access();
+    let fd = match inner.alloc_fd() {
+        Some(fd) => fd,
+        None => return -24, // EMFILE
+    };
+    inner.fd_table[fd] = Some(inode);
+    fd as isize
 }
 
 pub fn sys_close(fd: usize) -> isize {
@@ -133,7 +139,10 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
             if len == 0 {
                 continue;
             }
-            buffers.append(&mut translated_byte_buffer(token, base as *const u8, len));
+            match translated_byte_buffer(token, base as *const u8, len, MapPermission::R) {
+                Some(mut chunk) => buffers.append(&mut chunk),
+                None => return -14,
+            }
         }
         file.write(UserBuffer::new(buffers)) as isize
     } else {
@@ -165,21 +174,21 @@ pub fn sys_openat(_dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isi
     if flags & 0o1000 != 0 {
         of |= OpenFlags::TRUNC;
     }
-    if let Some(inode) = crate::fs::open_dyn(path.as_str(), of) {
-        let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-        let fd = match inner.alloc_fd() {
-            Some(fd) => fd,
-            None => return -24, // EMFILE
-        };
-        inner.fd_table[fd] = Some(inode);
-        if crate::fs::is_dir_path(path.as_str()) {
-            inner.dir_paths.insert(fd, path.clone());
-        }
-        fd as isize
-    } else {
-        -1
+    let inode = match crate::fs::open_dyn(path.as_str(), of) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let fd = match inner.alloc_fd() {
+        Some(fd) => fd,
+        None => return -24, // EMFILE
+    };
+    inner.fd_table[fd] = Some(inode);
+    if crate::fs::is_dir_path(path.as_str()) {
+        inner.dir_paths.insert(fd, path.clone());
     }
+    fd as isize
 }
 
 /// dup3(24)：把 oldfd 复制到指定的 newfd
@@ -384,16 +393,7 @@ pub fn sys_renameat(oldpath: *const u8, newpath: *const u8) -> isize {
     let new = translated_str(token, newpath);
     let old = crate::fs::resolve_path(&old);
     let new = crate::fs::resolve_path(&new);
-    match crate::fs::overlay_get(old.as_str()) {
-        Some(data) => {
-            let bytes = data.exclusive_access().clone();
-            let dst = crate::fs::overlay_create(new.as_str());
-            *dst.exclusive_access() = bytes;
-            crate::fs::overlay_remove(old.as_str());
-            0
-        }
-        None => -2,
-    }
+    if crate::fs::overlay_rename(&old, &new) { 0 } else { -2 }
 }
 
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
@@ -527,7 +527,10 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
             if len == 0 {
                 continue;
             }
-            buffers.append(&mut translated_byte_buffer(token, base as *const u8, len));
+            match translated_byte_buffer(token, base as *const u8, len, MapPermission::W) {
+                Some(mut chunk) => buffers.append(&mut chunk),
+                None => return -14,
+            }
         }
         file.read(UserBuffer::new(buffers)) as isize
     } else {

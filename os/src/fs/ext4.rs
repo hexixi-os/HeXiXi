@@ -308,7 +308,8 @@ impl File for Ext4File {
     fn read(&self, buf: UserBuffer) -> usize {
         let mut off = self.offset.exclusive_access();
         let mut total = 0;
-        for chunk in buf.buffers {
+        for buffer in buf.buffers {
+            let chunk = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), buffer.len()) };
             let read = self.fs.read_file_at(&self.inode, *off as u64, chunk);
             *off += read;
             total += read;
@@ -320,6 +321,12 @@ impl File for Ext4File {
     }
     fn size(&self) -> usize {
         self.inode.size as usize
+    }
+    fn mapping_size(&self) -> Option<usize> {
+        self.inode.is_file().then(|| self.size())
+    }
+    fn read_mapping(&self, offset: usize, out: &mut [u8]) -> usize {
+        self.fs.read_file_at(&self.inode, offset as u64, out)
     }
     fn seek_to(&self, pos: isize) -> isize {
         if pos < 0 {

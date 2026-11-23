@@ -1,6 +1,6 @@
 use crate::{
     mm::kernel_token,
-    task::{add_task, current_task, TaskControlBlock},
+    task::{add_task, current_task, TaskControlBlock, TaskUserRes},
     trap::{trap_handler, TrapContext},
 };
 use alloc::sync::Arc;
@@ -8,16 +8,11 @@ use alloc::sync::Arc;
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
-    // create a new thread
-    let new_task = Arc::new(TaskControlBlock::new(
-        Arc::clone(&process),
-        task.inner_exclusive_access()
-            .res
-            .as_ref()
-            .unwrap()
-            .ustack_base,
-        true,
-    ));
+    let ustack_base = task.inner_exclusive_access().res.as_ref().unwrap().ustack_base;
+    if !TaskUserRes::next_stack_available(&process, ustack_base) {
+        return -12;
+    }
+    let new_task = Arc::new(TaskControlBlock::new(Arc::clone(&process), ustack_base, true));
     // add new task to scheduler
     add_task(Arc::clone(&new_task));
     let mut new_task_inner = new_task.inner_exclusive_access();

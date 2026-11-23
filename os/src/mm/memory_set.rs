@@ -2,12 +2,13 @@ use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
+use super::vma::{PageFault, VmaBacking, VmaSpace, USER_END};
 use crate::config::{MMIO, PAGE_SIZE, TRAMPOLINE};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::arch::asm;
+use core::{arch::asm, ops::Range};
 use lazy_static::*;
 use riscv::register::satp;
 
@@ -36,6 +37,7 @@ pub fn kernel_token() -> usize {
 pub struct MemorySet {
     page_table: PageTable,
     areas: Vec<MapArea>,
+    vmas: VmaSpace,
 }
 
 impl MemorySet {
@@ -43,6 +45,7 @@ impl MemorySet {
         Self {
             page_table: PageTable::new(),
             areas: Vec::new(),
+            vmas: VmaSpace::default(),
         }
     }
     pub fn token(&self) -> usize {
@@ -60,62 +63,82 @@ impl MemorySet {
             None,
         );
     }
-    /// 只登记地址区间、不立刻分配物理帧（缺页时再按页分配）。
-    /// brk / mmap 用它，避免一次 mmap 就把整个区间全部实体化。
-    pub fn insert_lazy_area(
-        &mut self,
-        start_va: VirtAddr,
-        end_va: VirtAddr,
-        permission: MapPermission,
-    ) {
-        self.areas
-            .push(MapArea::new_lazy(start_va, end_va, permission));
-    }
-    /// 用户态缺页处理：vpn 落在某个 lazy 区间内就补一帧并建立映射，返回是否处理。
-    pub fn handle_page_fault(&mut self, vpn: VirtPageNum) -> bool {
-        for area in self.areas.iter_mut() {
-            let start = area.vpn_range.get_start();
+    fn framed_overlap_end(&self, range: &Range<VirtPageNum>) -> Option<VirtPageNum> {
+        self.areas.iter().filter_map(|area| {
             let end = area.vpn_range.get_end();
-            if start <= vpn && vpn < end {
-                if area.lazy {
-                    // 已经建过映射的页不能再 map 一次（会触发 PageTable::map 的
-                    // "vpn is mapped before mapping" panic）。典型场景：PROT_READ 的 mmap 页
-                    // 第一次写缺页补了 R 映射，第二次写还是缺页 —— 这时应该交给上层
-                    // 按非法访问处理（用户注册了 SIGSEGV handler 就投递 handler）。
-                    let mapped = self
-                        .page_table
-                        .translate(vpn)
-                        .map(|pte| pte.is_valid())
-                        .unwrap_or(false);
-                    if mapped {
-                        return false;
-                    }
-                    area.map_one(&mut self.page_table, vpn);
-                    return true;
-                }
-                return false;
-            }
-        }
-        false
+            (area.vpn_range.get_start() < range.end && range.start < end).then_some(end)
+        }).max()
     }
-    /// mprotect(addr, len, prot)：更新与 [start_vpn, end_vpn) 相交区域的权限。
-    /// 我们的 brk/mmap 是惰性映射，所以既要改“以后缺页补页用的权限”，
-    /// 也要改“已经映射过的页”的 PTE flags（否则第二次写还是缺页）。
-    pub fn mprotect(&mut self, start_vpn: VirtPageNum, end_vpn: VirtPageNum, perm: MapPermission) {
-        for area in self.areas.iter_mut() {
-            if area.vpn_range.get_start() < end_vpn && start_vpn < area.vpn_range.get_end() {
-                area.map_perm = perm;
-                let flags = PTEFlags::from_bits(perm.bits).unwrap();
-                let mapped: alloc::vec::Vec<VirtPageNum> =
-                    area.data_frames.keys().copied().collect();
-                for vpn in mapped {
-                    self.page_table.set_flags(vpn, flags);
-                }
+
+    fn overlap_end(&self, range: &Range<VirtPageNum>) -> Option<VirtPageNum> {
+        self.framed_overlap_end(range).into_iter().chain(self.vmas.overlap_end(range)).max()
+    }
+
+    pub fn vacant(&self, range: &Range<VirtPageNum>) -> bool {
+        self.overlap_end(range).is_none()
+    }
+
+    pub fn find_vacant(&self, mut start: VirtPageNum, pages: usize) -> Option<Range<VirtPageNum>> {
+        loop {
+            let end = VirtPageNum(start.0.checked_add(pages)?);
+            if end.0 > USER_END / PAGE_SIZE {
+                return None;
+            }
+            let range = start..end;
+            match self.overlap_end(&range) {
+                Some(next) => start = next,
+                None => return Some(range),
             }
         }
-        unsafe {
-            asm!("sfence.vma");
+    }
+
+    pub fn insert_vma(&mut self, range: Range<VirtPageNum>, permissions: MapPermission, backing: VmaBacking) {
+        self.vmas.insert(range, permissions, backing);
+    }
+
+    pub fn handle_page_fault(&mut self, vpn: VirtPageNum, access: MapPermission) -> PageFault {
+        self.vmas.fault(&mut self.page_table, vpn, access)
+    }
+
+    pub(crate) fn pin_vma_page(&self, vpn: VirtPageNum) -> Option<Arc<FrameTracker>> {
+        self.vmas.pin(vpn)
+    }
+
+    pub fn munmap(&mut self, range: Range<VirtPageNum>) -> Result<(), isize> {
+        // ELF segments and task resources follow their existing allocation lifecycle.
+        if self.framed_overlap_end(&range).is_some() {
+            return Err(-22);
         }
+        let mut tables = Vec::new();
+        let retired = self.vmas.unmap(&mut self.page_table, range, &mut tables);
+        unsafe { asm!("sfence.vma"); }
+        drop((retired, tables));
+        Ok(())
+    }
+
+    pub fn mprotect(&mut self, range: Range<VirtPageNum>, permissions: MapPermission) -> Result<(), isize> {
+        // Check the entire interval before changing any resident translation or VMA.
+        let mut cursor = range.start;
+        while cursor < range.end {
+            cursor = if let Some(end) = self.vmas.covered_until(cursor, permissions) {
+                end?
+            } else {
+                self.areas.iter().find(|area| {
+                    area.map_perm.contains(MapPermission::U)
+                        && area.vpn_range.get_start() <= cursor
+                        && cursor < area.vpn_range.get_end()
+                }).map(|area| area.vpn_range.get_end()).ok_or(-12isize)?
+            };
+        }
+        self.vmas.protect(&mut self.page_table, range.clone(), permissions);
+        let flags = PTEFlags::from_bits(permissions.bits()).unwrap();
+        for area in &self.areas {
+            for (&vpn, _) in area.data_frames.range(range.clone()) {
+                self.page_table.set_flags(vpn, flags);
+            }
+        }
+        unsafe { asm!("sfence.vma"); }
+        Ok(())
     }
 
     /// 映射一个页并写入数据（用于信号 stub 等内核注入的用户页）
@@ -296,9 +319,6 @@ impl MemorySet {
         memory_set.map_trampoline();
         // copy data sections/trap_context/user_stack
         for area in user_space.areas.iter() {
-            // 先登记区域，再按父进程“实际映射了哪些页”逐个复制。
-            // lazy 区（brk/mmap）大部分页在父进程里也是缺页未分配的，子进程保持同样状态，
-            // 既保证语义（缺页返回全零页），又不会 fork 时把几百 MB 地址空间全部实体化。
             let mut new_area = MapArea::from_another(area);
             for vpn in area.vpn_range {
                 if let Some(pte) = user_space.translate(vpn) {
@@ -307,6 +327,7 @@ impl MemorySet {
                     }
                     let src_ppn = pte.ppn();
                     new_area.map_one(&mut memory_set.page_table, vpn);
+                    memory_set.page_table.set_flags(vpn, pte.flags());
                     let dst_ppn = memory_set.page_table.translate(vpn).unwrap().ppn();
                     dst_ppn
                         .get_bytes_array()
@@ -315,6 +336,7 @@ impl MemorySet {
             }
             memory_set.areas.push(new_area);
         }
+        memory_set.vmas = user_space.vmas.fork(&mut memory_set.page_table);
         memory_set
     }
     pub fn activate(&self) {
@@ -328,7 +350,7 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
     pub fn recycle_data_pages(&mut self) {
-        //*self = Self::new_bare();
+        self.vmas = VmaSpace::default();
         self.areas.clear();
     }
 }
@@ -338,8 +360,6 @@ pub struct MapArea {
     data_frames: BTreeMap<VirtPageNum, FrameTracker>,
     map_type: MapType,
     map_perm: MapPermission,
-    /// 惰性分配：区间登记时不分配物理帧，访问缺页时按页补
-    lazy: bool,
 }
 
 impl MapArea {
@@ -356,13 +376,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type,
             map_perm,
-            lazy: false,
         }
-    }
-    pub fn new_lazy(start_va: VirtAddr, end_va: VirtAddr, map_perm: MapPermission) -> Self {
-        let mut area = Self::new(start_va, end_va, MapType::Framed, map_perm);
-        area.lazy = true;
-        area
     }
     pub fn from_another(another: &MapArea) -> Self {
         Self {
@@ -370,7 +384,6 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type: another.map_type,
             map_perm: another.map_perm,
-            lazy: another.lazy,
         }
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
@@ -451,12 +464,14 @@ bitflags! {
 }
 
 /// 用户态缺页入口：找到当前进程，交给它的 MemorySet 处理。
-/// 返回 true 表示已补页，调用者刷新 TLB 后直接返回用户态即可。
-pub fn handle_user_page_fault(stval: usize) -> bool {
+pub fn handle_user_page_fault(stval: usize, access: MapPermission) -> PageFault {
+    if stval >= USER_END {
+        return PageFault::Invalid;
+    }
     let vpn = VirtPageNum(stval / PAGE_SIZE);
     let process = crate::task::current_process();
     let mut inner = process.inner_exclusive_access();
-    inner.memory_set.handle_page_fault(vpn)
+    inner.memory_set.handle_page_fault(vpn, access)
 }
 
 #[allow(unused)]

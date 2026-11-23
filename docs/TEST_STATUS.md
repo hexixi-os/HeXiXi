@@ -1,5 +1,13 @@
 # 测试状态
 
+## 2026-11-23 PR-05 文件映射与 VMA
+
+QEMU 8.2.2 上用最终内核连续运行两次官方 RISC-V64 `basic-musl`，均为 **97/102**，29 个用例满分，32 个用例均执行并正常关机。`mmap` 从 2/3 升至 3/3，剩余失分来自 `clone`、`mkdir` 和 `unlink`。
+
+在 Linux 或 WSL2 上用 `tools/oscomp/test_mmap_vma.sh` 可构建并启动专用 EXT4 测试盘。它覆盖六参数 `mmap`、非零文件偏移、关闭 fd 后访问、私有隔离、共享 overlay 与普通 I/O 一致、局部 `munmap`、局部 `mprotect`、固定地址替换，以及文件末页补零和跨 EOF 整页的 `SIGBUS`。测试同时检查 `waitpid` 的信号状态和共享缓冲区重叠时的文件读写。 [mmap(2)](https://man7.org/linux/man-pages/man2/mmap.2.html) · [mprotect(2)](https://man7.org/linux/man-pages/man2/mprotect.2.html)
+
+当前可写文件共享映射支持内存 overlay。私有页在缺页时读取到独立帧。overlay 存在活动映射时，缩短文件或以 `O_TRUNC` 打开返回 `EBUSY`。`munmap` 和 `MAP_FIXED` 操作动态 VMA，ELF 装载段和任务资源由各自的生命周期管理。
+
 ## 2026-11-23 PR-04 EXT4 区间读取
 
 普通 `read` 和 `readv` 按当前文件偏移读取所需扇区。新版 `tools/oscomp/test_ext4.sh` 覆盖跨块、分段缓冲区、EOF 短读、稀疏洞、未写入 extent 和索引 extent 树。

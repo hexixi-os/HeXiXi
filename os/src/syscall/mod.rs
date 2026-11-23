@@ -147,7 +147,7 @@ pub static LAST_SYSCALLS: [core::sync::atomic::AtomicUsize; 8] = [
 pub static LAST_SYSCALL_IDX: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-pub fn syscall(syscall_id: usize, args: [usize; 5]) -> isize {
+pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     // 已被 SIGKILL/SIGTERM 的进程不再服务任何系统调用（超时杀进程必死）
     crate::task::check_kill_current();
     LAST_SYSCALL.store(syscall_id, core::sync::atomic::Ordering::Relaxed);
@@ -252,7 +252,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 5]) -> isize {
         SYSCALL_SCHED_RR_INTERVAL => 0,
         SYSCALL_GET_TIME => sys_gettimeofday(args[0] as *mut u8),
         SYSCALL_BRK => sys_brk(args[0]),
-        SYSCALL_MMAP => sys_mmap(args[1], args[2]),
+        SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETPPID => sys_getppid(),

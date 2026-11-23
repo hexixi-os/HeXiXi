@@ -1,4 +1,8 @@
-use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use super::{
+    frame_alloc, FrameTracker, MapPermission, PageFault, PhysAddr, PhysPageNum, VirtAddr,
+    VirtPageNum, USER_END,
+};
+use crate::config::PAGE_SIZE;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -84,7 +88,7 @@ impl PageTable {
                 break;
             }
             if !pte.is_valid() {
-                let frame = frame_alloc().unwrap();
+                let frame = frame_alloc()?;
                 *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
                 self.frames.push(frame);
             }
@@ -111,15 +115,37 @@ impl PageTable {
     }
     #[allow(unused)]
     pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
-        let pte = self.find_pte_create(vpn).unwrap();
+        assert!(self.try_map(vpn, ppn, flags), "out of page-table frames");
+    }
+    pub fn try_map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
+        let pte = match self.find_pte_create(vpn) {
+            Some(pte) => pte,
+            None => return false,
+        };
         assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        true
     }
     #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
         let pte = self.find_pte(vpn).unwrap();
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
         *pte = PageTableEntry::empty();
+    }
+    /// Unlink empty non-root tables. The caller holds their frames until after the TLB flush.
+    pub fn unmap_and_reclaim(&mut self, vpn: VirtPageNum, retired: &mut Vec<FrameTracker>) {
+        let indexes = vpn.indexes();
+        let middle = self.root_ppn.get_pte_array()[indexes[0]].ppn();
+        let leaf = middle.get_pte_array()[indexes[1]].ppn();
+        self.unmap(vpn);
+        for (parent, index, child) in [(middle, indexes[1], leaf), (self.root_ppn, indexes[0], middle)] {
+            if child.get_pte_array().iter().any(PageTableEntry::is_valid) {
+                break;
+            }
+            parent.get_pte_array()[index] = PageTableEntry::empty();
+            let index = self.frames.iter().position(|frame| frame.ppn == child).unwrap();
+            retired.push(self.frames.swap_remove(index));
+        }
     }
     /// 改一个已映射页的权限位（mprotect 用，保留原 ppn）
     pub fn set_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) {
@@ -147,13 +173,11 @@ impl PageTable {
     }
 }
 
-/// 内核代用户访问内存前，确保目标虚拟页已经有有效 PTE。
-/// brk/mmap 是惰性映射：内核直接读写用户缓冲区（read/write/pipe/stat ...）时，
-/// 这些页可能还没被用户态碰过、页表里也没有 PTE，这里补一次缺页。
-/// 返回 false 表示不是当前进程可补页的合法地址。
-/// 非法用户地址的落点：一块内核哑页。写进去的数据被丢弃，读出来是 0。
-/// 目的：系统调用拿到空指针/越界指针时不要 panic 掉整个内核（LTP 会大量这么干）。
-static mut DUMMY_USER_PAGE: [u8; 4096] = [0u8; 4096];
+/// 旧标量翻译接口的兜底页，使无效地址的访问不触及进程映射或其他内核数据。
+#[repr(C, align(4096))]
+struct DummyUserPage([u8; PAGE_SIZE]);
+
+static mut DUMMY_USER_PAGE: DummyUserPage = DummyUserPage([0; PAGE_SIZE]);
 
 fn dummy_user_page() -> *mut u8 {
     unsafe { core::ptr::addr_of_mut!(DUMMY_USER_PAGE) as *mut u8 }
@@ -191,24 +215,20 @@ fn report_bad_translation(token: usize, va: usize, pa: usize) {
     );
 }
 
-fn ensure_user_page_mapped(token: usize, va: usize) -> bool {
+fn ensure_user_page_mapped(table: &PageTable, va: usize, access: MapPermission) -> bool {
+    if va >= USER_END {
+        return false;
+    }
     let vpn = VirtAddr::from(va).floor();
-    // 快路径：必须是“带 U 位的有效 PTE”。
-    // 注意用户页表里还映射了 trampoline（vpn 0x7FFFFFFFF，只有 R|X 没有 U），
-    // 用户传 buf=(void*)-1 时 VirtAddr 掩码后会正好命中它，
-    // 不判 U 位就会把 trampoline 的物理地址（内核 .text）当用户缓冲区写 → 内核崩。
-    let mapped = PageTable::from_token(token)
-        .translate(vpn)
-        .map(|pte| pte.is_valid() && pte.flags().contains(PTEFlags::U))
-        .unwrap_or(false);
-    if mapped {
-        return true;
+    if let Some(entry) = table.translate(vpn).filter(PageTableEntry::is_valid) {
+        let required = PTEFlags::U | PTEFlags::from_bits(access.bits()).unwrap();
+        return entry.flags().contains(required);
     }
     if let Some(task) = crate::task::current_task() {
         if let Some(process) = task.process.upgrade() {
             if let Some(mut inner) = process.try_inner_exclusive_access() {
-                if inner.memory_set.token() == token {
-                    return inner.memory_set.handle_page_fault(vpn);
+                if inner.memory_set.token() == table.token() {
+                    return inner.memory_set.handle_page_fault(vpn, access) == PageFault::Resolved;
                 }
             }
         }
@@ -216,45 +236,39 @@ fn ensure_user_page_mapped(token: usize, va: usize) -> bool {
     false
 }
 
-pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
+pub fn translated_byte_buffer(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    access: MapPermission,
+) -> Option<Vec<UserSlice>> {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
-    let end = start + len;
-    let mut v = Vec::new();
+    let end = start.checked_add(len)?;
+    let mut buffers = Vec::new();
     while start < end {
-        let start_va = VirtAddr::from(start);
-        let mut vpn = start_va.floor();
-        vpn.step();
-        let mut end_va: VirtAddr = vpn.into();
-        end_va = end_va.min(VirtAddr::from(end));
-        let page_end = usize::from(end_va);
-        if !ensure_user_page_mapped(token, start) {
-            // 非法用户缓冲区：退回哑页（读 0 / 写丢弃），不让内核 panic
-            let n = if page_end > start { page_end - start } else { 0 };
-            if n > 0 {
-                v.push(unsafe { core::slice::from_raw_parts_mut(dummy_user_page(), n) });
+        if !ensure_user_page_mapped(&page_table, start, access) {
+            return None;
+        }
+        let va = VirtAddr::from(start);
+        let ppn = page_table.translate(va.floor())?.ppn();
+        let pa = usize::from(PhysAddr::from(ppn));
+        if !phys_addr_sane(pa) {
+            if !dummy_warned() {
+                report_bad_translation(token, start, pa);
             }
-            start = page_end;
-            continue;
+            return None;
         }
-        let ppn = page_table.translate(start_va.floor()).unwrap().ppn();
-        if !phys_addr_sane(usize::from(ppn) << 12) && !dummy_warned() {
-            report_bad_translation(token, start, usize::from(ppn) << 12);
-            let n = if page_end > start { page_end - start } else { 0 };
-            if n > 0 {
-                v.push(unsafe { core::slice::from_raw_parts_mut(dummy_user_page(), n) });
-            }
-            start = page_end;
-            continue;
-        }
-        if end_va.page_offset() == 0 {
-            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
-        } else {
-            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
-        }
-        start = page_end;
+        let first = va.page_offset();
+        let count = (end - start).min(PAGE_SIZE - first);
+        pin_vma_page(token, va.floor());
+        buffers.push(UserSlice {
+            ptr: (pa + first) as *mut u8,
+            len: count,
+        });
+        start += count;
     }
-    v
+    Some(buffers)
 }
 
 /// Load a string from other address spaces into kernel space without an end `\0`.
@@ -266,7 +280,7 @@ pub fn translated_str(token: usize, ptr: *const u8) -> String {
     loop {
         let vpn = VirtAddr::from(va).floor().0;
         if vpn != checked_vpn {
-            if !ensure_user_page_mapped(token, va) {
+            if !ensure_user_page_mapped(&page_table, va, MapPermission::R) {
                 // 非法指针：按空串处理，避免内核 panic
                 return string;
             }
@@ -275,7 +289,7 @@ pub fn translated_str(token: usize, ptr: *const u8) -> String {
         let ch: u8 = *(page_table
             .translate_va(VirtAddr::from(va))
             .unwrap()
-            .get_mut());
+            .get_ref());
         if ch == 0 {
             break;
         }
@@ -289,52 +303,88 @@ pub fn translated_str(token: usize, ptr: *const u8) -> String {
     string
 }
 
-pub fn translated_ref<T>(token: usize, ptr: *const T) -> &'static T {
-    let va = ptr as usize;
-    if !ensure_user_page_mapped(token, va) {
-        return unsafe { &*(dummy_user_page() as *const T) };
+fn typed_user_addr<T>(token: usize, va: usize, access: MapPermission) -> Option<PhysAddr> {
+    if va % core::mem::align_of::<T>() != 0
+        || core::mem::size_of::<T>() > PAGE_SIZE - va % PAGE_SIZE
+    {
+        return None;
     }
     let page_table = PageTable::from_token(token);
-    let pa = page_table.translate_va(VirtAddr::from(va)).unwrap();
+    if !ensure_user_page_mapped(&page_table, va, access) {
+        return None;
+    }
+    let pa = page_table.translate_va(VirtAddr::from(va))?;
     if !phys_addr_sane(usize::from(pa)) {
         if !dummy_warned() {
             report_bad_translation(token, va, usize::from(pa));
         }
-        return unsafe { &*(dummy_user_page() as *const T) };
+        return None;
     }
-    pa.get_ref()
+    Some(pa)
+}
+
+pub fn translated_ref<T>(token: usize, ptr: *const T) -> &'static T {
+    match typed_user_addr::<T>(token, ptr as usize, MapPermission::R) {
+        Some(pa) => pa.get_ref(),
+        None => unsafe { &*(dummy_user_page() as *const T) },
+    }
 }
 
 pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
-    let va = ptr as usize;
-    if !ensure_user_page_mapped(token, va) {
-        return unsafe { &mut *(dummy_user_page() as *mut T) };
+    match typed_user_addr::<T>(token, ptr as usize, MapPermission::W) {
+        Some(pa) => pa.get_mut(),
+        None => unsafe { &mut *(dummy_user_page() as *mut T) },
     }
-    let page_table = PageTable::from_token(token);
-    let pa = page_table.translate_va(VirtAddr::from(va)).unwrap();
-    if !phys_addr_sane(usize::from(pa)) {
-        if !dummy_warned() {
-            report_bad_translation(token, va, usize::from(pa));
+}
+
+// VMA pages can be unmapped while a blocking syscall sleeps. Hold the frame in
+// the TCB rather than on the kernel stack, which is not unwound on task exit.
+fn pin_vma_page(token: usize, vpn: VirtPageNum) {
+    if let Some(task) = crate::task::current_task() {
+        if let Some(process) = task.process.upgrade() {
+            let page = {
+                let inner = process.inner_exclusive_access();
+                if inner.memory_set.token() == token {
+                    inner.memory_set.pin_vma_page(vpn)
+                } else {
+                    None
+                }
+            };
+            if let Some(page) = page {
+                task.inner_exclusive_access().user_io_frames.push(page);
+            }
         }
-        return unsafe { &mut *(dummy_user_page() as *mut T) };
     }
-    pa.get_mut()
+}
+
+// Distinct virtual addresses and iovecs may alias the same physical frame.
+pub struct UserSlice {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl UserSlice {
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
 }
 
 pub struct UserBuffer {
-    pub buffers: Vec<&'static mut [u8]>,
+    pub buffers: Vec<UserSlice>,
 }
 
 impl UserBuffer {
-    pub fn new(buffers: Vec<&'static mut [u8]>) -> Self {
+    pub fn new(buffers: Vec<UserSlice>) -> Self {
         Self { buffers }
     }
     pub fn len(&self) -> usize {
-        let mut total: usize = 0;
-        for b in self.buffers.iter() {
-            total += b.len();
-        }
-        total
+        self.buffers.iter().map(UserSlice::len).sum()
     }
 }
 
@@ -351,7 +401,7 @@ impl IntoIterator for UserBuffer {
 }
 
 pub struct UserBufferIterator {
-    buffers: Vec<&'static mut [u8]>,
+    buffers: Vec<UserSlice>,
     current_buffer: usize,
     current_idx: usize,
 }
@@ -359,17 +409,13 @@ pub struct UserBufferIterator {
 impl Iterator for UserBufferIterator {
     type Item = *mut u8;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current_buffer >= self.buffers.len() {
-            None
-        } else {
-            let r = &mut self.buffers[self.current_buffer][self.current_idx] as *mut _;
-            if self.current_idx + 1 == self.buffers[self.current_buffer].len() {
-                self.current_idx = 0;
-                self.current_buffer += 1;
-            } else {
-                self.current_idx += 1;
-            }
-            Some(r)
+        let buffer = self.buffers.get(self.current_buffer)?;
+        let ptr = unsafe { buffer.ptr.add(self.current_idx) };
+        self.current_idx += 1;
+        if self.current_idx == buffer.len {
+            self.current_buffer += 1;
+            self.current_idx = 0;
         }
+        Some(ptr)
     }
 }

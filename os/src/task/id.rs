@@ -28,6 +28,9 @@ impl RecycleAllocator {
             self.current - 1
         }
     }
+    fn next_id(&self) -> usize {
+        self.recycled.last().copied().unwrap_or(self.current)
+    }
     pub fn dealloc(&mut self, id: usize) {
         assert!(id < self.current);
         assert!(
@@ -124,6 +127,16 @@ fn ustack_bottom_from_tid(ustack_base: usize, tid: usize) -> usize {
 }
 
 impl TaskUserRes {
+    pub fn next_stack_available(process: &ProcessControlBlock, ustack_base: usize) -> bool {
+        let inner = process.inner_exclusive_access();
+        let tid = inner.task_res_allocator.next_id();
+        let bottom = ustack_bottom_from_tid(ustack_base, tid);
+        let top = bottom + USER_STACK_SIZE;
+        top <= crate::mm::USER_END && inner.memory_set.vacant(&(
+            VirtAddr::from(bottom).floor()..VirtAddr::from(top).floor()
+        ))
+    }
+
     pub fn new(
         process: Arc<ProcessControlBlock>,
         ustack_base: usize,

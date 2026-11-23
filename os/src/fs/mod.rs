@@ -1,15 +1,32 @@
 pub mod ext4;
 mod inode;
+mod overlay;
 mod pipe;
 mod stdio;
 
-use crate::mm::UserBuffer;
+use crate::mm::{FrameTracker, UserBuffer};
+use overlay::OverlayFile;
 
 pub trait File: Send + Sync {
     fn readable(&self) -> bool;
     fn writable(&self) -> bool;
     fn read(&self, buf: UserBuffer) -> usize;
     fn write(&self, buf: UserBuffer) -> usize;
+    fn mapping_size(&self) -> Option<usize> {
+        None
+    }
+    fn read_mapping(&self, _offset: usize, _out: &mut [u8]) -> usize {
+        0
+    }
+    fn mapping_lease(&self) -> Option<Arc<()>> {
+        None
+    }
+    fn shared_mappable(&self) -> bool {
+        false
+    }
+    fn shared_page(&self, _offset: usize) -> Option<Arc<FrameTracker>> {
+        None
+    }
     /// 文件大小（fstat/mmap 需要）
     fn size(&self) -> usize {
         0
@@ -37,9 +54,9 @@ pub trait File: Send + Sync {
 }
 
 pub use inode::{is_unlinked, list_apps, mark_unlinked, open_file, root_names, OSInode, OpenFlags};
+pub use overlay::{overlay_create, overlay_get, overlay_remove, overlay_rename};
 pub use pipe::{make_pipe, Pipe};
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -52,33 +69,6 @@ lazy_static! {
 
 pub fn has_ext4() -> bool {
     EXT4.is_some()
-}
-
-/// EXT4 是只读的，这里用内存 overlay 支持创建/删除，
-/// 让 close/open(O_CREATE)/mkdir/unlink 这类用例可以工作。
-lazy_static! {
-    static ref OVERLAY: crate::sync::UPSafeCell<BTreeMap<String, Arc<crate::sync::UPSafeCell<Vec<u8>>>>> =
-        unsafe { crate::sync::UPSafeCell::new(BTreeMap::new()) };
-}
-
-pub type OverlayData = Arc<crate::sync::UPSafeCell<Vec<u8>>>;
-
-pub fn overlay_get(name: &str) -> Option<OverlayData> {
-    OVERLAY.exclusive_access().get(name).cloned()
-}
-
-pub fn overlay_create(name: &str) -> OverlayData {
-    let mut map = OVERLAY.exclusive_access();
-    if let Some(d) = map.get(name) {
-        return d.clone();
-    }
-    let d: OverlayData = Arc::new(unsafe { crate::sync::UPSafeCell::new(Vec::new()) });
-    map.insert(String::from(name), d.clone());
-    d
-}
-
-pub fn overlay_remove(name: &str) {
-    OVERLAY.exclusive_access().remove(name);
 }
 
 /// /dev/null：读永远 EOF，写直接丢弃
@@ -130,106 +120,6 @@ impl File for ZeroFile {
     }
 }
 
-pub struct OverlayFile {
-    data: OverlayData,
-    offset: crate::sync::UPSafeCell<usize>,
-}
-
-impl OverlayFile {
-    pub fn new(data: OverlayData) -> Self {
-        Self {
-            data,
-            offset: unsafe { crate::sync::UPSafeCell::new(0) },
-        }
-    }
-}
-
-impl File for OverlayFile {
-    fn readable(&self) -> bool {
-        true
-    }
-    fn writable(&self) -> bool {
-        true
-    }
-    fn read(&self, buf: UserBuffer) -> usize {
-        let data = self.data.exclusive_access();
-        let mut off = self.offset.exclusive_access();
-        let mut n = 0;
-        for ptr in buf {
-            if *off >= data.len() {
-                break;
-            }
-            unsafe { ptr.write_volatile(data[*off]); }
-            *off += 1;
-            n += 1;
-        }
-        n
-    }
-    fn size(&self) -> usize {
-        self.data.exclusive_access().len()
-    }
-    fn set_len(&self, len: usize) -> isize {
-        let mut data = self.data.exclusive_access();
-        if len < data.len() {
-            data.truncate(len);
-        } else if len > data.len() {
-            data.resize(len, 0);
-        }
-        0
-    }
-    fn seek_to(&self, pos: isize) -> isize {
-        if pos < 0 {
-            return -1;
-        }
-        let len = self.data.exclusive_access().len() as isize;
-        let new = if pos > len { len } else { pos };
-        *self.offset.exclusive_access() = new as usize;
-        new
-    }
-    fn seek(&self, offset: isize) -> isize {
-        let len = self.data.exclusive_access().len() as isize;
-        let mut off = self.offset.exclusive_access();
-        let new = (*off as isize).saturating_add(offset);
-        if new < 0 {
-            return -1;
-        }
-        let new = if new > len { len } else { new };
-        *off = new as usize;
-        new
-    }
-    fn write(&self, buf: UserBuffer) -> usize {
-        // overlay 存在内核堆里，限制单文件大小，避免把内核堆写爆
-        const MAX_OVERLAY: usize = 0x10_0000;
-        let mut data = self.data.exclusive_access();
-        let mut off = self.offset.exclusive_access();
-        let mut n = 0;
-        // 一次性 reserve 到“写完之后的大小”：Vec 的倍增策略会让每个 10KB 文件实占 16KB，
-        // lat_fs 一次创建上万个文件时这点放大就是几十 MB 的差距。
-        let total = buf.len();
-        if total > 0 && *off >= data.len() {
-            let need = (*off + total).min(MAX_OVERLAY).saturating_sub(data.len());
-            data.reserve(need);
-        }
-        for ptr in buf {
-            if *off >= MAX_OVERLAY {
-                // 假装写成功，实际丢弃
-                *off += 1;
-                n += 1;
-                continue;
-            }
-            let b = unsafe { ptr.read_volatile() };
-            if *off < data.len() {
-                data[*off] = b;
-            } else {
-                data.push(b);
-            }
-            *off += 1;
-            n += 1;
-        }
-        n
-    }
-}
-
 /// 读出整个文件（内核内部用，例如 exec 加载 ELF）
 pub fn read_file_all(name: &str) -> Option<Vec<u8>> {
     read_file_all_inner(name)
@@ -240,7 +130,7 @@ fn read_file_all_inner(name: &str) -> Option<Vec<u8>> {
         return Some(v);
     }
     if let Some(d) = overlay_get(name) {
-        return Some(d.exclusive_access().clone());
+        return Some(d.exclusive_access().read_all());
     }
     if let Some(fs) = EXT4.as_ref() {
         let inode = fs.lookup(name)?;
@@ -251,38 +141,49 @@ fn read_file_all_inner(name: &str) -> Option<Vec<u8>> {
 }
 
 /// 打开文件并返回统一的 File 对象（供系统调用使用）
-pub fn open_dyn(name: &str, flags: OpenFlags) -> Option<Arc<dyn File + Send + Sync>> {
+pub fn open_dyn(name: &str, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sync>, isize> {
     // 虚拟设备文件：/dev/null 这类被 lmbench / 测试大量使用，原来 ENOENT
     let dev = name.trim_start_matches("./").trim_start_matches('/');
     match dev {
-        "dev/null" => return Some(Arc::new(NullFile)),
-        "dev/zero" => return Some(Arc::new(ZeroFile)),
-        "dev/tty" | "dev/console" => return Some(Arc::new(Stdout)),
+        "dev/null" => return Ok(Arc::new(NullFile)),
+        "dev/zero" => return Ok(Arc::new(ZeroFile)),
+        "dev/tty" | "dev/console" => return Ok(Arc::new(Stdout)),
         _ => {}
     }
     if let Some(v) = virtual_file(name) {
         let d = overlay_create(name);
-        *d.exclusive_access() = v;
-        return Some(Arc::new(OverlayFile::new(d)));
+        {
+            let mut data = d.exclusive_access();
+            if !data.resize(v.len()) {
+                return Err(-16);
+            }
+            if data.write_at(0, &v) != v.len() {
+                return Err(-12);
+            }
+        }
+        return Ok(Arc::new(OverlayFile::new(d, flags)));
     }
     // 根目录用一个伪文件代表，供 getdents 使用
     if is_root_path(name) && EXT4.is_some() {
-        return Some(Arc::new(OverlayFile::new(overlay_create("/.rootdir"))));
+        return Ok(Arc::new(OverlayFile::root(flags)));
     }
     if let Some(d) = overlay_get(name) {
-        if flags.contains(OpenFlags::TRUNC) {
-            d.exclusive_access().clear();
+        if flags.contains(OpenFlags::TRUNC) && !d.exclusive_access().resize(0) {
+            return Err(-16);
         }
-        return Some(Arc::new(OverlayFile::new(d)));
+        return Ok(Arc::new(OverlayFile::new(d, flags)));
     }
     if let Some(fs) = EXT4.as_ref() {
         if flags.contains(OpenFlags::CREATE) {
-            return Some(Arc::new(OverlayFile::new(overlay_create(name))));
+            return Ok(Arc::new(OverlayFile::new(overlay_create(name), flags)));
         }
-        let inode = fs.lookup(name)?;
-        Some(Arc::new(ext4::Ext4File::new(Arc::clone(fs), inode)))
+        if flags.contains(OpenFlags::WRONLY) {
+            return Err(-30);
+        }
+        let inode = fs.lookup(name).ok_or(-2isize)?;
+        Ok(Arc::new(ext4::Ext4File::new(Arc::clone(fs), inode)))
     } else {
-        open_file(name, flags).map(|i| i as Arc<dyn File + Send + Sync>)
+        open_file(name, flags).map(|i| i as Arc<dyn File + Send + Sync>).ok_or(-2)
     }
 }
 

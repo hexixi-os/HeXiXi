@@ -1,7 +1,8 @@
 use super::id::TaskUserRes;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, TaskContext};
 use crate::trap::TrapContext;
-use crate::{mm::PhysPageNum, sync::UPSafeCell};
+use crate::{mm::{FrameTracker, PhysPageNum}, sync::UPSafeCell};
+use alloc::vec::Vec;
 use alloc::sync::{Arc, Weak};
 use core::cell::RefMut;
 
@@ -33,6 +34,7 @@ pub struct TaskControlBlockInner {
     pub exit_code: Option<i32>,
     /// CLONE_CHILD_CLEARTID 的地址：线程退出时把它清零
     pub clear_child_tid: usize,
+    pub(crate) user_io_frames: Vec<Arc<FrameTracker>>,
 }
 
 impl TaskControlBlockInner {
@@ -70,6 +72,7 @@ impl TaskControlBlock {
                     task_status: TaskStatus::Ready,
                     exit_code: None,
                     clear_child_tid: 0,
+                    user_io_frames: Vec::new(),
                 })
             },
         }
@@ -93,6 +96,7 @@ impl TaskControlBlock {
                     task_status: TaskStatus::Ready,
                     exit_code: None,
                     clear_child_tid: 0,
+                    user_io_frames: Vec::new(),
                 })
             },
         }

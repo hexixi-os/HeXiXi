@@ -111,6 +111,11 @@ pub fn fork() -> isize {
 pub fn exec(path: &str, args: &[*const u8]) -> isize {
     sys_exec(path, args)
 }
+fn decode_wait_status(status: i32) -> i32 {
+    let signal = status & 0x7f;
+    if signal == 0 { status >> 8 } else { -signal }
+}
+
 pub fn wait(exit_code: &mut i32) -> isize {
     let mut raw: i32 = 0;
     loop {
@@ -121,7 +126,7 @@ pub fn wait(exit_code: &mut i32) -> isize {
             // -1 or a real pid
             exit_pid => {
                 // 内核返回 Linux 风格的 wait status，这里还原成原始退出码
-                *exit_code = raw >> 8;
+                *exit_code = decode_wait_status(raw);
                 return exit_pid;
             }
         }
@@ -137,7 +142,7 @@ pub fn waitpid(pid: usize, exit_code: &mut i32) -> isize {
             }
             // -1 or a real pid
             exit_pid => {
-                *exit_code = raw >> 8;
+                *exit_code = decode_wait_status(raw);
                 return exit_pid;
             }
         }
@@ -148,7 +153,7 @@ pub fn waitpid_nb(pid: usize, exit_code: &mut i32) -> isize {
     let mut raw: i32 = 0;
     let ret = sys_waitpid(pid as isize, &mut raw as *mut i32);
     if ret > 0 {
-        *exit_code = raw >> 8;
+        *exit_code = decode_wait_status(raw);
     }
     ret
 }

@@ -1,3 +1,6 @@
+use crate::config::PAGE_SIZE;
+use crate::mm::{MapPermission, VirtPageNum, VmaBacking, USER_END};
+use core::ops::Range;
 use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_ref, translated_refmut, translated_str};
 use crate::task::{
@@ -136,11 +139,11 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
         if let Some((idx, _)) = pair {
             let child = inner.children.remove(idx);
             let found_pid = child.getpid();
-            let exit_code = child.inner_exclusive_access().exit_code;
-            // Linux 的 wait status 编码：退出码放在高 8 位
-            // Linux 允许 wait(NULL)：状态指针为空时跳过写回
+            let status = child.inner_exclusive_access().wait_status;
+            let token = inner.memory_set.token();
+            drop(inner);
             if !exit_code_ptr.is_null() {
-                *translated_refmut(inner.memory_set.token(), exit_code_ptr) = exit_code << 8;
+                *translated_refmut(token, exit_code_ptr) = status;
             }
             return found_pid as isize;
         }
@@ -275,71 +278,145 @@ pub fn sys_gettimeofday(tv: *mut u8) -> isize {
     0
 }
 
-/// brk(214)：调整 program break，向上增长时按页建立映射（惰性：先登记，缺页再真正分配帧）
+/// brk(214): grow or shrink the anonymous heap without overlapping another mapping.
 pub fn sys_brk(addr: usize) -> isize {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     let old = inner.brk;
-    if addr == 0 {
+    if addr == 0 || addr < inner.brk_base || addr >= USER_END {
         return old as isize;
     }
-    if addr < inner.brk_base {
-        return old as isize;
-    }
-    if addr > old {
-        let page = crate::config::PAGE_SIZE;
-        let old_page = (old + page - 1) / page * page;
-        let new_page = (addr + page - 1) / page * page;
-        if new_page <= old_page {
-            inner.brk = addr;
-            return addr as isize;
+    let old_end = VirtPageNum((old + PAGE_SIZE - 1) / PAGE_SIZE);
+    let new_end = VirtPageNum((addr + PAGE_SIZE - 1) / PAGE_SIZE);
+    if new_end > old_end {
+        let range = old_end..new_end;
+        if !inner.memory_set.vacant(&range) {
+            return old as isize;
         }
-        let start: crate::mm::VirtAddr = old_page.into();
-        let end: crate::mm::VirtAddr = new_page.into();
-        // 惰性映射：只登记 [start, end)，等真正访问缺页时再分配物理帧
-        inner.memory_set.insert_lazy_area(
-            start,
-            end,
-            crate::mm::MapPermission::U | crate::mm::MapPermission::R | crate::mm::MapPermission::W,
+        inner.memory_set.insert_vma(
+            range,
+            MapPermission::U | MapPermission::R | MapPermission::W,
+            VmaBacking::Anonymous,
         );
+    } else if new_end < old_end && inner.memory_set.munmap(new_end..old_end).is_err() {
+        return old as isize;
     }
     inner.brk = addr;
     addr as isize
 }
 
-/// mmap(222)：只支持匿名映射，从固定的 mmap 区向上分配（惰性：缺页时才分配物理帧）
-/// prot: PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4（mmap 第 3 个参数）。
-/// lat_sig 的 prot 用例依赖 PROT_READ 映射 + 写触发 SIGSEGV，所以这里必须尊重 prot。
-pub fn sys_mmap(len: usize, prot: usize) -> isize {
+fn page_range(addr: usize, size: usize) -> Option<Range<VirtPageNum>> {
+    let end = addr.checked_add(size)?;
+    if addr % PAGE_SIZE != 0 || end > USER_END {
+        return None;
+    }
+    Some(VirtPageNum(addr / PAGE_SIZE)..VirtPageNum(end / PAGE_SIZE))
+}
+
+fn round_mapping_size(len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    len.checked_add(PAGE_SIZE - 1).map(|n| n & !(PAGE_SIZE - 1))
+}
+
+pub fn sys_mmap(
+    addr: usize,
+    len: usize,
+    prot: usize,
+    flags: usize,
+    fd: usize,
+    offset: usize,
+) -> isize {
+    const MAP_SHARED: usize = 1;
+    const MAP_PRIVATE: usize = 2;
+    const MAP_FIXED: usize = 0x10;
+    const MAP_ANONYMOUS: usize = 0x20;
+    const MAP_FIXED_NOREPLACE: usize = 0x100000;
+
+    let size = match round_mapping_size(len) {
+        Some(size) if size <= USER_END => size,
+        _ => return -22,
+    };
+    let permissions = match prot_to_perm(prot) {
+        Some(permissions) => permissions,
+        None => return -22,
+    };
+    let shared = match flags & 0xf {
+        MAP_SHARED => true,
+        MAP_PRIVATE => false,
+        _ => return -22,
+    };
+    if offset % PAGE_SIZE != 0
+        || offset.checked_add(size).map_or(true, |end| end > isize::MAX as usize)
+    {
+        return -22;
+    }
+
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    let size = (len + crate::config::PAGE_SIZE - 1) / crate::config::PAGE_SIZE * crate::config::PAGE_SIZE;
-    let start = inner.mmap_top;
-    let end = start + size;
-    let perm = prot_to_perm(prot);
-    // 惰性映射：pthread 每个线程栈 128KB，按需分配才能让 2500 线程的用例跑得下去
-    inner.memory_set.insert_lazy_area(start.into(), end.into(), perm);
-    inner.mmap_top = end;
+    let backing = if flags & MAP_ANONYMOUS != 0 {
+        VmaBacking::anonymous(shared)
+    } else {
+        let file = match inner.fd_table.get(fd).and_then(|file| file.as_ref()) {
+            Some(file) => file.clone(),
+            None => return -9,
+        };
+        if !file.readable() {
+            return -13;
+        }
+        if file.mapping_size().is_none() {
+            return -19;
+        }
+        VmaBacking::file(file, offset, shared)
+    };
+    if !backing.allows(permissions) {
+        return -13;
+    }
+    let range = if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
+        let range = match page_range(addr, size) {
+            Some(range) if addr >= PAGE_SIZE => range,
+            _ => return -22,
+        };
+        if flags & MAP_FIXED_NOREPLACE != 0 {
+            if !inner.memory_set.vacant(&range) {
+                return -17;
+            }
+        } else if let Err(error) = inner.memory_set.munmap(range.clone()) {
+            return error;
+        }
+        range
+    } else {
+        let hint = addr & !(PAGE_SIZE - 1);
+        if let Some(range) = page_range(hint, size)
+            .filter(|range| hint >= PAGE_SIZE && inner.memory_set.vacant(range))
+        {
+            range
+        } else {
+            let start = VirtPageNum(inner.mmap_top / PAGE_SIZE);
+            match inner.memory_set.find_vacant(start, size / PAGE_SIZE) {
+                Some(range) => {
+                    inner.mmap_top = range.end.0 * PAGE_SIZE;
+                    range
+                }
+                None => return -12,
+            }
+        }
+    };
+    let start = range.start.0 * PAGE_SIZE;
+    inner.memory_set.insert_vma(range, permissions, backing);
     start as isize
 }
 
-/// munmap(215)：解除映射并回收帧（线程栈释放依赖它）
 pub fn sys_munmap(addr: usize, len: usize) -> isize {
-    if len == 0 {
-        return 0;
-    }
+    let range = match round_mapping_size(len).and_then(|size| page_range(addr, size)) {
+        Some(range) => range,
+        None => return -22,
+    };
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    let start = crate::mm::VirtAddr::from(addr).floor();
-    let end = crate::mm::VirtAddr::from(addr + len).ceil();
-    let mut vpn = start;
-    while vpn < end {
-        inner.memory_set.remove_area_with_start_vpn(vpn);
-        vpn = crate::mm::VirtPageNum(vpn.0 + 1);
-    }
-    0
+    let result = process.inner_exclusive_access().memory_set.munmap(range);
+    result.err().unwrap_or(0)
 }
-
 
 /// sched_getparam(123)：写一个 4 字节的 sched_priority
 pub fn sys_sched_getparam(param: *mut u8) -> isize {
@@ -581,33 +658,41 @@ fn apply_nofile(cur: usize) {
 }
 
 /// 把 Linux 的 prot 位翻译成 MapPermission
-fn prot_to_perm(prot: usize) -> crate::mm::MapPermission {
-    let mut perm = crate::mm::MapPermission::U;
-    if prot & 1 != 0 {
-        perm |= crate::mm::MapPermission::R;
+fn prot_to_perm(prot: usize) -> Option<MapPermission> {
+    if prot & !7 != 0 {
+        return None;
+    }
+    let mut permissions = MapPermission::U;
+    if prot & 3 != 0 {
+        // Sv39 reserves leaf entries with W=1 and R=0.
+        permissions |= MapPermission::R;
     }
     if prot & 2 != 0 {
-        perm |= crate::mm::MapPermission::W;
+        permissions |= MapPermission::W;
     }
     if prot & 4 != 0 {
-        perm |= crate::mm::MapPermission::X;
+        permissions |= MapPermission::X;
     }
-    perm
+    Some(permissions)
 }
 
-/// mprotect(226)：真正改权限。
-/// 之前它是空实现，而 rt-tests/cyclictest 先 mmap(PROT_NONE) 再 mprotect(RW) 当线程栈用；
-/// mmap 开始尊重 prot 后，不实现 mprotect 就会写 PROT_NONE 页 → SIGSEGV，cyclictest 4 个用例全 fail。
 pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
+    if addr % PAGE_SIZE != 0 {
+        return -22;
+    }
     if len == 0 {
         return 0;
     }
-    let start = crate::mm::VirtAddr::from(addr).floor();
-    let end = crate::mm::VirtAddr::from(addr + len).ceil();
+    let (range, permissions) = match (
+        round_mapping_size(len).and_then(|size| page_range(addr, size)),
+        prot_to_perm(prot),
+    ) {
+        (Some(range), Some(permissions)) => (range, permissions),
+        _ => return -22,
+    };
     let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    inner.memory_set.mprotect(start, end, prot_to_perm(prot));
-    0
+    let result = process.inner_exclusive_access().memory_set.mprotect(range, permissions);
+    result.err().unwrap_or(0)
 }
 
 /// getrlimit(163)

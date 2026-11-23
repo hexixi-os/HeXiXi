@@ -4,7 +4,7 @@ use crate::config::TRAMPOLINE;
 use crate::syscall::syscall;
 use crate::task::{
     check_signals_of_current, current_add_signal, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, exit_current_and_run_next, suspend_current_and_run_next, SignalFlags,
+    current_user_token, SignalFlags,
 };
 use crate::timer::{check_timer, set_next_trigger};
 use core::arch::{asm, global_asm};
@@ -54,14 +54,14 @@ fn report_user_fault(cause: Trap, stval: usize) {
     );
 }
 
-fn handle_user_fault(cause: Trap, stval: usize) {
+fn handle_user_fault(cause: Trap, stval: usize, signal: SignalFlags) {
     report_user_fault(cause, stval);
-    let sigsegv = crate::syscall::signal::SIGSEGV;
-    if crate::task::current_has_handler(sigsegv) {
+    let signo = signal.bits().trailing_zeros() as usize;
+    if crate::task::current_has_handler(signo) {
         // 用户 handler：投递后由 deliver_signal 跳到 handler，返回后指令重试
-        crate::task::current_set_pending(sigsegv);
+        crate::task::current_set_pending(signo);
     } else {
-        current_add_signal(SignalFlags::SIGSEGV);
+        current_add_signal(signal);
     }
 }
 
@@ -79,7 +79,15 @@ pub fn trap_handler() -> ! {
             cx.sepc += 4;
             // get system call return value
             let id = cx.x[17];
-            let result = syscall(id, [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14]]);
+            let result = syscall(
+                id,
+                [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
+            );
+            crate::task::current_task()
+                .unwrap()
+                .inner_exclusive_access()
+                .user_io_frames
+                .clear();
             // cx is changed during sys_exec, so we have to call it again
             cx = current_trap_cx();
             if id != 139 {
@@ -90,20 +98,25 @@ pub fn trap_handler() -> ! {
         Trap::Exception(Exception::StorePageFault)
         | Trap::Exception(Exception::LoadPageFault)
         | Trap::Exception(Exception::InstructionPageFault) => {
-            // brk/mmap 是惰性映射：第一次访问触发缺页，在这里补一帧后继续执行
-            if crate::mm::handle_user_page_fault(stval) {
-                // 补完 PTE 必须刷新 TLB，否则会再次缺页
-                unsafe {
-                    asm!("sfence.vma");
+            use crate::mm::{MapPermission, PageFault};
+            let access = match scause.cause() {
+                Trap::Exception(Exception::StorePageFault) => MapPermission::W,
+                Trap::Exception(Exception::InstructionPageFault) => MapPermission::X,
+                _ => MapPermission::R,
+            };
+            match crate::mm::handle_user_page_fault(stval, access) {
+                PageFault::Resolved => {
+                    unsafe { asm!("sfence.vma"); }
+                    trap_return();
                 }
-                trap_return();
+                PageFault::BeyondEof => handle_user_fault(scause.cause(), stval, SignalFlags::SIGBUS),
+                PageFault::Invalid => handle_user_fault(scause.cause(), stval, SignalFlags::SIGSEGV),
             }
-            handle_user_fault(scause.cause(), stval);
         }
         Trap::Exception(Exception::StoreFault)
         | Trap::Exception(Exception::InstructionFault)
         | Trap::Exception(Exception::LoadFault) => {
-            handle_user_fault(scause.cause(), stval);
+            handle_user_fault(scause.cause(), stval, SignalFlags::SIGSEGV);
         }
         Trap::Exception(Exception::IllegalInstruction) => {
             current_add_signal(SignalFlags::SIGILL);
@@ -129,7 +142,7 @@ pub fn trap_handler() -> ! {
     // check signals
     if let Some((errno, msg)) = check_signals_of_current() {
         println!("[kernel] {}", msg);
-        exit_current_and_run_next(errno);
+        crate::task::exit_current_by_signal(-errno);
     }
     trap_return();
 }

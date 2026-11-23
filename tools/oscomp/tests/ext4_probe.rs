@@ -44,6 +44,8 @@ mod fs {
         fn read(&self, buf: crate::mm::UserBuffer) -> usize;
         fn write(&self, buf: crate::mm::UserBuffer) -> usize;
         fn size(&self) -> usize;
+        fn mapping_size(&self) -> Option<usize>;
+        fn read_mapping(&self, offset: usize, out: &mut [u8]) -> usize;
         fn seek(&self, offset: isize) -> isize;
         fn seek_to(&self, pos: isize) -> isize;
     }
