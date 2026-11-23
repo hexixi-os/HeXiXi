@@ -176,19 +176,38 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     schedule(&mut _unused as *mut _);
 }
 
+/// 编进内核的 oscomp_runner（构建内核前由 os/Makefile 先编好 user）
+static BUILTIN_RUNNER: &[u8] =
+    include_bytes!("../../../user/target/riscv64gc-unknown-none-elf/release/oscomp_runner");
+
 lazy_static! {
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
         // 测试盘上有 run_tests 标记时，改为启动自动跑测的 autorun
         // 盘里有 oscomp_runner 就交给它去跑 *_testcode.sh
         let name = if crate::fs::exists("oscomp_runner") {
-            "oscomp_runner"
+            Some("oscomp_runner")
         } else if crate::fs::exists("run_tests") {
-            "autorun"
+            Some("autorun")
+        } else if crate::fs::exists("initproc") {
+            Some("initproc")
         } else {
-            "initproc"
+            None
         };
-        let v = crate::fs::read_file_all(name).unwrap();
-        ProcessControlBlock::new(v.as_slice())
+        match name {
+            Some(name) => {
+                let v = crate::fs::read_file_all(name).unwrap();
+                ProcessControlBlock::new(v.as_slice())
+            }
+            None => {
+                // 官方评测盘的根目录只有 musl/ glibc/ lib/ lib64/，盘里没有 runner。
+                // 用编进内核的 oscomp_runner，并把工作目录设成 /musl，
+                // 这样它按相对路径就能找到 *_testcode.sh 和 busybox。
+                println!("[kernel] no init program on disk, using built-in oscomp_runner (cwd=musl)");
+                let p = ProcessControlBlock::new(BUILTIN_RUNNER);
+                p.inner_exclusive_access().cwd = alloc::string::String::from("musl");
+                p
+            }
+        }
     };
 }
 

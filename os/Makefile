@@ -72,6 +72,7 @@ $(APPS):
 
 kernel:
 	@echo Platform: $(BOARD)
+	@$(MAKE) -C ../user elf
 	@cp src/linker-$(BOARD).ld src/linker.ld
 	@cargo build --release --features "board_$(BOARD)"
 	@rm src/linker.ld
