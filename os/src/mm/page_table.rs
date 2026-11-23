@@ -284,16 +284,25 @@ pub fn translated_byte_buffer(
 
 /// Load a string from other address spaces into kernel space without an end `\0`.
 pub fn translated_str(token: usize, ptr: *const u8) -> String {
+    read_user_string(token, ptr).unwrap_or_else(|(prefix, _)| prefix)
+}
+
+/// Require a NUL terminator before returning a path to a filesystem operation.
+pub fn translated_path(token: usize, ptr: *const u8) -> Result<String, isize> {
+    read_user_string(token, ptr).map_err(|(_, errno)| errno)
+}
+
+fn read_user_string(token: usize, ptr: *const u8) -> Result<String, (String, isize)> {
+    const PATH_MAX: usize = 4096;
     let page_table = PageTable::from_token(token);
     let mut string = String::new();
     let mut va = ptr as usize;
     let mut checked_vpn = usize::MAX;
-    loop {
+    for _ in 0..PATH_MAX {
         let vpn = VirtAddr::from(va).floor().0;
         if vpn != checked_vpn {
             if !ensure_user_page_mapped(&page_table, va, MapPermission::R) {
-                // 非法指针：按空串处理，避免内核 panic
-                return string;
+                return Err((string, -14)); // EFAULT
             }
             checked_vpn = vpn;
         }
@@ -302,16 +311,12 @@ pub fn translated_str(token: usize, ptr: *const u8) -> String {
             .unwrap()
             .get_ref());
         if ch == 0 {
-            break;
+            return Ok(string);
         }
         string.push(ch as char);
         va += 1;
-        // 防御：用户给的“字符串”可能没有结尾 0
-        if string.len() > 4095 {
-            break;
-        }
     }
-    string
+    Err((string, -36)) // ENAMETOOLONG
 }
 
 fn typed_user_addr<T>(token: usize, va: usize, access: MapPermission) -> Option<PhysAddr> {

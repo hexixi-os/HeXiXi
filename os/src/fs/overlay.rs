@@ -9,38 +9,91 @@ use alloc::vec;
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
 
-type OverlayData = Arc<UPSafeCell<OverlayContents>>;
+pub(super) type OverlayData = Arc<UPSafeCell<OverlayContents>>;
 const MAX_OVERLAY: usize = 0x10_0000;
 
+#[derive(Clone)]
+pub(super) enum OverlayEntry {
+    File(OverlayData),
+    Directory(Arc<()>),
+    Whiteout,
+}
+
+impl OverlayEntry {
+    pub(super) fn dirent_type(&self) -> Option<u8> {
+        match self {
+            Self::File(_) => Some(1),
+            Self::Directory(_) => Some(2),
+            Self::Whiteout => None,
+        }
+    }
+}
+
 lazy_static! {
-    static ref OVERLAY: UPSafeCell<BTreeMap<String, OverlayData>> =
+    static ref OVERLAY: UPSafeCell<BTreeMap<String, OverlayEntry>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
 }
 
-pub fn overlay_get(name: &str) -> Option<OverlayData> {
+pub(super) fn overlay_get(name: &str) -> Option<OverlayEntry> {
     OVERLAY.exclusive_access().get(name).cloned()
 }
 
-pub fn overlay_create(name: &str) -> OverlayData {
+pub(super) fn overlay_create(name: &str) -> OverlayData {
+    let mut entries = OVERLAY.exclusive_access();
+    if let Some(OverlayEntry::File(data)) = entries.get(name) {
+        return data.clone();
+    }
+    let data = Arc::new(unsafe { UPSafeCell::new(OverlayContents::default()) });
+    entries.insert(String::from(name), OverlayEntry::File(data.clone()));
+    data
+}
+
+pub(super) fn overlay_mkdir(name: &str) {
     OVERLAY
         .exclusive_access()
-        .entry(String::from(name))
-        .or_insert_with(|| Arc::new(unsafe { UPSafeCell::new(OverlayContents::default()) }))
-        .clone()
+        .insert(String::from(name), OverlayEntry::Directory(Arc::new(())));
 }
 
-pub fn overlay_remove(name: &str) {
-    OVERLAY.exclusive_access().remove(name);
-}
-
-pub fn overlay_rename(old: &str, new: &str) -> bool {
-    let mut overlay = OVERLAY.exclusive_access();
-    if let Some(data) = overlay.remove(old) {
-        overlay.insert(String::from(new), data);
-        true
+pub(super) fn overlay_unlink(name: &str, hide_lower: bool) {
+    let mut entries = OVERLAY.exclusive_access();
+    if hide_lower {
+        entries.insert(String::from(name), OverlayEntry::Whiteout);
     } else {
-        false
+        entries.remove(name);
     }
+}
+
+pub(super) fn overlay_rename(old: &str, new: &str, hide_lower: bool) -> bool {
+    let mut entries = OVERLAY.exclusive_access();
+    let file = match entries.get(old) {
+        Some(OverlayEntry::File(data)) => OverlayEntry::File(data.clone()),
+        _ => return false,
+    };
+    if old != new {
+        if hide_lower {
+            entries.insert(String::from(old), OverlayEntry::Whiteout);
+        } else {
+            entries.remove(old);
+        }
+        entries.insert(String::from(new), file);
+    }
+    true
+}
+
+pub(super) fn overlay_children(directory: &str) -> BTreeMap<String, OverlayEntry> {
+    let mut prefix = String::from(directory);
+    if !prefix.is_empty() {
+        prefix.push('/');
+    }
+    OVERLAY
+        .exclusive_access()
+        .range(prefix.clone()..)
+        .take_while(|(path, _)| path.starts_with(&prefix))
+        .filter_map(|(path, entry)| {
+            let child = &path[prefix.len()..];
+            (!child.contains('/')).then(|| (String::from(child), entry.clone()))
+        })
+        .collect()
 }
 
 /// The in-memory file owns its pages. MAP_SHARED takes another reference to the same frames.
@@ -152,7 +205,6 @@ pub(super) struct OverlayFile {
     data: OverlayData,
     offset: UPSafeCell<usize>,
     flags: OpenFlags,
-    directory: bool,
 }
 
 impl OverlayFile {
@@ -161,14 +213,6 @@ impl OverlayFile {
             data,
             offset: unsafe { UPSafeCell::new(0) },
             flags,
-            directory: false,
-        }
-    }
-
-    pub(super) fn root(flags: OpenFlags) -> Self {
-        Self {
-            directory: true,
-            ..Self::new(overlay_create("/.rootdir"), flags)
         }
     }
 }
@@ -196,21 +240,35 @@ impl File for OverlayFile {
         *offset - start
     }
 
-    fn write(&self, buf: UserBuffer) -> usize {
+    fn write(&self, buf: UserBuffer) -> isize {
+        const EFBIG: isize = -27;
+        const ENOSPC: isize = -28;
+
         let mut data = self.data.exclusive_access();
         let mut offset = self.offset.exclusive_access();
         let start = *offset;
         for chunk in buf.buffers {
-            let count = chunk.len().min(MAX_OVERLAY.saturating_sub(*offset));
-            let n = unsafe { data.copy_in(*offset, chunk.as_ptr(), count) };
-            *offset += n;
-            if n < count {
+            let len = chunk.len();
+            if len == 0 {
+                continue;
+            }
+            let count = len.min(MAX_OVERLAY.saturating_sub(*offset));
+            if count == 0 {
+                if *offset == start {
+                    return EFBIG;
+                }
                 break;
             }
-            // Preserve the existing 1 MiB limit and reported write length.
-            *offset += chunk.len() - count;
+            let n = unsafe { data.copy_in(*offset, chunk.as_ptr(), count) };
+            if n == 0 && *offset == start {
+                return ENOSPC;
+            }
+            *offset += n;
+            if n < len {
+                break;
+            }
         }
-        *offset - start
+        (*offset - start) as isize
     }
 
     fn size(&self) -> usize {
@@ -246,7 +304,7 @@ impl File for OverlayFile {
     }
 
     fn mapping_size(&self) -> Option<usize> {
-        (!self.directory).then(|| self.size())
+        Some(self.size())
     }
 
     fn mapping_lease(&self) -> Option<Arc<()>> {

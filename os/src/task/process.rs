@@ -3,7 +3,7 @@ use super::manager::insert_into_pid2process;
 use super::TaskControlBlock;
 use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
-use crate::fs::{File, Stdin, Stdout};
+use crate::fs::{DirectoryLocation, File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
@@ -33,18 +33,14 @@ pub struct ProcessControlBlockInner {
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
-    /// 当前工作目录（easy-fs 是扁平命名空间，仅记录字符串）
-    pub cwd: String,
+    /// 当前工作目录
+    pub cwd: DirectoryLocation,
     /// 堆起始（可增长下界）
     pub brk_base: usize,
     /// 当前 program break
     pub brk: usize,
     /// mmap 分配起点（向上增长）
     pub mmap_top: usize,
-    /// 目录 fd -> 路径（getdents 需要知道列哪个目录）
-    pub dir_paths: alloc::collections::BTreeMap<usize, String>,
-    /// 目录 fd -> 已读条目偏移
-    pub dir_offsets: alloc::collections::BTreeMap<usize, usize>,
     /// SIGALRM 到期时间（ms，0 表示未设置）
     pub alarm_deadline: usize,
     /// 每个信号号的用户 handler（0 = SIG_DFL，1 = SIG_IGN）
@@ -130,12 +126,10 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
-                    cwd: String::from("/"),
+                    cwd: DirectoryLocation::root(),
                     brk_base: 0,
                     brk: 0,
                     mmap_top: 0x1000_0000,
-                    dir_paths: alloc::collections::BTreeMap::new(),
-                    dir_offsets: alloc::collections::BTreeMap::new(),
                     alarm_deadline: 0,
                     signal_handlers: [0usize; 32],
                     signal_pending: 0,
@@ -316,7 +310,7 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn fork(self: &Arc<Self>) -> Arc<Self> {
+    pub fn fork(self: &Arc<Self>, stack: usize) -> Arc<Self> {
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
@@ -349,12 +343,10 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
-                    cwd: String::from("/"),
+                    cwd: parent.cwd.clone(),
                     brk_base: 0,
                     brk: 0,
                     mmap_top: 0x1000_0000,
-                    dir_paths: alloc::collections::BTreeMap::new(),
-                    dir_offsets: alloc::collections::BTreeMap::new(),
                     alarm_deadline: 0,
                     signal_handlers: [0usize; 32],
                     signal_pending: 0,
@@ -366,7 +358,6 @@ impl ProcessControlBlock {
         // 子进程继承父进程的工作目录与堆/mmap 指针
         {
             let mut ci = child.inner_exclusive_access();
-            ci.cwd = parent.cwd.clone();
             ci.brk_base = parent.brk_base;
             ci.brk = parent.brk;
             ci.mmap_top = parent.mmap_top;
@@ -396,6 +387,10 @@ impl ProcessControlBlock {
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.kernel_sp = task.kstack.get_top();
+        if stack != 0 {
+            trap_cx.x[2] = stack;
+        }
+        trap_cx.x[10] = 0;
         drop(task_inner);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add this thread to scheduler

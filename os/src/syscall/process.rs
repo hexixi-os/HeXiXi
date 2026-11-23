@@ -2,7 +2,7 @@ use crate::config::PAGE_SIZE;
 use crate::mm::{MapPermission, VirtPageNum, VmaBacking, USER_END};
 use core::ops::Range;
 use crate::fs::{open_file, OpenFlags};
-use crate::mm::{translated_ref, translated_refmut, translated_str};
+use crate::mm::{translated_path, translated_ref, translated_refmut, translated_str};
 use crate::task::{
     current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
     suspend_current_and_run_next, SignalFlags,
@@ -31,24 +31,20 @@ pub fn sys_getpid() -> isize {
 }
 
 pub fn sys_fork() -> isize {
-    let current_process = current_process();
-    let new_process = current_process.fork();
-    let new_pid = new_process.getpid();
-    // modify trap context of new_task, because it returns immediately after switching
-    let new_process_inner = new_process.inner_exclusive_access();
-    let task = new_process_inner.tasks[0].as_ref().unwrap();
-    let trap_cx = task.inner_exclusive_access().get_trap_cx();
-    // we do not have to move to next instruction since we have done it before
-    // for child process, fork returns 0
-    trap_cx.x[10] = 0;
-    new_pid as isize
+    current_process().fork(0).getpid() as isize
 }
 
 pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
     let token = current_user_token();
-    let raw_path = translated_str(token, path);
+    let raw_path = match translated_path(token, path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
     // exec 的路径同样要做归一化（busybox sh 传入的是 ./prog）
-    let path = crate::fs::resolve_path(&raw_path);
+    let path = match crate::fs::resolve_path(&raw_path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
     let mut args_vec: Vec<String> = Vec::new();
     loop {
         let arg_str_ptr = *translated_ref(token, args);

@@ -157,7 +157,7 @@ impl File for Pipe {
             }
         }
     }
-    fn write(&self, buf: UserBuffer) -> usize {
+    fn write(&self, buf: UserBuffer) -> isize {
         assert!(self.writable());
         let mut buf_iter = buf.into_iter();
         let mut write_size = 0usize;
@@ -176,7 +176,7 @@ impl File for Pipe {
                     ring_buffer.write_byte(unsafe { *byte_ref });
                     write_size += 1;
                 } else {
-                    return write_size;
+                    return write_size as isize;
                 }
             }
         }

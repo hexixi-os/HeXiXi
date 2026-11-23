@@ -14,7 +14,8 @@ pub use memory_set::{kernel_token, MapPermission, MemorySet, KERNEL_SPACE};
 pub use vma::{PageFault, VmaBacking, USER_END};
 use page_table::PTEFlags;
 pub use page_table::{
-    translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTable,
+    translated_byte_buffer, translated_path, translated_ref, translated_refmut, translated_str,
+    PageTable,
     PageTableEntry, UserBuffer, UserBufferIterator,
 };
 

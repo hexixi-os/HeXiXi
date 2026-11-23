@@ -65,6 +65,8 @@ bitflags! {
         const RDWR = 1 << 1;
         const CREATE = 1 << 9;
         const TRUNC = 1 << 10;
+        const EXCL = 1 << 11;
+        const DIRECTORY = 1 << 12;
     }
 }
 
@@ -150,7 +152,7 @@ impl File for OSInode {
         }
         total_read_size
     }
-    fn write(&self, buf: UserBuffer) -> usize {
+    fn write(&self, buf: UserBuffer) -> isize {
         let mut inner = self.inner.exclusive_access();
         let mut total_write_size = 0usize;
         for buffer in buf.buffers {
@@ -160,6 +162,6 @@ impl File for OSInode {
             inner.offset += write_size;
             total_write_size += write_size;
         }
-        total_write_size
+        total_write_size as isize
     }
 }

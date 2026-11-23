@@ -396,7 +396,7 @@ impl File for Ext4File {
         *off = new as usize;
         new
     }
-    fn write(&self, _buf: UserBuffer) -> usize {
+    fn write(&self, _buf: UserBuffer) -> isize {
         panic!("EXT4 root is read-only");
     }
 }

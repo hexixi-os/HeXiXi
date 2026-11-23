@@ -1,7 +1,12 @@
-use crate::fs::{make_pipe, open_file, OpenFlags};
-use crate::mm::{translated_byte_buffer, translated_ref, translated_refmut, translated_str, MapPermission, UserBuffer};
+use crate::fs::{self, make_pipe, OpenFlags};
+use crate::mm::{
+    translated_byte_buffer, translated_path, translated_ref, translated_refmut, translated_str,
+    MapPermission, UserBuffer,
+};
 use crate::task::{current_process, current_user_token};
-use alloc::sync::Arc;
+use alloc::{string::String, sync::Arc};
+
+const AT_FDCWD: isize = -100;
 
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
     let token = current_user_token();
@@ -18,7 +23,7 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
         match translated_byte_buffer(token, buf, len, MapPermission::R) {
-            Some(buffers) => file.write(UserBuffer::new(buffers)) as isize,
+            Some(buffers) => file.write(UserBuffer::new(buffers)),
             None => -14,
         }
     } else {
@@ -35,6 +40,9 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
     }
     if let Some(file) = &inner.fd_table[fd] {
         let file = file.clone();
+        if file.directory().is_some() {
+            return -21; // EISDIR
+        }
         if !file.readable() {
             return -1;
         }
@@ -157,7 +165,7 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
                 None => return -14,
             }
         }
-        file.write(UserBuffer::new(buffers)) as isize
+        file.write(UserBuffer::new(buffers))
     } else {
         -1
     }
@@ -168,26 +176,59 @@ pub fn sys_ioctl() -> isize {
     -25 // ENOTTY
 }
 
-/// openat(2)：只支持 AT_FDCWD；把 Linux 的 open flags 翻译成内核 OpenFlags
-pub fn sys_openat(_dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isize {
-    // easy-fs 是扁平命名空间，忽略 dirfd，按绝对名字查找
-    let token = current_user_token();
-    // easy-fs 是扁平命名空间：去掉 "./" 与前导 "/"
-    let path = translated_str(token, path);
-    let path = crate::fs::resolve_path(&path);
-    let mut of = OpenFlags::RDONLY;
-    match flags & 0b11 {
-        1 => of = OpenFlags::WRONLY,
-        2 => of = OpenFlags::RDWR,
-        _ => {}
+fn resolve_at(dirfd: isize, path: &str) -> Result<String, isize> {
+    if path.is_empty() {
+        return Err(-2); // ENOENT
     }
-    if flags & 0o100 != 0 {
-        of |= OpenFlags::CREATE;
+    if path.starts_with('/') || dirfd == AT_FDCWD {
+        return fs::resolve_path(path);
     }
-    if flags & 0o1000 != 0 {
-        of |= OpenFlags::TRUNC;
+
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let file = inner
+        .fd_table
+        .get(dirfd as usize)
+        .and_then(Option::as_ref)
+        .cloned()
+        .ok_or(-9isize)?;
+    drop(inner);
+    let directory = file.directory().ok_or(-20isize)?.location();
+    if !fs::directory_is_live(directory) {
+        return Err(-2);
     }
-    let inode = match crate::fs::open_dyn(path.as_str(), of) {
+    fs::resolve_from(path, directory.path())
+}
+
+/// openat(56)：解析 cwd 或目录 fd，并把 Linux flags 翻译成内核 OpenFlags。
+pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isize {
+    let raw = match translated_path(current_user_token(), path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
+    let path = match resolve_at(dirfd, &raw) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
+    let mut open_flags = match flags & 0b11 {
+        1 => OpenFlags::WRONLY,
+        2 => OpenFlags::RDWR,
+        _ => OpenFlags::RDONLY,
+    };
+    for (linux, internal) in [
+        (0o100, OpenFlags::CREATE),
+        (0o200, OpenFlags::EXCL),
+        (0o1000, OpenFlags::TRUNC),
+        (0o200000, OpenFlags::DIRECTORY),
+    ] {
+        if flags & linux != 0 {
+            open_flags |= internal;
+        }
+    }
+    if raw.ends_with('/') {
+        open_flags |= OpenFlags::DIRECTORY;
+    }
+    let file = match fs::open_dyn(&path, open_flags) {
         Ok(file) => file,
         Err(errno) => return errno,
     };
@@ -197,10 +238,7 @@ pub fn sys_openat(_dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isi
         Some(fd) => fd,
         None => return -24, // EMFILE
     };
-    inner.fd_table[fd] = Some(inode);
-    if crate::fs::is_dir_path(path.as_str()) {
-        inner.dir_paths.insert(fd, path.clone());
-    }
+    inner.fd_table[fd] = Some(file);
     fd as isize
 }
 
@@ -222,23 +260,16 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, _flags: u32) -> isize {
     newfd as isize
 }
 
-/// chdir(49)：更新工作目录，支持相对路径和上级目录。
+/// chdir(49)：切换到解析后的目录。
 pub fn sys_chdir(path: *const u8) -> isize {
-    let token = current_user_token();
-    let path = translated_str(token, path);
-    let resolved = crate::fs::resolve_path(&path);
-    let mut components = alloc::vec::Vec::new();
-    for component in resolved.split('/') {
-        match component {
-            "" | "." => (),
-            ".." => {
-                components.pop();
-            }
-            name => components.push(name),
-        }
-    }
-    let process = current_process();
-    process.inner_exclusive_access().cwd = components.join("/");
+    let directory = match translated_path(current_user_token(), path)
+        .and_then(|raw| resolve_at(AT_FDCWD, &raw))
+        .and_then(|path| fs::working_directory(&path))
+    {
+        Ok(directory) => directory,
+        Err(errno) => return errno,
+    };
+    current_process().inner_exclusive_access().cwd = directory;
     0
 }
 
@@ -246,10 +277,11 @@ pub fn sys_chdir(path: *const u8) -> isize {
 pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     let token = current_user_token();
     let cwd = current_process().inner_exclusive_access().cwd.clone();
-    let mut s = alloc::string::String::from("/");
-    if !cwd.is_empty() && cwd != "/" {
-        s.push_str(cwd.as_str());
+    if !fs::directory_is_live(&cwd) {
+        return -2;
     }
+    let mut s = alloc::string::String::from("/");
+    s.push_str(cwd.path());
     let n = s.len().min(size.saturating_sub(1));
     for (i, c) in s.as_bytes().iter().take(n).enumerate() {
         *translated_refmut(token, (buf as usize + i) as *mut u8) = *c;
@@ -258,33 +290,37 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     buf as isize
 }
 
-/// mkdirat(34)：easy-fs 无目录，用空文件模拟
-pub fn sys_mkdirat(_dirfd: isize, path: *const u8) -> isize {
-    let token = current_user_token();
-    let p = translated_str(token, path);
-    let p = alloc::string::String::from(p.trim_start_matches("./").trim_start_matches('/'));
-    if crate::fs::has_ext4() {
-        // EXT4 只读，用内存 overlay 记录
-        crate::fs::overlay_create(p.as_str());
-        return 0;
-    }
-    match open_file(p.as_str(), OpenFlags::CREATE | OpenFlags::RDONLY) {
-        Some(_) => 0,
-        None => -1,
-    }
+pub fn sys_mkdirat(dirfd: isize, path: *const u8) -> isize {
+    translated_path(current_user_token(), path)
+        .and_then(|raw| resolve_at(dirfd, &raw))
+        .and_then(|path| fs::mkdir(&path))
+        .err()
+        .unwrap_or(0)
 }
 
-/// unlinkat(35)：记入墓碑集合，之后 open 找不到它
-pub fn sys_unlinkat(_dirfd: isize, path: *const u8) -> isize {
-    let token = current_user_token();
-    let p = translated_str(token, path);
-    let p = alloc::string::String::from(p.trim_start_matches("./").trim_start_matches('/'));
-    if crate::fs::has_ext4() {
-        crate::fs::overlay_remove(p.as_str());
-        return 0;
+pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: usize) -> isize {
+    const AT_REMOVEDIR: usize = 0x200;
+    if flags & !AT_REMOVEDIR != 0 {
+        return -22; // EINVAL
     }
-    crate::fs::mark_unlinked(p.as_str());
-    0
+    let remove_directory = flags & AT_REMOVEDIR != 0;
+    translated_path(current_user_token(), path)
+        .and_then(|raw| {
+            let path = resolve_at(dirfd, &raw)?;
+            if remove_directory {
+                match raw.trim_end_matches('/').rsplit('/').next() {
+                    Some(".") => return Err(-22),
+                    Some("..") => return Err(-39),
+                    _ => {}
+                }
+            }
+            if raw.ends_with('/') {
+                fs::require_directory(&path)?;
+            }
+            fs::unlink(&path, remove_directory)
+        })
+        .err()
+        .unwrap_or(0)
 }
 
 /// fstat(80)：填 riscv64 的 struct stat（128 字节）
@@ -295,13 +331,14 @@ pub fn sys_fstat(fd: usize, st: *mut u8) -> isize {
     if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
         return -1;
     }
-    let file_size = inner.fd_table[fd].as_ref().unwrap().size();
+    let file = inner.fd_table[fd].as_ref().unwrap();
+    let file_size = file.size();
+    let mode: u32 = if file.directory().is_some() { 0o40755 } else { 0o100644 };
     drop(inner);
     let mut buf = [0u8; 128];
     // st_ino = fd
     buf[8..16].copy_from_slice(&(fd as u64).to_le_bytes());
-    // st_mode = S_IFREG | 0644
-    buf[16..20].copy_from_slice(&(0o100644u32).to_le_bytes());
+    buf[16..20].copy_from_slice(&mode.to_le_bytes());
     // st_nlink = 1
     buf[20..24].copy_from_slice(&1u32.to_le_bytes());
     // st_size
@@ -319,52 +356,66 @@ pub fn sys_mount_stub() -> isize {
     0
 }
 
-/// getdents64(61)：枚举 easy-fs 根目录
+/// getdents64(61)：按打开的目录描述读取目录项。
 pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
-    let token = current_user_token();
-    let dir = {
+    let file = {
         let process = current_process();
         let inner = process.inner_exclusive_access();
-        inner.dir_paths.get(&fd).cloned().unwrap_or_default()
+        match inner.fd_table.get(fd).and_then(Option::as_ref) {
+            Some(file) => file.clone(),
+            None => return -9,
+        }
     };
-    // 支持多次读取直到 EOF（busybox 的 readdir 依赖）
-    let (names, mut offset) = {
-        let process = current_process();
-        let inner = process.inner_exclusive_access();
-        let names: alloc::vec::Vec<alloc::string::String> = crate::fs::list_dir_path(dir.as_str())
-            .into_iter()
-            .map(|(n, _, _)| n)
-            .collect();
-        let offset = inner.dir_offsets.get(&fd).copied().unwrap_or(0);
-        (names, offset)
+    let directory = match file.directory() {
+        Some(directory) => directory,
+        None => return -20,
     };
-    if offset >= names.len() {
+    if !fs::directory_is_live(directory.location()) {
+        return -2;
+    }
+    let entries = fs::list_dir_path(directory.location().path());
+    let mut position = directory.position();
+    if position >= entries.len() {
         return 0;
     }
-    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    for (i, name) in names.iter().enumerate().skip(offset) {
-        // struct linux_dirent64 { u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[]; }
+
+    let mut out = alloc::vec::Vec::new();
+    for (name, ino, file_type) in entries.iter().skip(position) {
+        // struct linux_dirent64 { u64 ino; s64 off; u16 reclen; u8 type; char name[]; }
         let reclen = (19 + name.len() + 1 + 7) & !7usize;
         if out.len() + reclen > len {
+            if out.is_empty() {
+                return -22;
+            }
             break;
         }
         let start = out.len();
         out.resize(start + reclen, 0);
-        out[start..start + 8].copy_from_slice(&((i + 1) as u64).to_le_bytes());
+        position += 1;
+        out[start..start + 8].copy_from_slice(&u64::from(*ino).to_le_bytes());
+        out[start + 8..start + 16].copy_from_slice(&(position as i64).to_le_bytes());
         out[start + 16..start + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
-        out[start + 18] = 8; // DT_REG
+        out[start + 18] = match file_type {
+            1 => 8,  // DT_REG
+            2 => 4,  // DT_DIR
+            3 => 3,  // DT_CHR
+            4 => 6,  // DT_BLK
+            5 => 1,  // DT_FIFO
+            6 => 12, // DT_SOCK
+            7 => 10, // DT_LNK
+            _ => 0,  // DT_UNKNOWN
+        };
         out[start + 19..start + 19 + name.len()].copy_from_slice(name.as_bytes());
-        offset = i + 1;
-    }
-    {
-        let process = current_process();
-        let mut inner = process.inner_exclusive_access();
-        inner.dir_offsets.insert(fd, offset);
     }
     let n = out.len();
-    for (i, b) in out.iter().enumerate() {
-        *translated_refmut(token, (buf as usize + i) as *mut u8) = *b;
+    let target = match translated_byte_buffer(current_user_token(), buf, n, MapPermission::W) {
+        Some(buffers) => UserBuffer::new(buffers),
+        None => return -14,
+    };
+    for (dst, byte) in target.into_iter().zip(out) {
+        unsafe { dst.write(byte) };
     }
+    directory.set_position(position);
     n as isize
 }
 
@@ -381,15 +432,35 @@ fn write_stat(token: usize, st: *mut u8, size: usize, mode: u32) {
 }
 
 /// newfstatat(79)：按路径取文件信息
-pub fn sys_newfstatat(path: *const u8, st: *mut u8) -> isize {
+pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut u8, flags: usize) -> isize {
+    const AT_EMPTY_PATH: usize = 0x1000;
     let token = current_user_token();
-    let raw = translated_str(token, path);
-    let p = crate::fs::resolve_path(&raw);
-    if crate::fs::is_dir_path(p.as_str()) {
+    let raw = match translated_path(token, path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
+    let resolved = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        if dirfd != AT_FDCWD {
+            return sys_fstat(dirfd as usize, st);
+        }
+        fs::resolve_path(".")
+    } else {
+        resolve_at(dirfd, &raw)
+    };
+    let path = match resolved {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
+    if raw.ends_with('/') {
+        if let Err(errno) = fs::require_directory(&path) {
+            return errno;
+        }
+    }
+    if fs::path_is_directory(&path) == Ok(true) {
         write_stat(token, st, 4096, 0o40755);
         return 0;
     }
-    match crate::fs::read_file_all(p.as_str()) {
+    match fs::read_file_all(&path) {
         Some(data) => {
             write_stat(token, st, data.len(), 0o100644);
             0
@@ -402,11 +473,17 @@ pub fn sys_newfstatat(path: *const u8, st: *mut u8) -> isize {
 /// renameat(38)：在 overlay 里做重命名
 pub fn sys_renameat(oldpath: *const u8, newpath: *const u8) -> isize {
     let token = current_user_token();
-    let old = translated_str(token, oldpath);
-    let new = translated_str(token, newpath);
-    let old = crate::fs::resolve_path(&old);
-    let new = crate::fs::resolve_path(&new);
-    if crate::fs::overlay_rename(&old, &new) { 0 } else { -2 }
+    let result = (|| {
+        let old = translated_path(token, oldpath)?;
+        let new = translated_path(token, newpath)?;
+        let old_name = resolve_at(AT_FDCWD, &old)?;
+        let new_name = resolve_at(AT_FDCWD, &new)?;
+        if old.ends_with('/') || new.ends_with('/') {
+            return Err(-20); // This rename path only handles regular overlay files.
+        }
+        fs::rename_overlay_file(&old_name, &new_name)
+    })();
+    result.err().unwrap_or(0)
 }
 
 pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
@@ -470,14 +547,19 @@ pub fn sys_sendfile(_in_fd: usize, _out_fd: usize, _count: usize) -> isize {
 /// busybox touch 先调 utimensat，我们原来直接返回 0，它就不会创建文件，
 /// 后面 lmbench 打开 /var/tmp/lmbench 全是 EPERM。
 pub fn sys_utimensat(path: *const u8) -> isize {
-    let token = current_user_token();
-    let raw = translated_str(token, path);
-    let p = crate::fs::resolve_path(&raw);
-    if crate::fs::exists(&p) {
-        return 0;
-    }
-    crate::fs::overlay_create(&p);
-    0
+    translated_path(current_user_token(), path)
+        .and_then(|raw| {
+            let path = resolve_at(AT_FDCWD, &raw)?;
+            if raw.ends_with('/') {
+                fs::require_directory(&path)
+            } else if fs::exists(&path) {
+                Ok(())
+            } else {
+                fs::open_dyn(&path, OpenFlags::CREATE | OpenFlags::RDWR).map(|_| ())
+            }
+        })
+        .err()
+        .unwrap_or(0)
 }
 
 /// statfs(43)/fstatfs(44)：返回最小的 ext4 统计信息
@@ -527,6 +609,9 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         return -1;
     }
     if let Some(file) = &inner.fd_table[fd] {
+        if file.directory().is_some() {
+            return -21; // EISDIR
+        }
         if !file.readable() {
             return -1;
         }

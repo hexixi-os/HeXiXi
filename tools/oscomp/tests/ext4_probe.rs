@@ -84,7 +84,7 @@ mod fs {
         fn readable(&self) -> bool;
         fn writable(&self) -> bool;
         fn read(&self, buf: crate::mm::UserBuffer) -> usize;
-        fn write(&self, buf: crate::mm::UserBuffer) -> usize;
+        fn write(&self, buf: crate::mm::UserBuffer) -> isize;
         fn size(&self) -> usize;
         fn mapping_size(&self) -> Option<usize>;
         fn mapping_page(&self, offset: usize) -> Option<std::sync::Arc<crate::mm::FrameTracker>>;
