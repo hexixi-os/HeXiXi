@@ -1,7 +1,7 @@
 use super::{frame_alloc, FrameTracker, MapPermission, PTEFlags, PageTable, VirtPageNum};
 use crate::{config::PAGE_SIZE, fs::File, sync::UPSafeCell};
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
-use core::ops::Range;
+use core::{arch::asm, ops::Range};
 
 pub const USER_END: usize = 1 << 38;
 
@@ -69,27 +69,25 @@ impl VmaBacking {
         } = self
         {
             return !permissions.contains(MapPermission::W)
-                || (file.writable() && file.shared_mappable());
+                || (file.writable() && file.supports_mapped_writes());
         }
         true
     }
 
-    fn load(&self, bytes: usize) -> Result<Arc<FrameTracker>, PageFault> {
-        fn alloc_page() -> Result<Arc<FrameTracker>, PageFault> {
-            frame_alloc().map(Arc::new).ok_or(PageFault::Invalid)
-        }
-
-        match self {
-            Self::Anonymous => alloc_page(),
+    fn load(&self, bytes: usize) -> Result<ResidentPage, PageFault> {
+        let (frame, copy_on_write) = match self {
+            Self::Anonymous => (alloc_page()?, false),
             Self::SharedAnonymous { pages, offset } => {
                 let mut pages = pages.exclusive_access();
                 let index = (offset + bytes) / PAGE_SIZE;
-                if let Some(page) = pages.get(&index) {
-                    return Ok(page.clone());
-                }
-                let page = alloc_page()?;
-                pages.insert(index, page.clone());
-                Ok(page)
+                let page = if let Some(page) = pages.get(&index) {
+                    page.clone()
+                } else {
+                    let page = alloc_page()?;
+                    pages.insert(index, page.clone());
+                    page
+                };
+                (page, false)
             }
             Self::File {
                 file,
@@ -101,14 +99,45 @@ impl VmaBacking {
                 if offset >= file.mapping_size().ok_or(PageFault::Invalid)? {
                     return Err(PageFault::BeyondEof);
                 }
-                if *shared && file.shared_mappable() {
-                    return file.shared_page(offset).ok_or(PageFault::Invalid);
-                }
-                let page = alloc_page()?;
-                file.read_mapping(offset, page.ppn.get_bytes_array());
-                Ok(page)
+                let page = file.mapping_page(offset).ok_or(PageFault::Invalid)?;
+                (page, !shared)
             }
+        };
+        Ok(ResidentPage {
+            frame,
+            copy_on_write,
+        })
+    }
+}
+
+fn alloc_page() -> Result<Arc<FrameTracker>, PageFault> {
+    frame_alloc().map(Arc::new).ok_or(PageFault::Invalid)
+}
+
+#[derive(Clone)]
+struct ResidentPage {
+    frame: Arc<FrameTracker>,
+    copy_on_write: bool,
+}
+
+impl ResidentPage {
+    fn flags(&self, mut permissions: MapPermission) -> PTEFlags {
+        if self.copy_on_write {
+            permissions.remove(MapPermission::W);
         }
+        PTEFlags::from_bits(permissions.bits()).unwrap()
+    }
+
+    fn private_copy(&self) -> Result<Self, PageFault> {
+        let frame = alloc_page()?;
+        frame
+            .ppn
+            .get_bytes_array()
+            .copy_from_slice(self.frame.ppn.get_bytes_array());
+        Ok(Self {
+            frame,
+            copy_on_write: false,
+        })
     }
 }
 
@@ -122,16 +151,12 @@ struct Vma {
 #[derive(Default)]
 pub(super) struct VmaSpace {
     areas: BTreeMap<VirtPageNum, Vma>,
-    pages: BTreeMap<VirtPageNum, Arc<FrameTracker>>,
-}
-
-fn pte_flags(permissions: MapPermission) -> PTEFlags {
-    PTEFlags::from_bits(permissions.bits()).unwrap()
+    pages: BTreeMap<VirtPageNum, ResidentPage>,
 }
 
 impl VmaSpace {
     pub(super) fn pin(&self, vpn: VirtPageNum) -> Option<Arc<FrameTracker>> {
-        self.pages.get(&vpn).cloned()
+        self.pages.get(&vpn).map(|page| page.frame.clone())
     }
 
     pub(super) fn insert(
@@ -150,8 +175,11 @@ impl VmaSpace {
         );
     }
 
-    fn covering(&self, vpn: VirtPageNum) -> Option<(VirtPageNum, &Vma)> {
-        self.areas
+    fn covering(
+        areas: &BTreeMap<VirtPageNum, Vma>,
+        vpn: VirtPageNum,
+    ) -> Option<(VirtPageNum, &Vma)> {
+        areas
             .range(..=vpn)
             .next_back()
             .filter(|(_, area)| vpn < area.end)
@@ -163,7 +191,7 @@ impl VmaSpace {
         vpn: VirtPageNum,
         permissions: MapPermission,
     ) -> Option<Result<VirtPageNum, isize>> {
-        self.covering(vpn).map(|(_, area)| {
+        Self::covering(&self.areas, vpn).map(|(_, area)| {
             if area.backing.allows(permissions) {
                 Ok(area.end)
             } else {
@@ -181,7 +209,7 @@ impl VmaSpace {
     }
 
     fn split(&mut self, vpn: VirtPageNum) {
-        if let Some((start, area)) = self.covering(vpn) {
+        if let Some((start, area)) = Self::covering(&self.areas, vpn) {
             if start < vpn {
                 let mut right = area.clone();
                 right.backing.advance((vpn.0 - start.0) * PAGE_SIZE);
@@ -202,8 +230,8 @@ impl VmaSpace {
         for (_, area) in self.areas.range_mut(range.clone()) {
             area.permissions = permissions;
         }
-        for (&vpn, _) in self.pages.range(range) {
-            table.set_flags(vpn, pte_flags(permissions));
+        for (&vpn, page) in self.pages.range(range) {
+            table.set_flags(vpn, page.flags(permissions));
         }
     }
 
@@ -227,7 +255,7 @@ impl VmaSpace {
         let mut retired = Vec::with_capacity(vpns.len());
         for vpn in vpns {
             table.unmap_and_reclaim(vpn, tables);
-            retired.push(self.pages.remove(&vpn).unwrap());
+            retired.push(self.pages.remove(&vpn).unwrap().frame);
         }
         retired
     }
@@ -238,18 +266,38 @@ impl VmaSpace {
         vpn: VirtPageNum,
         access: MapPermission,
     ) -> PageFault {
-        let (start, area) = match self.covering(vpn) {
+        let (start, area) = match Self::covering(&self.areas, vpn) {
             Some(mapping) if mapping.1.permissions.contains(access) => mapping,
             _ => return PageFault::Invalid,
         };
-        if self.pages.contains_key(&vpn) {
-            return PageFault::Invalid;
+        let permissions = area.permissions;
+        if let Some(page) = self.pages.get_mut(&vpn) {
+            if !page.copy_on_write || access != MapPermission::W {
+                return PageFault::Invalid;
+            }
+            let new = match page.private_copy() {
+                Ok(page) => page,
+                Err(fault) => return fault,
+            };
+            table.remap(vpn, new.frame.ppn, new.flags(permissions));
+            let old = core::mem::replace(page, new);
+            unsafe {
+                asm!("sfence.vma");
+            }
+            drop(old);
+            return PageFault::Resolved;
         }
-        let page = match area.backing.load((vpn.0 - start.0) * PAGE_SIZE) {
+        let mut page = match area.backing.load((vpn.0 - start.0) * PAGE_SIZE) {
             Ok(page) => page,
             Err(fault) => return fault,
         };
-        if !table.try_map(vpn, page.ppn, pte_flags(area.permissions)) {
+        if page.copy_on_write && access == MapPermission::W {
+            page = match page.private_copy() {
+                Ok(page) => page,
+                Err(fault) => return fault,
+            };
+        }
+        if !table.try_map(vpn, page.frame.ppn, page.flags(permissions)) {
             return PageFault::Invalid;
         }
         self.pages.insert(vpn, page);
@@ -262,17 +310,16 @@ impl VmaSpace {
             pages: BTreeMap::new(),
         };
         for (&vpn, page) in &self.pages {
-            let (_, area) = self.covering(vpn).unwrap();
-            let new_page = if area.backing.is_shared() {
+            let (_, area) = Self::covering(&self.areas, vpn).unwrap();
+            let new_page = if area.backing.is_shared() || page.copy_on_write {
                 page.clone()
             } else {
-                let copy = Arc::new(frame_alloc().unwrap());
-                copy.ppn
-                    .get_bytes_array()
-                    .copy_from_slice(page.ppn.get_bytes_array());
-                copy
+                match page.private_copy() {
+                    Ok(page) => page,
+                    Err(_) => panic!("out of frames copying a resident page during fork"),
+                }
             };
-            table.map(vpn, new_page.ppn, pte_flags(area.permissions));
+            table.map(vpn, new_page.frame.ppn, new_page.flags(area.permissions));
             child.pages.insert(vpn, new_page);
         }
         child

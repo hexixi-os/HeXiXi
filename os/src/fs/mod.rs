@@ -1,6 +1,7 @@
 pub mod ext4;
 mod inode;
 mod overlay;
+pub(crate) mod page_cache;
 mod pipe;
 mod stdio;
 
@@ -15,16 +16,13 @@ pub trait File: Send + Sync {
     fn mapping_size(&self) -> Option<usize> {
         None
     }
-    fn read_mapping(&self, _offset: usize, _out: &mut [u8]) -> usize {
-        0
-    }
     fn mapping_lease(&self) -> Option<Arc<()>> {
         None
     }
-    fn shared_mappable(&self) -> bool {
+    fn supports_mapped_writes(&self) -> bool {
         false
     }
-    fn shared_page(&self, _offset: usize) -> Option<Arc<FrameTracker>> {
+    fn mapping_page(&self, _offset: usize) -> Option<Arc<FrameTracker>> {
         None
     }
     /// 文件大小（fstat/mmap 需要）

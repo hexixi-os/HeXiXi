@@ -65,13 +65,21 @@ pub fn exit_current_by_signal(signal: i32) {
 }
 
 fn exit_current_with_status(exit_code: i32, wait_status: i32) {
-    let task = take_current_task().unwrap();
-    let mut task_inner = task.inner_exclusive_access();
+    let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
-    let tid = task_inner.res.as_ref().unwrap().tid;
+    let (tid, clear_child_tid) = {
+        let inner = task.inner_exclusive_access();
+        (inner.res.as_ref().unwrap().tid, inner.clear_child_tid)
+    };
+    // A private file mapping may need a COW fault while the task is still current.
+    if tid != 0 && clear_child_tid != 0 {
+        let token = process.inner_exclusive_access().memory_set.token();
+        *crate::mm::translated_refmut(token, clear_child_tid as *mut i32) = 0;
+    }
+    drop(take_current_task());
+    let mut task_inner = task.inner_exclusive_access();
     // record exit code
     task_inner.exit_code = Some(exit_code);
-    let clear_child_tid = task_inner.clear_child_tid;
     task_inner.res = None;
     // here we do not remove the thread since we are still using the kstack
     // it will be deallocated when sys_waittid is called
@@ -163,12 +171,6 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32) {
             recycle_task(t);
         }
     } else {
-        // 普通线程退出：先按 CLONE_CHILD_CLEARTID 语义清零 tid 并唤醒 join 者
-        let cctid = clear_child_tid;
-        if cctid != 0 {
-            let token = process.inner_exclusive_access().memory_set.token();
-            *crate::mm::translated_refmut(token, cctid as *mut i32) = 0;
-        }
         // 从进程线程表摘除，TCB 交给延迟回收队列
         let process = process.clone();
         let mut process_inner = process.inner_exclusive_access();

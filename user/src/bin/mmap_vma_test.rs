@@ -5,7 +5,7 @@
 extern crate user_lib;
 
 use core::arch::asm;
-use user_lib::{close, exit, fork, open, read, waitpid, write, OpenFlags};
+use user_lib::{close, exit, fork, open, read, waitpid, write, yield_, OpenFlags};
 
 const PAGE: usize = 4096;
 const READ: usize = 1;
@@ -46,6 +46,26 @@ fn store(addr: usize, value: u8) {
     unsafe { (addr as *mut u8).write_volatile(value) }
 }
 
+fn clone_with_clear_tid(addr: usize) -> isize {
+    const CLONE_FLAGS: usize = 0x0021_0900; // VM | SIGHAND | THREAD | CHILD_CLEARTID
+    let tid;
+    unsafe {
+        // The child uses no stack and exits straight from assembly.
+        asm!(
+            "ecall",
+            "bnez a0, 2f",
+            "li a7, 93",
+            "ecall",
+            "unimp",
+            "2:",
+            inlateout("a0") CLONE_FLAGS => tid,
+            in("a1") 0usize, in("a2") 0usize, in("a3") 0usize, in("a4") addr,
+            inlateout("a7") 220usize => _,
+        );
+    }
+    tid
+}
+
 fn expect_signal(addr: usize, write_access: bool, signal: i32) {
     let pid = fork();
     assert!(pid >= 0);
@@ -79,8 +99,15 @@ fn main() -> i32 {
     let base = mmap(0, 4 * PAGE, READ | WRITE, PRIVATE, fd, PAGE);
     let mirror = mmap(0, PAGE, READ, PRIVATE, fd, PAGE);
     let tail = mmap(0, 2 * PAGE, READ, PRIVATE, fd, 4 * PAGE);
-    assert!(base > 0 && mirror > 0 && tail > 0);
+    let kernel_copy = mmap(0, PAGE, READ | WRITE, PRIVATE, fd, PAGE);
+    let cold_kernel_copy = mmap(0, PAGE, READ | WRITE, PRIVATE, fd, PAGE);
+    let pipe_copy = mmap(0, PAGE, READ | WRITE, PRIVATE, fd, PAGE);
+    let clear_tid_copy = mmap(0, PAGE, READ | WRITE, PRIVATE, fd, PAGE);
+    assert!(base > 0 && mirror > 0 && tail > 0 && kernel_copy > 0 && cold_kernel_copy > 0);
+    assert!(pipe_copy > 0 && clear_tid_copy > 0);
     let (base, mirror, tail) = (base as usize, mirror as usize, tail as usize);
+    let (kernel_copy, cold_kernel_copy) = (kernel_copy as usize, cold_kernel_copy as usize);
+    let (pipe_copy, clear_tid_copy) = (pipe_copy as usize, clear_tid_copy as usize);
     assert_eq!(load(base), b'B', "nonzero file offset");
     assert_eq!(
         mmap(base, PAGE, READ, PRIVATE | FIXED_NOREPLACE, fd, PAGE),
@@ -94,6 +121,18 @@ fn main() -> i32 {
     assert_eq!(mprotect(shared_read as usize, PAGE, READ | WRITE), -13);
     assert_eq!(close(fd as usize), 0);
     assert_eq!(load(shared_read as usize), b'A');
+    assert_eq!(load(kernel_copy), b'B');
+    let child = fork();
+    assert!(child >= 0);
+    if child == 0 {
+        store(kernel_copy, b'F');
+        assert_eq!(load(kernel_copy), b'F');
+        exit(0);
+    }
+    let mut status = 0;
+    assert_eq!(waitpid(child as usize, &mut status), child);
+    assert_eq!(status, 0);
+    assert_eq!(load(kernel_copy), b'B');
 
     assert_eq!(mprotect(base + PAGE, PAGE, 0), 0);
     expect_signal(base + PAGE, false, 11);
@@ -119,6 +158,10 @@ fn main() -> i32 {
     assert!(shared > 0);
     let shared = shared as usize;
     assert_eq!(load(shared + 1), b'b');
+    let private_overlay = mmap(0, PAGE, READ, PRIVATE, fd, 0);
+    assert!(private_overlay > 0);
+    let private_overlay = private_overlay as usize;
+    assert_eq!(load(private_overlay + 1), b'b');
     let child = fork();
     assert!(child >= 0);
     if child == 0 {
@@ -129,13 +172,47 @@ fn main() -> i32 {
     assert_eq!(waitpid(child as usize, &mut status), child);
     assert_eq!(status, 0);
     assert_eq!(load(shared + 1), b'X');
+    assert_eq!(
+        load(private_overlay + 1),
+        b'X',
+        "private mapping shares the unmodified file page"
+    );
+    assert_eq!(mprotect(private_overlay, PAGE, READ | WRITE), 0);
+    store(private_overlay + 1, b'P');
+    assert_eq!(load(private_overlay + 1), b'P');
+    assert_eq!(load(shared + 1), b'X');
+    assert_eq!(munmap(private_overlay, PAGE), 0);
     let reader = open("mmap-shared.bin\0", OpenFlags::RDONLY);
     assert!(reader >= 0);
     assert_eq!(syscall(63, [reader as usize, mirror, 1, 0, 0, 0]), -14);
     let mut contents = [0; 3];
     assert_eq!(read(reader as usize, &mut contents), 3);
     assert_eq!(&contents, b"aXc");
+    for destination in [kernel_copy, cold_kernel_copy] {
+        assert_eq!(syscall(62, [reader as usize, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(syscall(63, [reader as usize, destination, 1, 0, 0, 0]), 1);
+        assert_eq!(load(destination), b'a');
+        assert_eq!(load(mirror), b'B');
+    }
+    let file_again = open("mmap-fixture.bin\0", OpenFlags::RDONLY);
+    assert!(file_again >= 0);
+    assert_eq!(
+        syscall(62, [file_again as usize, PAGE, 0, 0, 0, 0]),
+        PAGE as isize
+    );
+    assert_eq!(read(file_again as usize, &mut contents), 3);
+    assert_eq!(&contents, b"BBB");
+    assert_eq!(close(file_again as usize), 0);
     assert_eq!(load(mirror), b'B');
+
+    assert_eq!(load(pipe_copy), b'B');
+    assert_eq!(syscall(59, [pipe_copy, 0, 0, 0, 0, 0]), 0);
+    for offset in [0, 4] {
+        let fd = unsafe { ((pipe_copy + offset) as *const i32).read_volatile() };
+        assert_eq!(close(fd as usize), 0, "pipe copyout returned a descriptor");
+    }
+    assert_eq!(load(mirror), b'B');
+
     assert_eq!(syscall(46, [fd as usize, 1, 0, 0, 0, 0]), -16);
     assert_eq!(
         open("mmap-shared.bin\0", OpenFlags::RDWR | OpenFlags::TRUNC),
@@ -191,6 +268,17 @@ fn main() -> i32 {
     assert_eq!(status, 0);
     assert_eq!(load(anon_shared), 0);
     assert_eq!(load(anon_shared + 2 * PAGE), b'R');
+
+    // Run this after the fork cases because the thread leaves an unused task slot.
+    assert_eq!(load(clear_tid_copy), b'B');
+    assert!(clone_with_clear_tid(clear_tid_copy) > 0);
+    yield_();
+    assert_eq!(
+        unsafe { (clear_tid_copy as *const i32).read_volatile() },
+        0,
+        "thread exit cleared TID through a private file mapping"
+    );
+    assert_eq!(load(mirror), b'B');
     println!("mmap-vma-test-ok");
     0
 }

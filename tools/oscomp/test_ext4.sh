@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 验证 EXT4 区间读取、稀疏文件和 extent 树，并可选验证官方盘跨块组读取。
+# 验证 EXT4 区间读取、页缓存、稀疏文件和 extent 树，并可选验证官方盘跨块组读取。
 set -euo pipefail
 
 tool_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

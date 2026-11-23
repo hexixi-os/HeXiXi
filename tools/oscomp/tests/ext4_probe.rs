@@ -17,7 +17,49 @@ mod drivers {
     }
 }
 
+mod config {
+    pub const PAGE_SIZE: usize = 4096;
+}
+
 mod mm {
+    use crate::config::PAGE_SIZE;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static LIVE_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct FrameTracker {
+        pub ppn: MockPage,
+    }
+
+    pub struct MockPage(usize);
+
+    impl MockPage {
+        pub fn get_bytes_array(&self) -> &'static mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(self.0 as *mut u8, PAGE_SIZE) }
+        }
+    }
+
+    pub fn frame_alloc() -> Option<FrameTracker> {
+        let page = Box::into_raw(Box::new([0u8; PAGE_SIZE]));
+        LIVE_FRAMES.fetch_add(1, Ordering::Relaxed);
+        Some(FrameTracker {
+            ppn: MockPage(page as usize),
+        })
+    }
+
+    pub fn live_frames() -> usize {
+        LIVE_FRAMES.load(Ordering::Relaxed)
+    }
+
+    impl Drop for FrameTracker {
+        fn drop(&mut self) {
+            unsafe {
+                drop(Box::from_raw(self.ppn.0 as *mut [u8; PAGE_SIZE]));
+            }
+            LIVE_FRAMES.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     pub struct UserBuffer<'a> {
         pub buffers: Vec<&'a mut [u8]>,
     }
@@ -45,7 +87,7 @@ mod fs {
         fn write(&self, buf: crate::mm::UserBuffer) -> usize;
         fn size(&self) -> usize;
         fn mapping_size(&self) -> Option<usize>;
-        fn read_mapping(&self, offset: usize, out: &mut [u8]) -> usize;
+        fn mapping_page(&self, offset: usize) -> Option<std::sync::Arc<crate::mm::FrameTracker>>;
         fn seek(&self, offset: isize) -> isize;
         fn seek_to(&self, pos: isize) -> isize;
     }
@@ -53,6 +95,8 @@ mod fs {
 
 #[path = "../../../os/src/fs/ext4.rs"]
 mod ext4;
+#[path = "../../../os/src/fs/page_cache.rs"]
+mod page_cache;
 #[path = "../../../os/src/sync/up.rs"]
 mod sync;
 
@@ -89,6 +133,20 @@ fn check_sequential_reads(file: &ext4::Ext4File, expected: &[u8]) {
         REQUEST_SIZE * REQUESTS / 1024
     );
     assert_eq!(sectors, REQUEST_SIZE * REQUESTS / 512);
+
+    assert_eq!(file.seek_to(0), 0);
+    let before = SECTORS_READ.load(Ordering::Relaxed);
+    let mut data = [0; REQUEST_SIZE];
+    assert_eq!(
+        file.read(mm::UserBuffer {
+            buffers: vec![&mut data]
+        }),
+        REQUEST_SIZE
+    );
+    assert_eq!(&data, &expected[..REQUEST_SIZE]);
+    let sectors = SECTORS_READ.load(Ordering::Relaxed) - before;
+    println!("/dense: one warm 4 KiB read, {sectors} sector reads");
+    assert_eq!(sectors, 0);
 }
 
 fn check_read_ranges(file: &ext4::Ext4File, block_size: usize, expected: &[u8]) {
@@ -148,6 +206,92 @@ fn check_read_ranges(file: &ext4::Ext4File, block_size: usize, expected: &[u8]) 
     );
 }
 
+fn check_cache_sharing(fs: &Arc<ext4::Ext4Fs>, file: &ext4::Ext4File, expected: &[u8]) {
+    const PAGE: usize = config::PAGE_SIZE;
+    let other = ext4::Ext4File::new(fs.clone(), fs.lookup("/dense").unwrap());
+    let before = SECTORS_READ.load(Ordering::Relaxed);
+    let warmed_by_read = file.mapping_page(0).unwrap();
+    assert!(Arc::ptr_eq(
+        &warmed_by_read,
+        &other.mapping_page(0).unwrap()
+    ));
+    assert_eq!(&warmed_by_read.ppn.get_bytes_array()[..], &expected[..PAGE]);
+    assert_eq!(
+        SECTORS_READ.load(Ordering::Relaxed) - before,
+        0,
+        "read -> mmap"
+    );
+
+    let offset = 8 * PAGE;
+    let before = SECTORS_READ.load(Ordering::Relaxed);
+    let warmed_by_mmap = other.mapping_page(offset).unwrap();
+    assert_eq!(SECTORS_READ.load(Ordering::Relaxed) - before, PAGE / 512);
+    assert_eq!(file.seek_to(offset as isize), offset as isize);
+    let mut data = [0; PAGE];
+    let before = SECTORS_READ.load(Ordering::Relaxed);
+    assert_eq!(
+        file.read(mm::UserBuffer {
+            buffers: vec![&mut data]
+        }),
+        PAGE
+    );
+    assert_eq!(&data, warmed_by_mmap.ppn.get_bytes_array());
+    assert_eq!(
+        SECTORS_READ.load(Ordering::Relaxed) - before,
+        0,
+        "mmap -> read"
+    );
+
+    let other_fs = Arc::new(ext4::Ext4Fs::new().unwrap());
+    let same_inode = other_fs.lookup("/dense").unwrap();
+    let separate = ext4::Ext4File::new(other_fs, same_inode)
+        .mapping_page(0)
+        .unwrap();
+    assert!(!Arc::ptr_eq(&separate, &warmed_by_read));
+    println!("/dense: read -> mmap 0 sector reads, mmap -> read 0 sector reads");
+}
+
+fn check_cache_bound(file: &ext4::Ext4File) {
+    const PAGE: usize = config::PAGE_SIZE;
+    let cap = page_cache::CAPACITY;
+    for index in 0..cap {
+        assert!(file.mapping_page(index * PAGE).is_some());
+    }
+    assert_eq!(mm::live_frames(), cap);
+    let before = SECTORS_READ.load(Ordering::Relaxed);
+    assert!(file.mapping_page(0).is_some());
+    assert_eq!(SECTORS_READ.load(Ordering::Relaxed), before);
+    assert!(file.mapping_page(cap * PAGE).is_some());
+    assert!(file.mapping_page(0).is_some());
+    assert_eq!(SECTORS_READ.load(Ordering::Relaxed) - before, PAGE / 512);
+    assert!(file.mapping_page(PAGE).is_some());
+    assert_eq!(
+        SECTORS_READ.load(Ordering::Relaxed) - before,
+        2 * PAGE / 512
+    );
+
+    let pinned: Vec<_> = (0..cap)
+        .map(|index| file.mapping_page(index * PAGE).unwrap())
+        .collect();
+    assert_eq!(mm::live_frames(), cap);
+    assert!(!page_cache::reclaim_one());
+    let before = SECTORS_READ.load(Ordering::Relaxed);
+    for _ in 0..2 {
+        let bypassed = file.mapping_page(cap * PAGE).unwrap();
+        assert_eq!(mm::live_frames(), cap + 1);
+        assert!(Arc::ptr_eq(&pinned[0], &file.mapping_page(0).unwrap()));
+        drop(bypassed);
+    }
+    assert_eq!(
+        SECTORS_READ.load(Ordering::Relaxed) - before,
+        2 * PAGE / 512
+    );
+    drop(pinned);
+    assert!(page_cache::reclaim_one());
+    assert_eq!(mm::live_frames(), cap - 1);
+    println!("/dense: {cap} cached frames, LRU / pinning / bypass / reclaim passed");
+}
+
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let [image, path, reference] = args.as_slice() else {
@@ -168,8 +312,13 @@ fn main() {
     let file = ext4::Ext4File::new(Arc::clone(&ext4), inode);
     if path == "/dense" {
         check_sequential_reads(&file, &expected);
+        check_cache_sharing(&ext4, &file, &expected);
+        check_cache_bound(&file);
     }
     if expected.len() >= ext4.block_size + 100 {
         check_read_ranges(&file, ext4.block_size, &expected);
     }
+    drop(file);
+    drop(ext4);
+    assert_eq!(mm::live_frames(), 0);
 }

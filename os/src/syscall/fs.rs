@@ -82,6 +82,11 @@ pub fn sys_close(fd: usize) -> isize {
 pub fn sys_pipe(pipe: *mut usize) -> isize {
     let process = current_process();
     let token = current_user_token();
+    // Resolve writable pages before borrowing the process to install descriptors.
+    let output = match translated_byte_buffer(token, pipe.cast(), 8, MapPermission::W) {
+        Some(buffers) => UserBuffer::new(buffers),
+        None => return -14, // EFAULT
+    };
     let mut inner = process.inner_exclusive_access();
     let (pipe_read, pipe_write) = make_pipe();
     let read_fd = match inner.alloc_fd() {
@@ -91,12 +96,20 @@ pub fn sys_pipe(pipe: *mut usize) -> isize {
     inner.fd_table[read_fd] = Some(pipe_read);
     let write_fd = match inner.alloc_fd() {
         Some(fd) => fd,
-        None => return -24, // EMFILE
+        None => {
+            inner.fd_table[read_fd] = None;
+            return -24; // EMFILE
+        }
     };
     inner.fd_table[write_fd] = Some(pipe_write);
-    // Linux 的 pipe(int fd[2]) 是 4 字节 int，按 4 字节写入
-    *translated_refmut(token, pipe as *mut i32) = read_fd as i32;
-    *translated_refmut(token, (pipe as usize + 4) as *mut i32) = write_fd as i32;
+    // Linux 的 pipe(int fd[2]) 使用两个 4 字节整数。
+    let descriptors = (read_fd as i32)
+        .to_ne_bytes()
+        .into_iter()
+        .chain((write_fd as i32).to_ne_bytes());
+    for (dst, byte) in output.into_iter().zip(descriptors) {
+        unsafe { dst.write(byte) };
+    }
     0
 }
 

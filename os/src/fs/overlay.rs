@@ -253,15 +253,15 @@ impl File for OverlayFile {
         Some(self.data.exclusive_access().mapping_lease.clone())
     }
 
-    fn read_mapping(&self, offset: usize, out: &mut [u8]) -> usize {
-        self.data.exclusive_access().read_at(offset, out)
-    }
-
-    fn shared_mappable(&self) -> bool {
+    fn supports_mapped_writes(&self) -> bool {
         true
     }
 
-    fn shared_page(&self, offset: usize) -> Option<Arc<FrameTracker>> {
-        self.data.exclusive_access().page(offset / PAGE_SIZE)
+    fn mapping_page(&self, offset: usize) -> Option<Arc<FrameTracker>> {
+        let mut data = self.data.exclusive_access();
+        if offset >= data.len || offset % PAGE_SIZE != 0 {
+            return None;
+        }
+        data.page(offset / PAGE_SIZE)
     }
 }

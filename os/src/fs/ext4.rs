@@ -2,19 +2,23 @@
 //!
 //! 目前支持：超级块、连续布局的块组描述符、inode、extent 树和目录项遍历。
 
+use super::page_cache::{self, FilePageKey};
+use crate::config::PAGE_SIZE;
 use crate::drivers::block::BLOCK_DEVICE;
 use crate::fs::File;
-use crate::mm::UserBuffer;
+use crate::mm::{FrameTracker, UserBuffer};
 use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const EXT4_MAGIC: u16 = 0xEF53;
 const EXTENT_MAGIC: u16 = 0xF30A;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 const SECTOR_SIZE: usize = 512;
+static NEXT_FS_ID: AtomicUsize = AtomicUsize::new(1);
 
 // VirtIO 用一个 DMA 描述符传输整个扇区，对齐后缓冲区始终位于同一页内。
 #[repr(align(512))]
@@ -58,6 +62,7 @@ impl Inode {
 }
 
 pub struct Ext4Fs {
+    id: usize,
     pub block_size: usize,
     pub inode_size: usize,
     inode_count: u32,
@@ -95,6 +100,7 @@ impl Ext4Fs {
             32
         };
         Some(Self {
+            id: NEXT_FS_ID.fetch_add(1, Ordering::Relaxed),
             block_size,
             inode_size,
             inode_count,
@@ -222,6 +228,39 @@ impl Ext4Fs {
         out
     }
 
+    fn file_page(&self, inode: &Inode, index: u64) -> Option<Arc<FrameTracker>> {
+        let key = FilePageKey {
+            fs: self.id,
+            inode: inode.ino,
+            index,
+        };
+        page_cache::get_or_load(key, |bytes| {
+            self.read_file_at(inode, index * PAGE_SIZE as u64, bytes);
+        })
+    }
+
+    fn read_cached_at(&self, inode: &Inode, mut offset: u64, buf: &mut [u8]) -> usize {
+        if !inode.is_file() {
+            return self.read_file_at(inode, offset, buf);
+        }
+        let len = inode.size.saturating_sub(offset).min(buf.len() as u64) as usize;
+        let mut remaining = &mut buf[..len];
+        while !remaining.is_empty() {
+            let in_page = (offset % PAGE_SIZE as u64) as usize;
+            let count = remaining.len().min(PAGE_SIZE - in_page);
+            let (chunk, rest) = remaining.split_at_mut(count);
+            if let Some(frame) = self.file_page(inode, offset / PAGE_SIZE as u64) {
+                let bytes = frame.ppn.get_bytes_array();
+                chunk.copy_from_slice(&bytes[in_page..in_page + count]);
+            } else {
+                self.read_file_at(inode, offset, chunk);
+            }
+            offset += count as u64;
+            remaining = rest;
+        }
+        len
+    }
+
     pub fn list_dir(&self, inode: &Inode) -> Vec<(String, u32, u8)> {
         let mut out = Vec::new();
         let data = self.read_file(inode);
@@ -257,6 +296,12 @@ impl Ext4Fs {
             cur = self.inode(*ino)?;
         }
         Some(cur)
+    }
+}
+
+impl Drop for Ext4Fs {
+    fn drop(&mut self) {
+        page_cache::discard_fs(self.id);
     }
 }
 
@@ -310,7 +355,7 @@ impl File for Ext4File {
         let mut total = 0;
         for buffer in buf.buffers {
             let chunk = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), buffer.len()) };
-            let read = self.fs.read_file_at(&self.inode, *off as u64, chunk);
+            let read = self.fs.read_cached_at(&self.inode, *off as u64, chunk);
             *off += read;
             total += read;
             if read < chunk.len() {
@@ -325,8 +370,11 @@ impl File for Ext4File {
     fn mapping_size(&self) -> Option<usize> {
         self.inode.is_file().then(|| self.size())
     }
-    fn read_mapping(&self, offset: usize, out: &mut [u8]) -> usize {
-        self.fs.read_file_at(&self.inode, offset as u64, out)
+    fn mapping_page(&self, offset: usize) -> Option<Arc<FrameTracker>> {
+        if offset >= self.mapping_size()? || offset % PAGE_SIZE != 0 {
+            return None;
+        }
+        self.fs.file_page(&self.inode, (offset / PAGE_SIZE) as u64)
     }
     fn seek_to(&self, pos: isize) -> isize {
         if pos < 0 {

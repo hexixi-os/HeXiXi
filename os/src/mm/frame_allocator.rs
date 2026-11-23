@@ -75,7 +75,6 @@ impl FrameAllocator for StackFrameAllocator {
         if let Some(ppn) = self.recycled.pop() {
             Some(ppn.into())
         } else if self.current == self.end {
-            println!("[mm] OUT OF FRAMES: current={} end={}", self.current, self.end);
             None
         } else {
             self.current += 1;
@@ -119,8 +118,14 @@ pub fn init_frame_allocator() {
 }
 
 pub fn frame_alloc() -> Option<FrameTracker> {
-    let r = FRAME_ALLOCATOR.exclusive_access().alloc();
-    r.map(FrameTracker::new)
+    let mut ppn = FRAME_ALLOCATOR.exclusive_access().alloc();
+    if ppn.is_none() && crate::fs::page_cache::reclaim_one() {
+        ppn = FRAME_ALLOCATOR.exclusive_access().alloc();
+    }
+    if ppn.is_none() {
+        println!("[mm] OUT OF FRAMES");
+    }
+    ppn.map(FrameTracker::new)
 }
 
 pub fn frame_dealloc(ppn: PhysPageNum) {

@@ -132,6 +132,11 @@ impl PageTable {
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
         *pte = PageTableEntry::empty();
     }
+    pub(super) fn remap(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
+        let pte = self.find_pte(vpn).unwrap();
+        assert!(pte.is_valid());
+        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+    }
     /// Unlink empty non-root tables. The caller holds their frames until after the TLB flush.
     pub fn unmap_and_reclaim(&mut self, vpn: VirtPageNum, retired: &mut Vec<FrameTracker>) {
         let indexes = vpn.indexes();
@@ -222,7 +227,13 @@ fn ensure_user_page_mapped(table: &PageTable, va: usize, access: MapPermission) 
     let vpn = VirtAddr::from(va).floor();
     if let Some(entry) = table.translate(vpn).filter(PageTableEntry::is_valid) {
         let required = PTEFlags::U | PTEFlags::from_bits(access.bits()).unwrap();
-        return entry.flags().contains(required);
+        if entry.flags().contains(required) {
+            return true;
+        }
+        if access != MapPermission::W || !entry.flags().contains(PTEFlags::U) {
+            return false;
+        }
+        // A kernel write into a MAP_PRIVATE buffer may need the same COW fault as a user store.
     }
     if let Some(task) = crate::task::current_task() {
         if let Some(process) = task.process.upgrade() {
