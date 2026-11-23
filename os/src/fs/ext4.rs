@@ -1,6 +1,6 @@
 //! 极简 EXT4 只读实现（目标：读取官方评测盘根目录里的测试脚本与 ELF）
 //!
-//! 目前支持：超级块、块组描述符、inode 读取、extent 树（深度 0/1）、目录项遍历。
+//! 目前支持：超级块、连续布局的块组描述符、inode、extent 树和目录项遍历。
 
 use crate::drivers::block::BLOCK_DEVICE;
 use crate::fs::File;
@@ -62,8 +62,16 @@ impl Inode {
 pub struct Ext4Fs {
     pub block_size: usize,
     pub inode_size: usize,
-    pub inodes_per_group: u32,
-    inode_table_block: u64,
+    inode_count: u32,
+    inodes_per_group: u32,
+    group_desc_offset: u64,
+    group_desc_size: usize,
+}
+
+enum BlockMapping {
+    Hole,
+    Unwritten,
+    Physical(u64),
 }
 
 impl Ext4Fs {
@@ -75,7 +83,11 @@ impl Ext4Fs {
         }
         let block_size = 1024usize << le32(&sb, 24);
         let inode_size = if le16(&sb, 88) == 0 { 128 } else { le16(&sb, 88) as usize };
+        let inode_count = le32(&sb, 0);
         let inodes_per_group = le32(&sb, 40);
+        if inodes_per_group == 0 {
+            return None;
+        }
         let first_data_block = le32(&sb, 20) as u64;
         let incompat = le32(&sb, 96);
         let desc_size = if incompat & 0x80 != 0 {
@@ -84,16 +96,13 @@ impl Ext4Fs {
         } else {
             32
         };
-        // 块组 0 的描述符在 (first_data_block + 1) 号块的开头
-        let gdt_off = (first_data_block + 1) * block_size as u64;
-        let mut d = vec![0u8; desc_size];
-        read_at(gdt_off, &mut d);
-        let inode_table_block = le32(&d, 8) as u64;
         Some(Self {
             block_size,
             inode_size,
+            inode_count,
             inodes_per_group,
-            inode_table_block,
+            group_desc_offset: (first_data_block + 1) * block_size as u64,
+            group_desc_size: desc_size,
         })
     }
 
@@ -104,11 +113,22 @@ impl Ext4Fs {
     }
 
     pub fn inode(&self, ino: u32) -> Option<Inode> {
-        if ino == 0 {
+        if ino == 0 || ino > self.inode_count {
             return None;
         }
+        let group = (ino - 1) / self.inodes_per_group;
         let idx = (ino - 1) % self.inodes_per_group;
-        let off = self.inode_table_block * self.block_size as u64
+        let mut desc = [0; 64];
+        let desc_len = self.group_desc_size.min(desc.len());
+        read_at(
+            self.group_desc_offset + group as u64 * self.group_desc_size as u64,
+            &mut desc[..desc_len],
+        );
+        let inode_table_block = le32(&desc, 8) as u64 | ((le32(&desc, 40) as u64) << 32);
+        if inode_table_block == 0 {
+            return None;
+        }
+        let off = inode_table_block * self.block_size as u64
             + idx as u64 * self.inode_size as u64;
         let mut b = vec![0u8; self.inode_size.max(128)];
         read_at(off, &mut b);
@@ -124,68 +144,62 @@ impl Ext4Fs {
         })
     }
 
-    fn map_extent(&self, node: &[u8], logical: u32) -> Option<u64> {
+    fn map_extent(&self, node: &[u8], logical: u32) -> BlockMapping {
         if node.len() < 12 || le16(node, 0) != EXTENT_MAGIC {
-            return None;
+            return BlockMapping::Hole;
         }
-        let entries = le16(node, 4) as usize;
-        let depth = le16(node, 6) as usize;
-        if depth == 0 {
-            for i in 0..entries {
-                let e = &node[12 + i * 12..12 + i * 12 + 12];
+        let entries = le16(node, 2) as usize;
+        let entries = node[12..].chunks_exact(12).take(entries);
+        if le16(node, 6) == 0 {
+            for e in entries {
                 let ee_block = le32(e, 0);
                 let raw_len = le16(e, 4);
                 let start = ((le16(e, 6) as u64) << 32) | le32(e, 8) as u64;
-                let len = if raw_len > 0x8000 { (raw_len - 0x8000) } else { raw_len } as u32;
-                if logical >= ee_block && logical < ee_block + len.max(1) {
-                    return Some(start + (logical - ee_block) as u64);
+                // ee_len == 0x8000 是 32768 个已写入块，只有更大的值表示未写入。
+                let unwritten = raw_len > 0x8000;
+                let len = if unwritten { raw_len - 0x8000 } else { raw_len } as u32;
+                if logical >= ee_block && logical - ee_block < len {
+                    return if unwritten {
+                        BlockMapping::Unwritten
+                    } else {
+                        BlockMapping::Physical(start + (logical - ee_block) as u64)
+                    };
                 }
             }
-            None
+            BlockMapping::Hole
         } else {
-            let mut chosen: Option<u64> = None;
-            for i in 0..entries {
-                let e = &node[12 + i * 12..12 + i * 12 + 12];
-                let ei_block = le32(e, 0);
-                let leaf = ((le16(e, 8) as u64) << 32) | le32(e, 4) as u64;
-                if logical >= ei_block {
-                    chosen = Some(leaf);
+            match entries.take_while(|e| le32(e, 0) <= logical).last() {
+                Some(entry) => {
+                    let block = ((le16(entry, 8) as u64) << 32) | le32(entry, 4) as u64;
+                    self.map_extent(&self.read_block(block), logical)
                 }
+                None => BlockMapping::Hole,
             }
-            let leaf = chosen?;
-            let blk = self.read_block(leaf);
-            self.map_extent(&blk, logical)
         }
     }
 
-    pub fn map_block(&self, inode: &Inode, logical: u32) -> Option<u64> {
+    fn map_block(&self, inode: &Inode, logical: u32) -> BlockMapping {
         if inode.flags & EXT4_EXTENTS_FL != 0 {
             self.map_extent(&inode.blocks, logical)
         } else {
             // 直接块指针表（小文件）
-            let idx = logical as usize;
-            if idx < 12 {
-                let b = le32(&inode.blocks, idx * 4);
-                if b == 0 { None } else { Some(b as u64) }
-            } else {
-                None
+            if logical < 12 {
+                let block = le32(&inode.blocks, logical as usize * 4);
+                if block != 0 {
+                    return BlockMapping::Physical(block as u64);
+                }
             }
+            BlockMapping::Hole
         }
     }
 
     pub fn read_file(&self, inode: &Inode) -> Vec<u8> {
-        let mut out = Vec::new();
-        let nblocks = (inode.size as usize + self.block_size - 1) / self.block_size;
-        for lb in 0..nblocks {
-            match self.map_block(inode, lb as u32) {
-                Some(pb) => {
-                    let blk = self.read_block(pb);
-                    out.extend_from_slice(&blk);
-                }
-                None => break,
+        let mut out = vec![0; inode.size as usize];
+        for (logical, bytes) in out.chunks_mut(self.block_size).enumerate() {
+            if let BlockMapping::Physical(block) = self.map_block(inode, logical as u32) {
+                bytes.copy_from_slice(&self.read_block(block)[..bytes.len()]);
             }
         }
-        out.truncate(inode.size as usize);
         out
     }
 
@@ -243,21 +257,6 @@ pub fn probe() -> bool {
             let kind = match ftype { 1 => "file", 2 => "dir", _ => "?" };
             let size = fs.inode(ino).map(|i| i.size).unwrap_or(0);
             println!("[ext4]   {} ino={} type={} size={}", name, ino, kind, size);
-        }
-        if let Some(f) = fs.lookup("/big.bin") {
-            let data = fs.read_file(&f);
-            let sum: u32 = data.iter().fold(0u32, |a, b| a.wrapping_add(*b as u32));
-            println!("[ext4] /big.bin len={} sum={}", data.len(), sum);
-        }
-        if let Some(d) = fs.lookup("/testdir") {
-            for (name, ino, ftype) in fs.list_dir(&d) {
-                println!("[ext4]   testdir/{} ino={} type={}", name, ino, ftype);
-            }
-        }
-        if let Some(f) = fs.lookup("/hello.txt") {
-            let data = fs.read_file(&f);
-            let s = core::str::from_utf8(&data).unwrap_or("<binary>");
-            println!("[ext4] /hello.txt = {:?}", s);
         }
     }
     true
