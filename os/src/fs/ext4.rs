@@ -182,7 +182,10 @@ impl Ext4Fs {
                     let blk = self.read_block(pb);
                     out.extend_from_slice(&blk);
                 }
-                None => break,
+                // 稀疏文件的“洞”（extent 没覆盖的逻辑块）按 POSIX 语义读作全零。
+                // 以前这里 break，会把洞当成文件结尾，导致 ELF 被截断、exec 时 panic
+                // （mkfs.ext4 -d / cp 默认都会把全零块做成洞）。
+                None => out.resize(out.len() + self.block_size, 0),
             }
         }
         out.truncate(inode.size as usize);
