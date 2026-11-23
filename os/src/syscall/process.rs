@@ -64,7 +64,16 @@ pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
             args = args.add(1);
         }
     }
-    if let Some(all_data) = crate::fs::read_file_all(path.as_str()) {
+    // 官方脚本里常写 `busybox mkdir ...`（不带 ./），busybox sh 靠 PATH 去找，
+    // 而内核给的环境变量是空的，PATH 里也没有 /musl。找不到时回退到 musl/busybox。
+    let data = crate::fs::read_file_all(path.as_str()).or_else(|| {
+        if raw_path.rsplit('/').next() == Some("busybox") {
+            crate::fs::read_file_all("musl/busybox")
+        } else {
+            None
+        }
+    });
+    if let Some(all_data) = data {
         let process = current_process();
         // 支持 shebang：把脚本交给解释器运行（Linux 的 binfmt_script 行为）
         if all_data.starts_with(b"#!") {
