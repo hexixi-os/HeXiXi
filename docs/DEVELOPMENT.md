@@ -144,7 +144,7 @@ tools/oscomp/score_basic.sh ~/oscomp-work/local/basic.log
 
 官方的运行命令见 [oscomp-evaluation.md](oscomp-evaluation.md)。
 
-**当前内核在真实官方盘上起不来**：启动时找不到 `oscomp_runner`/`initproc`，在 `os/src/task/mod.rs:190` panic；另外 `glibc` 目录的 inode 读出来大小为 0，疑似读第二个块组的 inode 有问题。详见 [测试状态](TEST_STATUS.md)。
+**`feat/official-disk` 分支已能在真实官方盘上跑 musl 部分**：盘里没有 `oscomp_runner` 时用编进内核的那份，工作目录设为 `musl/`；glibc 部分没跑（需要动态链接）。各组的实测结果见 [测试状态](TEST_STATUS.md)。跑完整一轮要二十多分钟，超时请给 2400 秒以上。
 
 ### 生成真实官方盘
 

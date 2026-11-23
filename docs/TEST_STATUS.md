@@ -1,64 +1,82 @@
 # 测试状态
 
-最后更新：2026-11-22，测试人：Martyr。内核基于提交 `3bf874f`，加上 `fs/ext4.rs` 的稀疏文件修复（未提交）。
+最后更新：2026-11-23，测试人：Martyr。分支 `feat/official-disk`。
 
-## 先看这个：模拟盘分数不等于评测机分数
+**怎么读**：
 
-下面的「Martyr 实测」都是在**本地模拟盘**（平铺布局，自建）上测的。Martyr 另外用官方 Docker 镜像生成了**真实官方盘**，并用当前内核按官方 QEMU 参数启动：
+- 「Martyr 实测」是 Martyr 自己跑出来的，可信。「wonder-world 记录」来自 [ADAPTATION_NOTES.md](ADAPTATION_NOTES.md) 第 17 章，是他在自己机器上的结果，**没有经 Martyr 复现**，且多数只表示「脚本跑到了 END」，不等于得分。
+- 实测分两种盘：**真实官方盘**（官方 Docker 镜像里跑官方 `make` 生成，4 GB，根目录是 `musl/ glibc/ lib/ lib64/`）和**本地模拟盘**（自建、平铺）。以真实官方盘为准，两者的区别和生成方法见 [DEVELOPMENT.md](DEVELOPMENT.md) 第 6 节。
 
-- 内核能识别 EXT4 并列出根目录（`glibc`、`lib`、`lib64`、`musl`）。
-- 随后在 `os/src/task/mod.rs:190` panic（`Option::unwrap()` 为 `None`）：内核要从盘里读 `oscomp_runner` 或 `initproc`，官方盘根目录没有它们。**一个测试都没跑**。
-- `glibc` 目录读出 `ino=131073 size=0`，疑似读第二个块组的 inode 有问题，未确认。
-- glibc 那一套需要动态链接，内核不支持。
+## 真实官方盘上的实测（musl 部分）
 
-所以**真实官方盘上的得分目前是 0**。差异对照和生成方法见 [开发与测试指南](DEVELOPMENT.md) 第 6 节。
+运行方式：官方 QEMU 参数（1G 内存、单核、带网卡和第二块盘），内核从盘里找不到 `oscomp_runner` 时使用编进内核的那份，工作目录设为 `musl/`。**glibc 那一套没有跑**（需要动态链接，内核不支持）。
 
-**怎么读这张表**：
+| 组 | 结果 | 说明 |
+|---|---|---|
+| basic | **96/102**（28/32 个用例满分） | 官方判分器；4 个失败见下 |
+| lua | **9/9** | |
+| busybox | 51 条成功，4 条失败 | |
+| libctest | 107 个用例，98 个 `Pass!`，9 个没通过 | 失败例：`pthread_cancel`、`setjmp`、`socket` 等 |
+| libcbench | 25 个 benchmark 有结果 | 没有标准判分口径，只数了有时间输出的 |
+| lmbench | 11 项数字 | 能跑完，延迟和带宽各有输出 |
+| cyclictest | 4 个用例全部 `fail`（`kill hackbench` 为 success） | |
+| iperf | 全部 fail | `open /dev/urandom` 返回 `Operation not permitted`，且没有网络栈 |
+| unixbench | **大量崩溃** | 反复出现 `InstructionPageFault sepc=0xfffffffffffffffe`，结果不完整 |
+| iozone | **大量崩溃** | 同上 |
+| ltp | **内核 panic，没有结果** | 一开始遍历 `ltp/testcases/bin/`（2822 个文件）时，读 extent 索引块报 `virtio IoError` |
+| netperf | **没跑到** | 排在 ltp 之后，ltp 的 panic 使内核退出 |
 
-- 「Martyr 实测」是 Martyr 用官方判分方式跑出来的，可信。
-- 「wonder-world 记录」来自 [适配改动说明](ADAPTATION_NOTES.md) 第 17 章，是 wonder-world 在自己机器上的结果，**没有经 Martyr 复现**。而且那些数字多数只表示「脚本跑到了 END」，不等于得分，不要当成绩用。
+**整轮没有走到正常关机**：ltp 处 panic 后 QEMU 退出，没有 `Idle process exit`。完整一轮约 20 多分钟，跑它时请给足超时（我们用 2400 秒）。
 
-## 总表
-
-| 组 | Martyr 实测 | wonder-world 记录（未复现） | 测试盘脚本 |
-|---|---|---|---|
-| basic | **96/102**（28/32 个用例满分，仅限本地模拟盘） | 称 32/32 | 有，全套 |
-| lua | 未测 | 称 9/9 | `build_lua.sh`（已写，没跑过） |
-| busybox | 未测 | 55 条命令 52 条成功 | 只有 `build_busybox.sh`（构建二进制），缺组盘脚本 |
-| libc-test | 未测 | 94 个用例，88 Pass | `build_libctest.sh`（旧脚本，路径没对齐 `env.sh`） |
-| libcbench | 未测 | 27 个 benchmark，256M 内存 | 缺 |
-| lmbench | 未测 | 跑完，约 17 项数字，需 1G 内存 | `build_lmbench.sh`（旧脚本，同上） |
-| unixbench | 未测 | 19 行结果 | 缺 |
-| iozone | 未测 | 子测试全部执行 | 缺 |
-| cyclictest | 未测 | 称 4/4 | 缺 |
-| ltp | 未测 | 162 个用例，TPASS 54~60，且有波动 | `build_ltp.sh`（旧脚本，同上） |
-| iperf / netperf | 未测 | 脚本跑完，全部子测试失败 | `build_net.sh`（旧脚本，同上） |
-
-「旧脚本」指 wonder-world 留下的 4 个脚本，仍引用 `$HOME/rCore-Tutorial-v3` 和 `fsroot`，没有改成用 `tools/oscomp/env.sh`，Martyr 没试跑过。
-「缺」指仓库里没有这个脚本，wonder-world 的文档提到过但没提交。
-
-## basic 的 4 个失败（Martyr 实测，本地模拟盘）
+### basic 的 4 个失败
 
 | 用例 | 得分 | 现象 |
 |---|---|---|
-| clone | 1/4 | 子进程跳到栈地址执行，触发 `InstructionPageFault`（`sepc=0x105d60`），收到 SIGSEGV |
+| clone | 1/4 | 子进程触发非法指令/页错误，收到 SIGILL 或 SIGSEGV |
 | mkdir | 2/3 | 输出了 `mkdir error` |
 | mmap | 2/3 | 读出的 mmap 内容为空 |
 | unlink | 1/2 | 输出了 `unlink error` |
 
-原因还没查。
+原因都还没查。在本地模拟盘上同样是这 4 个失败，分数一致。另外在模拟盘上曾观察到 `test_pipe` 偶发失败（3 次运行中 1 次，得 0/4），在官方盘上只跑了 1 次，没遇到。
 
-**结果不稳定**：同一张盘、同一个内核，连续 3 次运行中 2 次是 96/102，1 次是 92/102（`test_pipe` 得 0/4，断言 `[2, 3] (>=)` 失败）。`test_pipe` 存在偶发失败，原因未查，所以 96/102 只是典型值，不是确定值。
+## wonder-world 记录对照（未复现）
 
-## 其他已知问题（Martyr 发现）
+| 组 | wonder-world 记录 | 与 Martyr 在官方盘上的实测 |
+|---|---|---|
+| basic | 称 32/32 | 96/102 |
+| lua | 9/9 | 一致 |
+| busybox | 55 条中 52 成功 | 51 成功 |
+| libctest | 94 个用例，88 Pass | 107 个，98 Pass（用例集不同） |
+| libcbench | 27 个 benchmark | 25 个 |
+| lmbench | 约 17 项数字 | 11 项 |
+| unixbench | 19 行结果 | 大量崩溃 |
+| iozone | 子测试全部执行 | 大量崩溃 |
+| cyclictest | 称 4/4 | 4 个 fail |
+| ltp | 162 个用例，TPASS 54~60 | panic，没结果 |
+| iperf / netperf | 脚本跑完，全部失败 | iperf 全失败，netperf 没跑到 |
 
-- **usertests 会让内核 panic**：在本地 easy-fs 镜像上跑 `usertests`，跑到 `race_adder_arg` 时内核 panic：
-  `src/mm/page_table.rs:115 vpn 0xffe is mapped before mapping`。
-  `0xffe000` 是信号 stub 页，疑似多线程场景下重复映射，没有进一步确认。此前的用例（`filetest_simple`、`cat`、`matrix`、`pipetest` 等）都正常退出。
-- **EXT4 稀疏文件**：已修复，之前会导致 `exec` 读到被截断的 ELF 而 panic。
-- **EXT4「未写入的 extent」**（fallocate 预分配）现在被当作真实数据读，可能读到旧内容。目前没遇到，只是代码上看到。
-- **每次 `read()` 都把整个文件重新读一遍**（`Ext4File::read` → `read_file`），大文件会很慢。
+后几行差距明显，可能是编译器不同（官方是 musl GCC 12.2，wonder-world 用 musl.cc 的 GCC 11.2.1）、盘布局不同，也可能是他的数字本身口径宽松。没有进一步确认。
 
-## wonder-world 文档里提到的、仍未解决的限制
+## 已知问题
 
-以下来自 wonder-world 记录，未验证：信号返回上下文被破坏会让 lmbench 的 `lat_ctx` 等子进程崩溃；单核调度下 cyclictest 压力阶段超时；没有动态链接（libc-test 动态部分被跳过）；`execve` 不支持 `#!` 解释器行；没有网卡和 TCP/IP 栈。
+- **ltp 读大目录 panic**：`ltp/testcases/bin/` 有 2822 项（htree 目录，extent 有一层索引），`getdents64` 每次都把整个目录重新读一遍，读索引块（物理块 32599）时 virtio 报 `IoError`。原因未确认。
+- **iozone、unixbench 崩溃在 `0xfffffffffffffffe`**：疑似子进程返回到 -2，和信号返回、fork 后的上下文有关，未查。
+- **iperf 需要 `/dev/urandom`**：目前 `open` 返回 `Operation not permitted`。
+- **usertests 会让内核 panic**（本地 easy-fs 镜像）：跑到 `race_adder_arg` 时 `src/mm/page_table.rs:115 vpn 0xffe is mapped before mapping`。`0xffe000` 是信号 stub 页，疑似多线程下重复映射，没有进一步确认。
+- **EXT4「未写入的 extent」**（fallocate 预分配）被当作真实数据读，可能读到旧内容。目前没遇到，只是代码上看到。
+- **每次 `read()` 都把整个文件重新读一遍**（`Ext4File::read` → `read_file`），大文件会很慢，也是上面大目录问题的放大因素。
+- 官方脚本里 `busybox xxx`（不带 `./`）依赖 PATH，内核的环境变量是空的，目前靠 `execve` 找不到 `busybox` 时回退到 `musl/busybox` 绕过。
+
+## 本分支为适配官方盘做的内核改动
+
+1. EXT4 读稀疏文件的「洞」（读作全零）。
+2. EXT4 按块组描述符读 inode，支持多块组大盘（原来只读块组 0）。
+3. `chdir` 相对当前目录解析并处理 `.`、`..`。
+4. shebang 回退到 busybox 时，在当前目录、根目录、`musl/` 下依次找。
+5. 盘里没有 `oscomp_runner`/`autorun`/`initproc` 时使用编进内核的 runner，工作目录设为 `musl/`。
+6. `execve` 找不到 `busybox` 时回退到 `musl/busybox`。
+7. runner 的 lua 直驱特例只在跑 `lua_testcode.sh` 时触发，并输出 `lua-musl` 组名。
+
+## wonder-world 文档里提到、仍未验证的限制
+
+信号返回上下文被破坏会让 lmbench 的 `lat_ctx` 等子进程崩溃；单核调度下 cyclictest 压力阶段超时；没有动态链接；没有网卡和 TCP/IP 栈。

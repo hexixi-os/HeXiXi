@@ -28,7 +28,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m <mem> -nographic -smp <sm
 | 步骤 | 实现 |
 |---|---|
 | 读 EXT4 | `os/src/fs/ext4.rs`，只读：超级块、块组、inode、extent、目录 |
-| 选第一个进程 | `os/src/task/mod.rs` 的 `INITPROC`：有 `oscomp_runner` 就启动它 |
+| 选第一个进程 | `os/src/task/mod.rs` 的 `INITPROC`：盘里有 `oscomp_runner` 就启动它；都没有（官方盘就是这样）则用编进内核的 runner，工作目录设为 `musl/` |
 | 执行脚本 | `user/src/bin/oscomp_runner.rs`：优先用盘里的 `busybox sh` 逐个执行 `*_testcode.sh` |
 | 写文件 | EXT4 是只读的，写入走内存 overlay（`os/src/fs/mod.rs`），重启就没了 |
 | 关机 | 第一个进程以 0 退出，内核调用 `exit_success` |

@@ -9,7 +9,7 @@
 - 文件系统：只读 EXT4（评测盘）。写入的文件只存在内存里，重启就没了。
 - 单核，没有网卡驱动和网络协议栈，不支持动态链接。
 - 评测方式：看串口输出。内核启动后自动执行测试盘里的 `*_testcode.sh`，跑完关机。
-- **基线**：basic 组在本地模拟盘上 96/102；**在真实官方盘上目前起不来**（找不到 `oscomp_runner`，启动即 panic）。其余组还没测过，见 [测试状态](docs/TEST_STATUS.md)。
+- **基线**（`feat/official-disk` 分支，真实官方盘 musl 部分）：basic 96/102、lua 9/9、busybox 51/55、libctest 98/107。unixbench、iozone 大量崩溃，ltp 会让内核 panic，iperf 全失败。详见 [测试状态](docs/TEST_STATUS.md)。
 
 当前分支 `oscomp-adaptation` 是适配分支；`main` 仍是原版基线，没有适配评测。
 
