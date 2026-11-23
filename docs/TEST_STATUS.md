@@ -1,5 +1,15 @@
 # 测试状态
 
+## 2026-11-23 PR-04 EXT4 区间读取
+
+普通 `read` 和 `readv` 按当前文件偏移读取所需扇区。新版 `tools/oscomp/test_ext4.sh` 覆盖跨块、分段缓冲区、EOF 短读、稀疏洞、未写入 extent 和索引 extent 树。
+
+| 验证 | M1 基线 `601a839b` | PR-04 |
+|---|---|---|
+| 宿主对同一个 8 MiB 文件连续读 8 次，每次 4 KiB | 131,072 次扇区读取 | 64 次扇区读取，数据一致 |
+| QEMU 256 MiB，从 129 MiB 稀疏文件的 128 MiB 偏移执行 BusyBox `dd`，读取 4 KiB 并用 `cmp` 校验 | 内核尝试分配 129 MiB，触发 panic | 内容一致，正常关机 |
+| 官方 RISC-V64 原盘 `basic-musl` | 96/102 | 96/102，32 个用例均执行并正常关机 |
+
 ## 2026-11-23 官方盘回归
 
 基线 `44a89a39` 在原盘上复现了首进程启动 panic。更新到 `ac9e23c7` 后，用 QEMU 8.2.2、1 核和 1 GiB RAM 连续运行三次。每次执行原盘 `/musl/basic_testcode.sh` 的 32 个用例，均为 **96/102**，28 个用例满分，QEMU 正常退出。三轮 QEMU 墙钟耗时依次为 4、5、4 秒。
@@ -55,7 +65,6 @@ Martyr 的内核基于 `3bf874f` 加未提交的稀疏文件修复，以下分�
 - **usertests 会让内核 panic**：在本地 easy-fs 镜像上跑 `usertests`，跑到 `race_adder_arg` 时内核 panic：
   `src/mm/page_table.rs:115 vpn 0xffe is mapped before mapping`。
   `0xffe000` 是信号 stub 页，疑似多线程场景下重复映射，没有进一步确认。此前的用例（`filetest_simple`、`cat`、`matrix`、`pipetest` 等）都正常退出。
-- **每次 `read()` 都把整个文件重新读一遍**（`Ext4File::read` → `read_file`），大文件会很慢。
 
 ## wonder-world 文档里提到的、仍未解决的限制
 

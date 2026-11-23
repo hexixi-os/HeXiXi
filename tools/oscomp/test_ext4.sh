@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 验证稀疏文件、未写入 extent，并可选验证官方盘跨块组读取。
+# 验证 EXT4 区间读取、稀疏文件和 extent 树，并可选验证官方盘跨块组读取。
 set -euo pipefail
 
 tool_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -21,10 +21,14 @@ Path("expected").write_bytes(b"A" * 4096 + b"\0" * 4096 + b"Z" * 100)
 Path("tree.expected").write_bytes(
     b"".join(bytes([letter]) * 4096 + b"\0" * 4096 for letter in b"ABCDEF")
 )
+with Path("dense.expected").open("wb") as dense:
+    for block in range(1, 2049):
+        dense.write(block.to_bytes(4, "little") * 1024)
 PY
 debugfs -w -R 'write expected sparse' fixture.img
 debugfs -w -R 'write expected unwritten' fixture.img
 debugfs -w -R 'write tree.expected tree' fixture.img
+debugfs -w -R 'write dense.expected dense' fixture.img
 debugfs -w -R 'fallocate /unwritten 1 1' fixture.img
 block=$(debugfs -R 'bmap /unwritten 1' fixture.img)
 python3 - "$block" <<'PY'
@@ -36,6 +40,10 @@ with open("fixture.img", "r+b") as image:
     image.seek(int(block) * 4096)
     image.write(b"U" * 4096)
 PY
+
+debugfs -R 'dump /dense dense.reference' fixture.img
+cmp dense.expected dense.reference
+./ext4_probe fixture.img /dense dense.reference
 
 for path in sparse unwritten; do
     debugfs -R "dump /$path $path.reference" fixture.img

@@ -14,6 +14,11 @@ use alloc::vec::Vec;
 pub const EXT4_MAGIC: u16 = 0xEF53;
 const EXTENT_MAGIC: u16 = 0xF30A;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
+const SECTOR_SIZE: usize = 512;
+
+// VirtIO 用一个 DMA 描述符传输整个扇区，对齐后缓冲区始终位于同一页内。
+#[repr(align(512))]
+struct SectorBuffer([u8; SECTOR_SIZE]);
 
 fn le16(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
@@ -22,24 +27,17 @@ fn le32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 
-/// 按 512 字节扇区读入（起始必须是 512 的倍数）
-fn read_sectors(start_sector: u64, buf: &mut [u8]) {
-    let n = buf.len() / 512;
-    for i in 0..n {
-        let mut tmp = [0u8; 512];
-        BLOCK_DEVICE.read_block(start_sector as usize + i, &mut tmp);
-        buf[i * 512..(i + 1) * 512].copy_from_slice(&tmp);
+/// 从磁盘字节偏移读入缓冲区，只访问覆盖请求范围的扇区。
+fn read_at(mut offset: u64, mut buf: &mut [u8]) {
+    let mut sector = SectorBuffer([0; SECTOR_SIZE]);
+    while !buf.is_empty() {
+        let start = (offset % SECTOR_SIZE as u64) as usize;
+        let len = buf.len().min(SECTOR_SIZE - start);
+        BLOCK_DEVICE.read_block((offset / SECTOR_SIZE as u64) as usize, &mut sector.0);
+        buf[..len].copy_from_slice(&sector.0[start..start + len]);
+        buf = &mut buf[len..];
+        offset += len as u64;
     }
-}
-
-/// 任意字节偏移读取
-fn read_at(byte_off: u64, buf: &mut [u8]) {
-    let start = byte_off / 512 * 512;
-    let end = (byte_off + buf.len() as u64 + 511) / 512 * 512;
-    let mut tmp = vec![0u8; (end - start) as usize];
-    read_sectors(start / 512, &mut tmp);
-    let s = (byte_off - start) as usize;
-    buf.copy_from_slice(&tmp[s..s + buf.len()]);
 }
 
 pub struct Inode {
@@ -178,7 +176,11 @@ impl Ext4Fs {
         }
     }
 
-    fn map_block(&self, inode: &Inode, logical: u32) -> BlockMapping {
+    fn map_block(&self, inode: &Inode, logical: u64) -> BlockMapping {
+        let logical = match u32::try_from(logical) {
+            Ok(block) => block,
+            Err(_) => return BlockMapping::Hole,
+        };
         if inode.flags & EXT4_EXTENTS_FL != 0 {
             self.map_extent(&inode.blocks, logical)
         } else {
@@ -193,13 +195,30 @@ impl Ext4Fs {
         }
     }
 
+    /// 从文件偏移读取，返回实际写入的字节数。跨过 EOF 时保留输出缓冲区的剩余内容。
+    pub fn read_file_at(&self, inode: &Inode, mut offset: u64, buf: &mut [u8]) -> usize {
+        let len = inode.size.saturating_sub(offset).min(buf.len() as u64) as usize;
+        let block_size = self.block_size as u64;
+        let mut remaining = &mut buf[..len];
+        while !remaining.is_empty() {
+            let in_block = (offset % block_size) as usize;
+            let count = remaining.len().min(self.block_size - in_block);
+            let (chunk, rest) = remaining.split_at_mut(count);
+            match self.map_block(inode, offset / block_size) {
+                BlockMapping::Physical(block) => {
+                    read_at(block * block_size + in_block as u64, chunk);
+                }
+                BlockMapping::Hole | BlockMapping::Unwritten => chunk.fill(0),
+            }
+            offset += count as u64;
+            remaining = rest;
+        }
+        len
+    }
+
     pub fn read_file(&self, inode: &Inode) -> Vec<u8> {
         let mut out = vec![0; inode.size as usize];
-        for (logical, bytes) in out.chunks_mut(self.block_size).enumerate() {
-            if let BlockMapping::Physical(block) = self.map_block(inode, logical as u32) {
-                bytes.copy_from_slice(&self.read_block(block)[..bytes.len()]);
-            }
-        }
+        self.read_file_at(inode, 0, &mut out);
         out
     }
 
@@ -287,20 +306,17 @@ impl File for Ext4File {
         false
     }
     fn read(&self, buf: UserBuffer) -> usize {
-        let data = self.fs.read_file(&self.inode);
         let mut off = self.offset.exclusive_access();
-        let mut n = 0usize;
-        for byte_ptr in buf {
-            if *off >= data.len() {
+        let mut total = 0;
+        for chunk in buf.buffers {
+            let read = self.fs.read_file_at(&self.inode, *off as u64, chunk);
+            *off += read;
+            total += read;
+            if read < chunk.len() {
                 break;
             }
-            unsafe {
-                byte_ptr.write_volatile(data[*off]);
-            }
-            *off += 1;
-            n += 1;
         }
-        n
+        total
     }
     fn size(&self) -> usize {
         self.inode.size as usize
