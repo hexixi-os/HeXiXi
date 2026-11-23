@@ -204,9 +204,24 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, _flags: u32) -> isize {
 pub fn sys_chdir(path: *const u8) -> isize {
     let token = current_user_token();
     let path = translated_str(token, path);
-    let p = alloc::string::String::from(path.trim_start_matches("./").trim_start_matches('/'));
     let process = current_process();
-    process.inner_exclusive_access().cwd = alloc::string::String::from(p.as_str());
+    // 相对路径要接在当前目录后面，并处理 . 和 ..（cwd 不带前导斜杠，根目录为空串）。
+    // 以前直接存原串，官方盘里 `cd ./basic` 会得到 "basic" 而不是 "musl/basic"。
+    let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    let cwd = process.inner_exclusive_access().cwd.clone();
+    if !path.starts_with('/') {
+        parts.extend(cwd.split('/').filter(|s| !s.is_empty()));
+    }
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    process.inner_exclusive_access().cwd = parts.join("/");
     0
 }
 

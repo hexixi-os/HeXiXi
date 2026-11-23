@@ -41,6 +41,13 @@ pub fn sys_fork() -> isize {
     new_pid as isize
 }
 
+/// 找 busybox 的位置：当前目录 -> 根目录 -> musl/（官方评测盘里它在 /musl/ 下）。
+/// 脚本里常 cd 进子目录（如 musl/basic）再执行 `#!/bin/sh` 脚本，所以不能只看当前目录。
+fn find_busybox() -> Option<String> {
+    let candidates = [crate::fs::resolve_path("busybox"), String::from("busybox"), String::from("musl/busybox")];
+    candidates.into_iter().find(|p| crate::fs::exists(p.as_str()))
+}
+
 pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
     let token = current_user_token();
     let raw_path = translated_str(token, path);
@@ -71,13 +78,13 @@ pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
             // argv = [解释器, 可选解释器参数(缺省用 basename), 脚本, ...原参数]
             let (prog, interp_arg, interp_data) = if let Some(d) = crate::fs::read_file_all(interp_name) {
                 (alloc::string::String::from(interp_name), extra.map(|s| alloc::string::String::from(s)), d)
-            } else if crate::fs::exists("busybox") {
+            } else if find_busybox().is_some() {
                 // 回退到 busybox 时用 sh 解释（#!/bin/bash 也能跑）
                 let arg = match extra {
                     Some(s) => alloc::string::String::from(s),
                     None => alloc::string::String::from("sh"),
                 };
-                match crate::fs::read_file_all("busybox") {
+                match find_busybox().and_then(|p| crate::fs::read_file_all(p.as_str())) {
                     Some(d) => (alloc::string::String::from("busybox"), Some(arg), d),
                     None => return -1,
                 }
