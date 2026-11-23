@@ -3,7 +3,7 @@
 #
 # 用法：
 #   tools/oscomp/run_group.sh <disk.img> [内存] [超时秒] [日志文件]
-#   tools/oscomp/run_group.sh ~/oscomp-work/official/disk.img            # 默认 256M / 300s
+#   tools/oscomp/run_group.sh ~/oscomp-work/local/disk.img            # 默认 256M / 300s
 #   tools/oscomp/run_group.sh ~/oscomp-work/lmbench/disk.img 1G 900
 #
 # 环境变量：KERNEL（默认 os/target/.../release/os.bin，改了内核先 `make -C os build`）

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build_libctest.sh — 构建 oscomp libc-test（musl 静态，非 PIE）并打官方布局 ext4 测试盘
+# build_libctest.sh — 构建 oscomp libc-test（musl 静态，非 PIE）并打本地模拟 ext4 测试盘（平铺布局，不同于真实官方盘）
 #
 # 产物（默认 $HOME/oscomp-work/libctest/）：
 #   entry-static.exe  runtest.exe  run-static.sh  run-dynamic.sh  disk.img
@@ -100,7 +100,7 @@ sed -e 's#^\./run-static.sh$#. ./run-static.sh#' \
 chmod 755 "$WORK/libctest_testcode.sh"
 echo "   testcode wrapper: $WORK/libctest_testcode.sh"
 
-echo "== [4/4] 打 64MB ext4 官方布局测试盘"
+echo "== [4/4] 打 64MB ext4 本地模拟测试盘"
 rm -f "$OUTDIR/disk.img"
 dd if=/dev/zero of="$OUTDIR/disk.img" bs=1M count=64 status=none
 mkfs.ext4 -q -F -L LIBCTEST "$OUTDIR/disk.img"

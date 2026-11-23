@@ -7,7 +7,7 @@
 # 这些工具、也没有 root。本脚本把新版 autotools 通过 `apt-get download` 下载
 # 成 .deb（无需 root）并解包到私有前缀，改写成可重定位路径后完成：
 #   autotools -> configure(cross) -> 构建 lib + syscall 子集 -> 打 128MB ext4
-#   官方布局测试盘 -> （可选）QEMU 实跑。
+#   本地模拟测试盘 -> （可选）QEMU 实跑。
 #
 # 用法：
 #   bash tools/oscomp/build_ltp.sh            # 构建 + 打盘，不跑 QEMU

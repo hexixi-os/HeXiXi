@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 构建 riscv64 musl 静态 iperf3 / netperf 并打官方布局的组盘。
+# 构建 riscv64 musl 静态 iperf3 / netperf 并打本地模拟的组盘。
 #
 # 说明：rCore-QEMU 侧没有 TCP/IP 栈（socket/connect/bind 等 syscall 未实现），
 # 这两组的子测试必然 fail；本脚本的目的是让官方 *_testcode.sh **能跑完并打

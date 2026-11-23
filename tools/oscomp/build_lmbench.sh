@@ -49,7 +49,7 @@ if [ ! -x "$O/lmbench_all" ]; then
 fi
 echo "built lmbench_all: $(ls -l "$O/lmbench_all" | awk '{print $5}') bytes"
 
-# ---- 官方布局的 EXT4 测试盘（lmbench 组单独一张）----
+# ---- 本地模拟的 EXT4 测试盘（lmbench 组单独一张）----
 mkdir -p "$OUT"
 rm -f "$OUT/disk.img"
 dd if=/dev/zero of="$OUT/disk.img" bs=1M count=64 status=none

@@ -2,7 +2,7 @@
 # score_basic.sh — 用官方判分器给 basic 组的串口日志打分
 #
 # 用法：tools/oscomp/score_basic.sh <串口日志>
-#   例：tools/oscomp/score_basic.sh ~/oscomp-work/official/basic.log
+#   例：tools/oscomp/score_basic.sh ~/oscomp-work/local/basic.log
 #
 # 判分器是官方 $SUITE/basic/user/src/oscomp/test_runner.py：它在日志里找
 # "========== START test_xxx ==========" 与 "END" 之间的输出，逐条断言（*_test.py）。
