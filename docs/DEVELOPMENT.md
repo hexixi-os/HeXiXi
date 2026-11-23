@@ -19,8 +19,8 @@ QEMU（RISC-V64，-machine virt）
 
 1. 内核入口 `rust_main`（`os/src/main.rs`）读设备树、初始化内存、陷阱、时钟。
 2. 探测磁盘是不是 EXT4。
-3. 创建第一个进程。盘里有 `oscomp_runner` 就启动它，否则看有没有 `run_tests`（启动 `autorun`），都没有才启动 `initproc`。
-4. `oscomp_runner` 在盘根目录找 `*_testcode.sh`，用盘里的 `busybox sh` 逐个执行。
+3. 创建第一个进程。官方布局的 EXT4 盘使用内嵌的 `oscomp_runner`。平铺盘可提供自己的 runner，教学盘由 `run_tests` 或默认 `initproc` 选择入口。
+4. 官方盘的 runner 切到 `/musl`，用该目录下的 `busybox sh` 执行 `basic_testcode.sh`。平铺盘由原 runner 在根目录查找脚本。
 5. 第一个进程以 0 退出，内核就让 QEMU 关机。
 
 ## 2. 环境
@@ -82,7 +82,7 @@ tools/oscomp/score_basic.sh ~/oscomp-work/local/basic.log
 | 改动 | 需要执行 |
 |---|---|
 | 内核（`os/`） | `make -C os build`，然后重新 `run_group.sh`，不用重新打盘 |
-| `oscomp_runner.rs` | `build_runner.sh`，再重新打盘（`make_local_image.sh` 等） |
+| `oscomp_runner.rs` | 官方盘走 `make all`，更新内嵌 runner。平铺盘走 `build_runner.sh`，再重新打盘 |
 | 测试程序或脚本 | 重新构建并打盘 |
 
 ### 调试
@@ -135,18 +135,18 @@ tools/oscomp/score_basic.sh ~/oscomp-work/local/basic.log
 
 | 方面 | 官方评测盘 | 本地模拟盘 |
 |---|---|---|
-| 生成方式 | 官方 Docker 镜像里跑 `make`：`dd` 建 4 GB 文件，`mkfs.ext4`，挂载后 `cp -rL` | `mkfs.ext4 -d` 从目录生成，64 MB |
-| 根目录 | `musl/`、`glibc/`、`lib/`、`lib64/` 四个目录 | 平铺：脚本、程序、busybox 都在根目录 |
+| 来源 | 2025 初赛发布的 `sdcard-rv.img.xz` 解压使用 | `mkfs.ext4 -d` 从目录生成，64 MB |
+| 根目录 | 测试文件在 `musl/` 和 `glibc/` 子目录 | 平铺：脚本、程序、busybox 都在根目录 |
 | 脚本里的标记 | `#### OS COMP TEST GROUP START basic-musl ####`（带 `-musl`/`-glibc` 后缀） | 无后缀 |
-| `oscomp_runner` | 盘里没有 | 放在根目录 |
+| `oscomp_runner` | `make all` 内嵌到评测内核 | 放在测试盘根目录 |
 | 编译器 | 容器里的 musl GCC 12.2 / glibc 交叉编译器 | musl.cc 的 GCC 11.2.1，只有 musl 一套 |
 | QEMU | 9.2.1，带网卡和第二块盘 `disk.img` | 10.2.1，只有一块盘 |
 
 官方的运行命令见 [oscomp-evaluation.md](oscomp-evaluation.md)。
 
-**当前内核在真实官方盘上起不来**：启动时找不到 `oscomp_runner`/`initproc`，在 `os/src/task/mod.rs:190` panic；另外 `glibc` 目录的 inode 读出来大小为 0，疑似读第二个块组的 inode 有问题。详见 [测试状态](TEST_STATUS.md)。
+原盘回归使用 `tools/oscomp/run_official_basic.sh` 生成串口、判分和运行元数据。下载与复跑步骤见 [官方盘回归](oscomp-evaluation.md#官方盘回归)，实测结果见 [测试状态](TEST_STATUS.md)。
 
-### 生成真实官方盘
+### 从旧版 Docker 环境生成评测布局（历史记录）
 
 需要 Docker Desktop（在 Windows 里运行，WSL 里没有装 docker）。构建产物约 1 GB 压缩、4 GB 解压，耗时十几分钟，注意 D 盘空间。官方套件 `~/testsuits` 要先用 `setup.sh` 准备好。
 

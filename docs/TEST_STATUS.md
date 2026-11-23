@@ -1,19 +1,19 @@
 # 测试状态
 
-最后更新：2026-11-22，测试人：Martyr。内核基于提交 `3bf874f`，加上 `fs/ext4.rs` 的稀疏文件修复（未提交）。
+## 2026-11-23 官方盘回归
 
-## 先看这个：模拟盘分数不等于评测机分数
+基线 `44a89a39` 在原盘上复现了首进程启动 panic。更新到 `ac9e23c7` 后，用 QEMU 8.2.2、1 核和 1 GiB RAM 连续运行三次。每次执行原盘 `/musl/basic_testcode.sh` 的 32 个用例，均为 **96/102**，28 个用例满分，QEMU 正常退出。三轮 QEMU 墙钟耗时依次为 4、5、4 秒。
 
-下面的「Martyr 实测」都是在**本地模拟盘**（平铺布局，自建）上测的。Martyr 另外用官方 Docker 镜像生成了**真实官方盘**，并用当前内核按官方 QEMU 参数启动：
+- 镜像为 2025 初赛发布的 `sdcard-rv.img.xz` 解压所得，原盘 SHA-256 为 `95973543db6b84a9a5e70f30da466ce292867aff5b689fb14c88dc9406e378b8`。 [发布页](https://github.com/oscomp/testsuits-for-oskernel/releases/tag/pre-20250615)
+- 判分使用同一发布版本的测试套件 `4b40ee92e8b594fb20e3957ebc2f79ad43aca538`。内核 SHA-256 为 `057544f007f71b18f98f9e5e3a0c3d6bb0693b1ab68b47a6a6e89535b952749f`。
+- 官方盘跨块组文件 `/glibc/basic/brk` 的 56,472 字节与宿主 `debugfs` 结果逐字节一致。合成镜像中的三个文件分别验证了稀疏洞、未写入 extent 和带索引的 extent 树，读取结果均与预期一致。
+- 四项失分为 `clone` 1/4、`mkdir` 2/3、`mmap` 2/3、`unlink` 1/2。三次 `pipe` 均得满分，历史偶发失败仍需观察。
 
-- 内核能识别 EXT4 并列出根目录（`glibc`、`lib`、`lib64`、`musl`）。
-- 随后在 `os/src/task/mod.rs:190` panic（`Option::unwrap()` 为 `None`）：内核要从盘里读 `oscomp_runner` 或 `initproc`，官方盘根目录没有它们。**一个测试都没跑**。
-- `glibc` 目录读出 `ino=131073 size=0`，疑似读第二个块组的 inode 有问题，未确认。
-- glibc 那一套需要动态链接，内核不支持。
+以上是本地 QEMU 对历史官方盘的回归。复跑命令见 [官方盘回归](oscomp-evaluation.md#官方盘回归)。
 
-所以**真实官方盘上的得分目前是 0**。差异对照和生成方法见 [开发与测试指南](DEVELOPMENT.md) 第 6 节。
+## 2026-11-22 本地模拟盘记录
 
-**怎么读这张表**：
+Martyr 的内核基于 `3bf874f` 加未提交的稀疏文件修复，以下分数来自平铺布局的本地模拟盘。
 
 - 「Martyr 实测」是 Martyr 用官方判分方式跑出来的，可信。
 - 「wonder-world 记录」来自 [适配改动说明](ADAPTATION_NOTES.md) 第 17 章，是 wonder-world 在自己机器上的结果，**没有经 Martyr 复现**。而且那些数字多数只表示「脚本跑到了 END」，不等于得分，不要当成绩用。
@@ -55,10 +55,8 @@
 - **usertests 会让内核 panic**：在本地 easy-fs 镜像上跑 `usertests`，跑到 `race_adder_arg` 时内核 panic：
   `src/mm/page_table.rs:115 vpn 0xffe is mapped before mapping`。
   `0xffe000` 是信号 stub 页，疑似多线程场景下重复映射，没有进一步确认。此前的用例（`filetest_simple`、`cat`、`matrix`、`pipetest` 等）都正常退出。
-- **EXT4 稀疏文件**：已修复，之前会导致 `exec` 读到被截断的 ELF 而 panic。
-- **EXT4「未写入的 extent」**（fallocate 预分配）现在被当作真实数据读，可能读到旧内容。目前没遇到，只是代码上看到。
 - **每次 `read()` 都把整个文件重新读一遍**（`Ext4File::read` → `read_file`），大文件会很慢。
 
 ## wonder-world 文档里提到的、仍未解决的限制
 
-以下来自 wonder-world 记录，未验证：信号返回上下文被破坏会让 lmbench 的 `lat_ctx` 等子进程崩溃；单核调度下 cyclictest 压力阶段超时；没有动态链接（libc-test 动态部分被跳过）；`execve` 不支持 `#!` 解释器行；没有网卡和 TCP/IP 栈。
+以下来自 wonder-world 记录，未重新验证：信号返回上下文被破坏会让 lmbench 的 `lat_ctx` 等子进程崩溃，单核调度下 cyclictest 压力阶段超时。内核仍缺少动态链接以及网卡驱动和 TCP/IP 栈。

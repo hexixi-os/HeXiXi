@@ -8,24 +8,34 @@
 - 内核约 7700 行 Rust，实现了 100 多个 Linux 系统调用（`fork`/`exec`/`clone`/`futex`/`mmap`/信号等）。
 - 文件系统：只读 EXT4（评测盘）。写入的文件只存在内存里，重启就没了。
 - 单核，没有网卡驱动和网络协议栈，不支持动态链接。
-- 评测方式：看串口输出。内核启动后自动执行测试盘里的 `*_testcode.sh`，跑完关机。
-- **基线**：basic 组在本地模拟盘上 96/102；**在真实官方盘上目前起不来**（找不到 `oscomp_runner`，启动即 panic）。其余组还没测过，见 [测试状态](docs/TEST_STATUS.md)。
+- 评测方式：QEMU 内核内嵌 runner，在官方布局盘上进入 `/musl` 执行原版 `basic_testcode.sh`，跑完关机。
+- **基线**：2025 官方发布的 RISC-V64 原盘已在本地 QEMU 上跑通 `basic-musl`。分数和失败用例见 [测试状态](docs/TEST_STATUS.md)。
 
-当前分支 `oscomp-adaptation` 是适配分支；`main` 仍是原版基线，没有适配评测。
+评测适配基于 `oscomp-adaptation`，`main` 为原版教学内核基线。
 
 ## 快速开始
 
 在 Ubuntu / WSL2 里（Windows 原生不支持）。环境怎么装、每个脚本干什么，见 [开发与测试指南](docs/DEVELOPMENT.md)。
 
+### 官方盘
+
+使用 2025 初赛原盘及同一版本的测试套件，完整步骤见 [官方盘回归](docs/oscomp-evaluation.md#官方盘回归)。
+
 ```bash
-tools/oscomp/setup.sh                 # 下载测试套件、交叉编译器、cmake
-tools/oscomp/build_runner.sh          # 用户态启动程序 oscomp_runner
-tools/oscomp/build_busybox.sh         # busybox
-tools/oscomp/build_tests.sh           # basic 组的 32 个用例
-tools/oscomp/make_local_image.sh      # 打成 EXT4 测试盘
+SUITE=~/testsuits-pre-20250615 tools/oscomp/run_official_basic.sh ~/sdcard-rv.img ~/oscomp-work/official-basic
+```
+
+### 本地模拟盘
+
+```bash
+bash tools/oscomp/setup.sh                 # 下载测试套件、交叉编译器、cmake
+bash tools/oscomp/build_runner.sh          # 用户态启动程序 oscomp_runner
+bash tools/oscomp/build_busybox.sh         # busybox
+bash tools/oscomp/build_tests.sh           # basic 组的 32 个用例
+bash tools/oscomp/make_local_image.sh      # 打成 EXT4 测试盘
 make -C os build                      # 编译内核
-tools/oscomp/run_group.sh ~/oscomp-work/local/disk.img 256M 200 ~/oscomp-work/local/basic.log
-tools/oscomp/score_basic.sh ~/oscomp-work/local/basic.log     # 官方判分器打分
+bash tools/oscomp/run_group.sh ~/oscomp-work/local/disk.img 256M 200 ~/oscomp-work/local/basic.log
+bash tools/oscomp/score_basic.sh ~/oscomp-work/local/basic.log     # 官方判分器打分
 ```
 
 ## 目录结构

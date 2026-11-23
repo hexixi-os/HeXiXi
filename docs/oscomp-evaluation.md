@@ -13,37 +13,33 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m <mem> -nographic -smp <sm
   -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
 ```
 
-`{fs}` 是官方提供的 **EXT4 镜像**（无分区表，4 GB），根目录下是编译好的程序和 `xxx_testcode.sh` 脚本。
-内核需要在启动后：
-
-1. 找到并读取这个磁盘；
-2. 依次执行每个 `*_testcode.sh`；
-3. 脚本自带 `#### OS COMP TEST GROUP START xxx ####` 之类的标记；
-4. 全部跑完后主动关机。
-
-**评分只看屏幕（串口）输出。**
+`{fs}` 是官方提供的 **EXT4 镜像**。2025 初赛 RISC-V64 发布盘的程序和测试脚本位于 `/musl`、`/glibc`。脚本在串口输出组标记和用例结果，判分器据此执行断言。
 
 ## 内核现在怎么对接
 
 | 步骤 | 实现 |
 |---|---|
-| 读 EXT4 | `os/src/fs/ext4.rs`，只读：超级块、块组、inode、extent、目录 |
-| 选第一个进程 | `os/src/task/mod.rs` 的 `INITPROC`：有 `oscomp_runner` 就启动它 |
-| 执行脚本 | `user/src/bin/oscomp_runner.rs`：优先用盘里的 `busybox sh` 逐个执行 `*_testcode.sh` |
+| 读 EXT4 | `os/src/fs/ext4.rs` 按块组查找 inode，稀疏洞和未写入 extent 读为零 |
+| 选第一个进程 | `make all` 的 QEMU 评测构建先编译并内嵌 runner。`INITPROC` 识别官方布局后启动内嵌 runner |
+| 执行脚本 | runner 进入 `/musl`，调用盘里的 `busybox sh basic_testcode.sh`，保留原版 `basic-musl` 组标记和用例输出 |
 | 写文件 | EXT4 是只读的，写入走内存 overlay（`os/src/fs/mod.rs`），重启就没了 |
 | 关机 | 第一个进程以 0 退出，内核调用 `exit_success` |
 
-`oscomp_runner` 的两个特例：
+平铺模拟盘继续从根目录加载 `oscomp_runner`。教学盘可通过 `run_tests` 启动 `autorun`，默认启动 `initproc`。
 
-- 盘里有 `lua` 和 `date.lua` 时，直接逐个 fork+exec `lua` 去跑每个 `.lua`，不走 `lua_testcode.sh`。
-- 盘里没有 `busybox` 时，退回内置的迷你 shell，只支持少量语法。
+## 官方盘回归
 
-**注意**：上面是 wonder-world 文档和本地模拟盘采用的**平铺**布局（`busybox`、`*_testcode.sh`、测试程序、`oscomp_runner` 都在根目录）。
-真实官方盘的根目录是 `musl/`、`glibc/`、`lib/`、`lib64/`，盘里没有 `oscomp_runner`，脚本标记带 `-musl`/`-glibc` 后缀，当前的 `oscomp_runner` 对接方式在真实盘上不成立。详见 [开发与测试指南](DEVELOPMENT.md) 第 6 节。
+在 Linux 或 WSL2 配好 [构建环境](BUILD.md)，并从 [2025 初赛镜像发布页](https://github.com/oscomp/testsuits-for-oskernel/releases/tag/pre-20250615) 下载 `sdcard-rv.img.xz` 到 `~`。以下命令从 HeXiXi 仓库根目录运行。
 
-## 在本地复现
+```bash
+xz -dk ~/sdcard-rv.img.xz
+git clone --depth 1 --branch pre-20250615 https://github.com/oscomp/testsuits-for-oskernel.git ~/testsuits-pre-20250615
+SUITE=~/testsuits-pre-20250615 tools/oscomp/run_official_basic.sh ~/sdcard-rv.img ~/oscomp-work/official-basic
+```
 
-构建、运行、判分的完整步骤见 [开发与测试指南](DEVELOPMENT.md)。当前各组的得分见 [测试状态](TEST_STATUS.md)。
+脚本用 `make all` 构建内核，以 QEMU 快照模式挂载原盘。每次运行在结果目录生成独立记录，包含 `run.meta`、`serial.log`、`basic-musl.log` 和 `score.txt`。`run.meta` 记录镜像与内核 SHA-256、当前源码与测试套件提交、QEMU 命令、运行耗时和退出状态。完成回归要求串口有完整的组标记和用例输出，且 QEMU 正常退出。部分断言失败会保留分数和用例详情。
+
+已有内核可通过 `KERNEL=/path/to/kernel-rv` 复用。`QEMU_MEM` 默认 `1G`，`QEMU_TIMEOUT` 默认 `200` 秒。仅验证 EXT4 读取时，有 `debugfs` 和 stable Rust 的宿主环境可执行 `tools/oscomp/test_ext4.sh ~/sdcard-rv.img`。实测数据见 [测试状态](TEST_STATUS.md)。
 
 ## 已知限制
 
@@ -51,5 +47,4 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m <mem> -nographic -smp <sm
 - 单核，FIFO 轮转调度。
 - 没有网卡驱动和 TCP/IP 协议栈，iperf、netperf 拿不到分。
 - 不支持动态链接（没有 `ld-musl`，不支持 `dlopen`）。
-- `execve` 不支持 `#!` 解释器行，所以 runner 是显式调用 `busybox sh <脚本>`，而不是直接执行脚本（wonder-world 记录，未单独验证）。
-- 内存：lmbench 需要 1G，其余组 256M 够用。
+- 官方盘回归当前覆盖 `basic-musl`。动态 glibc 和其他组仍待适配或复跑。
