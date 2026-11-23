@@ -63,7 +63,9 @@ pub struct Ext4Fs {
     pub block_size: usize,
     pub inode_size: usize,
     pub inodes_per_group: u32,
-    inode_table_block: u64,
+    /// 块组描述符表的起始字节偏移与单个描述符大小
+    gdt_off: u64,
+    desc_size: usize,
 }
 
 impl Ext4Fs {
@@ -84,16 +86,14 @@ impl Ext4Fs {
         } else {
             32
         };
-        // 块组 0 的描述符在 (first_data_block + 1) 号块的开头
+        // 块组描述符表紧跟在超级块所在块之后：(first_data_block + 1) 号块
         let gdt_off = (first_data_block + 1) * block_size as u64;
-        let mut d = vec![0u8; desc_size];
-        read_at(gdt_off, &mut d);
-        let inode_table_block = le32(&d, 8) as u64;
         Some(Self {
             block_size,
             inode_size,
             inodes_per_group,
-            inode_table_block,
+            gdt_off,
+            desc_size,
         })
     }
 
@@ -107,9 +107,17 @@ impl Ext4Fs {
         if ino == 0 {
             return None;
         }
+        // inode 可能在任意块组里：先按块组描述符找到该组的 inode 表。
+        // （4GB 的官方盘有 32 个块组，以前只读块组 0，别的组的 inode 全是错的）
+        let group = ((ino - 1) / self.inodes_per_group) as u64;
         let idx = (ino - 1) % self.inodes_per_group;
-        let off = self.inode_table_block * self.block_size as u64
-            + idx as u64 * self.inode_size as u64;
+        let mut d = vec![0u8; self.desc_size];
+        read_at(self.gdt_off + group * self.desc_size as u64, &mut d);
+        let mut table = le32(&d, 8) as u64;
+        if self.desc_size >= 64 {
+            table |= (le32(&d, 40) as u64) << 32; // bg_inode_table_hi
+        }
+        let off = table * self.block_size as u64 + idx as u64 * self.inode_size as u64;
         let mut b = vec![0u8; self.inode_size.max(128)];
         read_at(off, &mut b);
         let mut blocks = [0u8; 60];
