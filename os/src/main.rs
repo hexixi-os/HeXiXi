@@ -53,7 +53,8 @@ fn clear_bss() {
 pub fn rust_main() -> ! {
     clear_bss();
     println!("[kernel] Hello, world!");
-    match fdt::detect_ram_end() {
+    let boot = fdt::detect_boot_info();
+    match boot.ram_end {
         Some(end) => {
             // 末尾留 1MB 余量，避免越过 RAM
             let end = end.saturating_sub(0x10_0000);
@@ -71,7 +72,7 @@ pub fn rust_main() -> ! {
     if !is_ext4 {
         fs::list_apps();
     }
-    task::add_initproc();
+    task::add_initproc(boot.oscomp_group());
     task::run_tasks();
     panic!("Unreachable in rust_main!");
 }

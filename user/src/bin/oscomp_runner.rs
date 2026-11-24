@@ -18,6 +18,7 @@ extern crate alloc;
 extern crate user_lib;
 
 use alloc::string::{String, ToString};
+use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 use user_lib::{chdir, close, exec, exit, fork, open, read, waitpid, OpenFlags};
@@ -280,7 +281,8 @@ fn run_with_busybox(script: &str) -> i32 {
             script.ptr(),
             core::ptr::null(),
         ];
-        exec("busybox\0", &args);
+        let errno = exec("busybox\0", &args);
+        println!("[oscomp] cannot exec busybox sh {} errno={}", script.as_str(), errno);
         exit(126);
     }
     let mut code = 0;
@@ -290,31 +292,44 @@ fn run_with_busybox(script: &str) -> i32 {
     code
 }
 
-#[no_mangle]
-pub fn main(_argc: usize, _argv: &[&str]) -> i32 {
-    if exists("/musl/basic_testcode.sh") {
-        if chdir("/musl\0") != 0 || !exists("busybox") || !exists("basic_testcode.sh") {
-            println!("[oscomp] missing BusyBox or basic_testcode.sh in /musl");
-            return 1;
-        }
-        println!("[oscomp] running /musl/basic_testcode.sh");
-        return run_with_busybox("basic_testcode.sh");
-    }
+const GROUPS: &[&str] = &[
+    "basic", "lua", "busybox", "libctest", "libcbench", "unixbench", "iozone",
+    "iperf", "lmbench", "cyclictest", "ltp", "netperf",
+];
 
-    const SCRIPTS: &[&str] = &[
-        "basic_testcode.sh",
-        "lua_testcode.sh",
-        "busybox_testcode.sh",
-        "libctest_testcode.sh",
-        "libcbench_testcode.sh",
-        "unixbench_testcode.sh",
-        "iozone_testcode.sh",
-        "iperf_testcode.sh",
-        "lmbench_testcode.sh",
-        "cyclictest_testcode.sh",
-        "ltp_testcode.sh",
-        "netperf_testcode.sh",
-    ];
+fn run_official(requested: Option<&str>) -> i32 {
+    let mut selected = false;
+    for (libc, directory) in [("musl", "/musl\0"), ("glibc", "/glibc\0")] {
+        for group in GROUPS {
+            let name = format!("{}-{}", group, libc);
+            if requested.map_or(false, |selection| selection != name) {
+                continue;
+            }
+            selected = true;
+            let script = format!("{}_testcode.sh", group);
+            println!("[oscomp] running /{}/{}", libc, script);
+            let code = if chdir(directory) != 0 || !exists("busybox") || !exists(&script) {
+                println!("[oscomp] missing /{}/{} or BusyBox", libc, script);
+                127
+            } else {
+                run_with_busybox(&script)
+            };
+            println!("[oscomp] result {} exit={}", name, code);
+        }
+    }
+    if selected {
+        0
+    } else {
+        println!("[oscomp] unknown group {}", requested.unwrap_or_default());
+        1
+    }
+}
+
+#[no_mangle]
+pub fn main(_argc: usize, argv: &[&str]) -> i32 {
+    if exists("/musl/basic_testcode.sh") {
+        return run_official(argv.get(1).copied());
+    }
 
     // lua 组：直接调用 lua 解释器逐个跑脚本（绕过 busybox/test.sh 的崩溃）
     const LUA_SCRIPTS: &[&str] = &[
@@ -350,20 +365,21 @@ pub fn main(_argc: usize, _argv: &[&str]) -> i32 {
 
     // 有 busybox 时，用真实的 sh 解释脚本（最贴近评测机行为）
     if exists("busybox") {
-        for script in SCRIPTS.iter() {
-            if !exists(script) {
-                continue;
+        for group in GROUPS {
+            let script = format!("{}_testcode.sh", group);
+            if exists(&script) {
+                run_with_busybox(&script);
             }
-            run_with_busybox(script);
         }
         return 0;
     }
 
     // 没有 busybox 时退回内置迷你 shell
     let mut sh = Shell::new();
-    for s in SCRIPTS {
-        if exists(s) {
-            sh.run_file(s);
+    for group in GROUPS {
+        let script = format!("{}_testcode.sh", group);
+        if exists(&script) {
+            sh.run_file(&script);
         }
     }
     0

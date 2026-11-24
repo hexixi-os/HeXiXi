@@ -63,7 +63,12 @@ EOF
 
 CMDS="$OUT/cmds.txt"
 : > "$CMDS"
-echo "write $SUITE/scripts/lmbench/lmbench_testcode.sh /lmbench_testcode.sh" >> "$CMDS"
+# 只缩短本地模拟盘的测量目标，评测原盘继续使用原始参数。
+{
+    printf 'export ENOUGH=10000\n'
+    cat "$SUITE/scripts/lmbench/lmbench_testcode.sh"
+} > "$OUT/lmbench_testcode.sh"
+echo "write $OUT/lmbench_testcode.sh /lmbench_testcode.sh" >> "$CMDS"
 echo "write $O/lmbench_all /lmbench_all" >> "$CMDS"
 echo "write $SUITE/busybox/busybox /busybox" >> "$CMDS"
 echo "write $OUT/hello /hello" >> "$CMDS"

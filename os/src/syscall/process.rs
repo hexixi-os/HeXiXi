@@ -3,7 +3,7 @@ use crate::mm::{MapPermission, VirtPageNum, VmaBacking, USER_END};
 use core::ops::Range;
 use crate::fs::{open_executable, Executable};
 use crate::mm::{
-    translated_byte_buffer, translated_path, translated_ref, translated_refmut,
+    translated_byte_buffer, translated_c_bytes, translated_path, translated_ref, translated_refmut,
     try_translated_refmut, UserBuffer,
 };
 use crate::task::{
@@ -40,7 +40,7 @@ pub(super) fn fork_with_stack(stack: usize) -> isize {
     current_process().fork(stack).map(|pid| pid as isize).unwrap_or_else(|errno| errno)
 }
 
-pub fn sys_exec(path: *const u8, args: *const usize) -> isize {
+pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isize {
     let token = current_user_token();
     let raw_path = match translated_path(token, path) {
         Ok(path) => path,
@@ -53,6 +53,10 @@ pub fn sys_exec(path: *const u8, args: *const usize) -> isize {
     };
     let args = match exec_arguments(token, args) {
         Ok(args) => args,
+        Err(errno) => return errno,
+    };
+    let envs = match exec_arguments(token, envp) {
+        Ok(envs) => envs,
         Err(errno) => return errno,
     };
     let source = match open_executable(&path) {
@@ -71,13 +75,13 @@ pub fn sys_exec(path: *const u8, args: *const usize) -> isize {
         (source, args)
     };
     let argc = args.len();
-    match current_process().exec(source, args) {
+    match current_process().exec(source, args, envs) {
         Ok(()) => argc as isize, // trap_handler writes the syscall result to the new a0.
         Err(errno) => errno,
     }
 }
 
-fn exec_arguments(token: usize, args: *const usize) -> Result<Vec<String>, isize> {
+fn exec_arguments(token: usize, args: *const usize) -> Result<Vec<Vec<u8>>, isize> {
     const WORD: usize = core::mem::size_of::<usize>();
     let mut result = Vec::new();
     if args.is_null() {
@@ -96,7 +100,7 @@ fn exec_arguments(token: usize, args: *const usize) -> Result<Vec<String>, isize
         if pointer == 0 {
             return Ok(result);
         }
-        let arg = translated_path(token, pointer as *const u8)
+        let arg = translated_c_bytes(token, pointer as *const u8)
             .map_err(|errno| if errno == -36 { -7 } else { errno })?;
         remaining = remaining.checked_sub(arg.len() + 1 + WORD).ok_or(-7isize)?;
         result.push(arg);
@@ -108,8 +112,8 @@ fn script_interpreter(
     prefix: &[u8],
     more_data: bool,
     path: String,
-    args: Vec<String>,
-) -> Result<(Executable, Vec<String>), isize> {
+    args: Vec<Vec<u8>>,
+) -> Result<(Executable, Vec<Vec<u8>>), isize> {
     let newline = prefix.iter().position(|&byte| byte == b'\n');
     let end = newline.unwrap_or(prefix.len());
     let line = core::str::from_utf8(&prefix[2..end]).map_err(|_| -8isize)?.trim_start();
@@ -136,11 +140,11 @@ fn script_interpreter(
         }
     };
     let mut new_args = Vec::with_capacity(args.len() + 3);
-    new_args.push(String::from(program));
+    new_args.push(program.as_bytes().to_vec());
     if let Some(argument) = argument {
-        new_args.push(String::from(argument));
+        new_args.push(argument.as_bytes().to_vec());
     }
-    new_args.push(path);
+    new_args.push(path.into_bytes());
     new_args.extend(args.into_iter().skip(1));
     Ok((source, new_args))
 }

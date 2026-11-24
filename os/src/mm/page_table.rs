@@ -291,18 +291,28 @@ pub fn translated_byte_buffer(
 
 /// Load a string from other address spaces into kernel space without an end `\0`.
 pub fn translated_str(token: usize, ptr: *const u8) -> String {
-    read_user_string(token, ptr).unwrap_or_else(|(prefix, _)| prefix)
+    read_user_string(token, ptr, |s: &mut String, byte| s.push(char::from(byte)))
+        .unwrap_or_else(|(prefix, _)| prefix)
 }
 
 /// Require a NUL terminator before returning a path to a filesystem operation.
 pub fn translated_path(token: usize, ptr: *const u8) -> Result<String, isize> {
-    read_user_string(token, ptr).map_err(|(_, errno)| errno)
+    read_user_string(token, ptr, |s: &mut String, byte| s.push(char::from(byte)))
+        .map_err(|(_, errno)| errno)
 }
 
-fn read_user_string(token: usize, ptr: *const u8) -> Result<String, (String, isize)> {
+pub(crate) fn translated_c_bytes(token: usize, ptr: *const u8) -> Result<Vec<u8>, isize> {
+    read_user_string(token, ptr, Vec::push).map_err(|(_, errno)| errno)
+}
+
+fn read_user_string<T: Default>(
+    token: usize,
+    ptr: *const u8,
+    mut push: impl FnMut(&mut T, u8),
+) -> Result<T, (T, isize)> {
     const PATH_MAX: usize = 4096;
     let page_table = PageTable::from_token(token);
-    let mut string = String::new();
+    let mut string = T::default();
     let mut va = ptr as usize;
     let mut checked_vpn = usize::MAX;
     for _ in 0..PATH_MAX {
@@ -320,7 +330,7 @@ fn read_user_string(token: usize, ptr: *const u8) -> Result<String, (String, isi
         if ch == 0 {
             return Ok(string);
         }
-        string.push(ch as char);
+        push(&mut string, ch);
         va += 1;
     }
     Err((string, -36)) // ENAMETOOLONG

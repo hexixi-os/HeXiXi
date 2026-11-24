@@ -3,6 +3,34 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 static DETECTED_RAM_END: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Default)]
+pub struct BootInfo {
+    pub ram_end: Option<usize>,
+    oscomp_group: [u8; 32],
+}
+
+impl BootInfo {
+    pub fn oscomp_group(&self) -> Option<&str> {
+        let end = self.oscomp_group.iter().position(|&byte| byte == 0)?;
+        (end != 0).then(|| core::str::from_utf8(&self.oscomp_group[..end]).unwrap())
+    }
+
+    fn read_bootargs(&mut self, args: &[u8]) {
+        let args = args.split(|&byte| byte == 0).next().unwrap_or_default();
+        for arg in args.split(|byte| byte.is_ascii_whitespace()) {
+            if let Some(group) = arg.strip_prefix(b"oscomp.group=") {
+                let group = if group.is_empty() || group.len() >= self.oscomp_group.len() || !group.is_ascii() {
+                    b"<invalid>"
+                } else {
+                    group
+                };
+                self.oscomp_group[..group.len()].copy_from_slice(group);
+                break;
+            }
+        }
+    }
+}
+
 fn read_be32(addr: usize) -> u32 {
     unsafe { u32::from_be(core::ptr::read_volatile(addr as *const u32)) }
 }
@@ -13,17 +41,18 @@ fn read_be64(addr: usize) -> u64 {
     (hi << 32) | lo
 }
 
-/// 解析 FDT，返回 RAM 结束地址（最大 memory 区域末尾）
-pub fn detect_ram_end() -> Option<usize> {
+/// 解析 FDT 中的 RAM 结束地址和评测启动参数。
+pub fn detect_boot_info() -> BootInfo {
     extern "C" {
         static BOOT_DTB: usize;
     }
     let dtb = unsafe { BOOT_DTB };
+    let mut info = BootInfo::default();
     if dtb < 0x8000_0000 || dtb >= 0x1_0000_0000 {
-        return None;
+        return info;
     }
     if read_be32(dtb) != 0xd00d_feed {
-        return None;
+        return info;
     }
     let off_struct = read_be32(dtb + 8) as usize;
     let off_strings = read_be32(dtb + 12) as usize;
@@ -35,6 +64,7 @@ pub fn detect_ram_end() -> Option<usize> {
     let mut size_cells = 2usize;
     // 正在处理的节点名（深度 1 时是 memory 节点）
     let mut node_is_memory = false;
+    let mut node_is_chosen = false;
     let mut max_end = 0usize;
 
     loop {
@@ -57,11 +87,15 @@ pub fn detect_ram_end() -> Option<usize> {
                 if depth == 2 && (name.starts_with("memory") || name.contains("memory@")) {
                     node_is_memory = true;
                 }
+                if depth == 2 {
+                    node_is_chosen = name == "chosen";
+                }
             }
             2 => {
                 // FDT_END_NODE
                 if depth == 2 {
                     node_is_memory = false;
+                    node_is_chosen = false;
                 }
                 depth = depth.saturating_sub(1);
             }
@@ -86,6 +120,10 @@ pub fn detect_ram_end() -> Option<usize> {
                         "#size-cells" if len >= 4 => size_cells = read_be32(value) as usize,
                         _ => {}
                     }
+                }
+                if depth == 2 && node_is_chosen && pname == "bootargs" && len <= 4096 {
+                    let args = unsafe { core::slice::from_raw_parts(value as *const u8, len) };
+                    info.read_bootargs(args);
                 }
                 if node_is_memory && pname == "reg" {
                     let entry = addr_cells + size_cells;
@@ -120,10 +158,9 @@ pub fn detect_ram_end() -> Option<usize> {
     }
     if max_end > 0 {
         DETECTED_RAM_END.store(max_end, Ordering::Relaxed);
-        Some(max_end)
-    } else {
-        None
+        info.ram_end = Some(max_end);
     }
+    info
 }
 
 pub fn ram_end() -> Option<usize> {

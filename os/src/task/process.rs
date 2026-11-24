@@ -8,7 +8,6 @@ use crate::fs::{DirectoryLocation, Executable, File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
-use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -171,8 +170,40 @@ impl ProcessControlBlock {
         process
     }
 
+    #[cfg(feature = "oscomp_runner")]
+    pub(super) fn set_initial_args(&self, args: &[&str]) {
+        let inner = self.inner_exclusive_access();
+        let token = inner.get_user_token();
+        let task = inner.get_task(0);
+        drop(inner);
+        let mut inner = task.inner_exclusive_access();
+        let mut sp = inner.res.as_ref().unwrap().ustack_top();
+        let mut pointers = Vec::with_capacity(args.len());
+        for arg in args {
+            sp -= arg.len() + 1;
+            for (offset, byte) in arg.bytes().chain(core::iter::once(0)).enumerate() {
+                *translated_refmut(token, (sp + offset) as *mut u8) = byte;
+            }
+            pointers.push(sp);
+        }
+        let word = core::mem::size_of::<usize>();
+        sp = (sp - (pointers.len() + 1) * word) & !15;
+        for (index, pointer) in pointers.into_iter().chain(core::iter::once(0)).enumerate() {
+            *translated_refmut(token, (sp + index * word) as *mut usize) = pointer;
+        }
+        let trap = inner.get_trap_cx();
+        trap.set_sp(sp);
+        trap.x[10] = args.len();
+        trap.x[11] = sp;
+    }
+
     /// Only support processes with a single thread.
-    pub fn exec(self: &Arc<Self>, source: Executable, args: Vec<String>) -> Result<(), isize> {
+    pub fn exec(
+        self: &Arc<Self>,
+        source: Executable,
+        args: Vec<Vec<u8>>,
+        envs: Vec<Vec<u8>>,
+    ) -> Result<(), isize> {
         const AUXV_ENTRIES: usize = 15;
         if self.inner_exclusive_access().thread_count() != 1 {
             return Err(-16); // EBUSY
@@ -180,19 +211,6 @@ impl ProcessControlBlock {
         let (mut memory_set, elf) = MemorySet::from_elf(source)?;
         let new_token = memory_set.token();
         let heap_base = 0x2000_0000.max(elf.stack_base + USER_STACK_SIZE + PAGE_SIZE);
-        // 环境变量：只给 lmbench 注入 ENOUGH。
-        //   为什么：lmbench 的计时目标默认按“1 秒”校准，每个子进程要跑 1s 的校准/测量；
-        //   lat_fs 还会按 1 秒预算创建上万个 10KB 文件（overlay 数据在内核堆里），
-        //   1G 机器上会堆爆/超时。ENOUGH 是 lmbench 官方支持的调参环境变量
-        //   （lib_timing.c: getenv("ENOUGH")），设成 10000 即 10ms 目标，
-        //   不影响测量含义，还能让整组在几分钟内跑完。
-        let prog_name = args.first().map(|s| s.as_str()).unwrap_or("");
-        let envs: Vec<String> = if prog_name.ends_with("lmbench_all") || prog_name.ends_with("lmbench") {
-            vec![String::from("ENOUGH=10000")]
-        } else {
-            Vec::new()
-        };
-
         let string_bytes = args.iter().chain(&envs).try_fold(0usize, |total, s| {
             total.checked_add(s.len() + 1)
         }).ok_or(-7isize)?;
@@ -220,7 +238,7 @@ impl ProcessControlBlock {
             pinner.mmap_top = 0x1000_0000;
         }
         // ---- 构造 Linux 进程启动栈 ----
-        // 低地址 -> 高地址：argc | argv[..] | NULL | NULL(envp) | auxv | 字符串/程序头/随机数
+        // 低地址 -> 高地址：argc | argv[..] | NULL | envp[..] | NULL | auxv | 字符串/程序头/随机数
         let mut sp = task_inner.res.as_mut().unwrap().ustack_top();
         let argc = args.len();
 
@@ -229,7 +247,7 @@ impl ProcessControlBlock {
         for env in envs.iter().rev() {
             sp -= env.len() + 1;
             let mut ep = sp;
-            for c in env.as_bytes() {
+            for c in env {
                 *translated_refmut(new_token, ep as *mut u8) = *c;
                 ep += 1;
             }
@@ -243,7 +261,7 @@ impl ProcessControlBlock {
         for arg in args.iter().rev() {
             sp -= arg.len() + 1;
             let mut p = sp;
-            for c in arg.as_bytes() {
+            for c in arg {
                 *translated_refmut(new_token, p as *mut u8) = *c;
                 p += 1;
             }

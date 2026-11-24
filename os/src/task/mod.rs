@@ -207,8 +207,16 @@ lazy_static! {
     };
 }
 
-pub fn add_initproc() {
-    let _initproc = INITPROC.clone();
+pub fn add_initproc(oscomp_group: Option<&str>) {
+    let initproc = INITPROC.clone();
+    #[cfg(feature = "oscomp_runner")]
+    if let Some(group) = oscomp_group {
+        if crate::fs::has_ext4() && crate::fs::exists("musl/basic_testcode.sh") {
+            initproc.set_initial_args(&["oscomp_runner", group]);
+        }
+    }
+    #[cfg(not(feature = "oscomp_runner"))]
+    let _ = (initproc, oscomp_group);
 }
 
 /// 进程被 kill(SIGKILL) 后，在内核里的轮询/等待循环中尽快退出。

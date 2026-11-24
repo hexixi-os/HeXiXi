@@ -266,7 +266,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FORK => sys_fork(),
         SYSCALL_EXEC => {
             let path = args[0] as *const u8;
-            let load = || sys_exec(path, args[1] as *const usize);
+            let load = || sys_exec(path, args[1] as *const usize, args[2] as *const usize);
             #[cfg(feature = "elf_startup_stats")]
             return crate::exec_stats::measure(path, load);
             #[cfg(not(feature = "elf_startup_stats"))]
