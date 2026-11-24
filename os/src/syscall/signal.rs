@@ -31,14 +31,10 @@ const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
 /// 在用户地址空间建立信号所需的两页（exec 时调用）
 pub fn setup_signal_pages(memory_set: &mut MemorySet) {
     if memory_set.translate(SIGSTUB_VA.into()).is_none() {
-        // addi a7, x0, 139 ; ecall ; j .
-        let code: [u8; 12] = [
-            0x93, 0x08, 0xB0, 0x08, 0x73, 0x00, 0x00, 0x00, 0x6F, 0x00, 0x00, 0x00,
-        ];
         memory_set.insert_data_page(
             VirtAddr::from(SIGSTUB_VA),
             MapPermission::U | MapPermission::R | MapPermission::X,
-            &code,
+            &crate::arch::SIGRETURN_CODE,
         );
     }
     if memory_set.translate(SIGCTX_VA.into()).is_none() {
@@ -322,8 +318,8 @@ pub fn deliver_signal() {
         }
         cx.sepc = action.handler;
         cx.x[1] = SIGSTUB_VA;
-        cx.x[10] = signo;
-        cx.x[2] = cx.x[2].saturating_sub(512) & !0xf;
+        cx.x[crate::arch::REG_A0] = signo;
+        cx.x[crate::arch::REG_SP] = cx.x[crate::arch::REG_SP].saturating_sub(512) & !0xf;
         return;
     }
 }

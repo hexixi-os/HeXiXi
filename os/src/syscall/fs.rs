@@ -7,6 +7,7 @@ use crate::task::{current_process, current_user_token};
 use alloc::{string::String, sync::Arc};
 
 const AT_FDCWD: isize = -100;
+const AT_EMPTY_PATH: usize = 0x1000;
 
 fn with_io_file<T>(file: Arc<dyn fs::File>, operation: impl FnOnce(&dyn fs::File) -> T) -> T {
     let pointer = Arc::as_ptr(&file);
@@ -364,7 +365,6 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: usize) -> isize {
         .unwrap_or(0)
 }
 
-/// fstat(80)：填 riscv64 的 struct stat（128 字节）
 fn file_by_fd(fd: usize) -> Result<Arc<dyn fs::File + Send + Sync>, isize> {
     current_process().inner_exclusive_access().fd_table.get(fd)
         .and_then(Option::as_ref).cloned().ok_or(-9)
@@ -445,55 +445,96 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
     n as isize
 }
 
-fn write_stat(st: *mut u8, file: &dyn fs::File, fallback_inode: u64) -> isize {
-    let (device, inode) = file.stat_identity().unwrap_or((0, fallback_inode));
-    let mode: u32 = if file.directory().is_some() { 0o40755 } else { 0o100644 };
-    let mut buf = [0u8; 128];
-    buf[0..8].copy_from_slice(&device.to_le_bytes());
-    buf[8..16].copy_from_slice(&inode.to_le_bytes());
-    buf[16..20].copy_from_slice(&mode.to_le_bytes());
-    buf[20..24].copy_from_slice(&file.link_count().to_le_bytes());
-    buf[48..56].copy_from_slice(&(file.size() as u64).to_le_bytes());
-    buf[56..60].copy_from_slice(&4096u32.to_le_bytes());
-    let target = match translated_byte_buffer(current_user_token(), st, buf.len(), MapPermission::W) {
+fn stat_mode(file: &dyn fs::File) -> u16 {
+    if file.directory().is_some() { 0o40755 } else { 0o100644 }
+}
+
+fn write_stat_bytes(st: *mut u8, bytes: &[u8]) -> isize {
+    let target = match translated_byte_buffer(current_user_token(), st, bytes.len(), MapPermission::W) {
         Some(buffers) => UserBuffer::new(buffers),
         None => return -14,
     };
-    for (dst, byte) in target.into_iter().zip(buf) {
+    for (dst, &byte) in target.into_iter().zip(bytes) {
         unsafe { dst.write(byte); }
     }
     0
 }
 
-/// newfstatat(79)：按路径取文件信息
-pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut u8, flags: usize) -> isize {
-    const AT_EMPTY_PATH: usize = 0x1000;
-    let token = current_user_token();
-    let raw = match translated_path(token, path) {
-        Ok(path) => path,
-        Err(errno) => return errno,
-    };
-    let resolved = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+fn write_stat(st: *mut u8, file: &dyn fs::File, fallback_inode: u64) -> isize {
+    let (device, inode) = file.stat_identity().unwrap_or((0, fallback_inode));
+    let mut buf = [0u8; 128];
+    buf[0..8].copy_from_slice(&device.to_le_bytes());
+    buf[8..16].copy_from_slice(&inode.to_le_bytes());
+    buf[16..20].copy_from_slice(&u32::from(stat_mode(file)).to_le_bytes());
+    buf[20..24].copy_from_slice(&file.link_count().to_le_bytes());
+    buf[48..56].copy_from_slice(&(file.size() as u64).to_le_bytes());
+    buf[56..60].copy_from_slice(&4096u32.to_le_bytes());
+    write_stat_bytes(st, &buf)
+}
+
+fn stat_file_at(
+    dirfd: isize,
+    raw: &str,
+    flags: usize,
+) -> Result<(Arc<dyn fs::File + Send + Sync>, u64), isize> {
+    let path = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dirfd != AT_FDCWD {
-            return sys_fstat(dirfd as usize, st);
+            return file_by_fd(dirfd as usize).map(|file| (file, dirfd as u64));
         }
-        fs::resolve_path(".")
+        fs::resolve_path(".")?
     } else {
-        resolve_at(dirfd, &raw)
-    };
-    let path = match resolved {
-        Ok(path) => path,
-        Err(errno) => return errno,
+        resolve_at(dirfd, raw)?
     };
     if raw.ends_with('/') {
-        if let Err(errno) = fs::require_directory(&path) {
-            return errno;
-        }
+        fs::require_directory(&path)?;
     }
-    match fs::open_dyn(&path, OpenFlags::RDONLY) {
-        Ok(file) => write_stat(st, file.as_ref(), 0),
+    fs::open_dyn(&path, OpenFlags::RDONLY).map(|file| (file, 0))
+}
+
+pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut u8, flags: usize) -> isize {
+    match translated_path(current_user_token(), path).and_then(|raw| stat_file_at(dirfd, &raw, flags)) {
+        Ok((file, fallback_inode)) => write_stat(st, file.as_ref(), fallback_inode),
         Err(errno) => errno,
     }
+}
+
+pub fn sys_statx(dirfd: isize, path: *const u8, flags: usize, mask: u32, st: *mut u8) -> isize {
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    const AT_NO_AUTOMOUNT: usize = 0x800;
+    const AT_STATX_SYNC_TYPE: usize = 0x6000;
+    const STATX_RESERVED: u32 = 0x8000_0000;
+    const STATX_AVAILABLE: u32 = 0x207; // type, mode, link count, size
+    const STATX_INO: u32 = 0x100;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE) != 0
+        || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE
+        || mask & STATX_RESERVED != 0
+    {
+        return -22;
+    }
+    let raw = if path.is_null() && flags & AT_EMPTY_PATH != 0 {
+        Ok(String::new())
+    } else {
+        translated_path(current_user_token(), path)
+    };
+    let (file, _) = match raw.and_then(|raw| stat_file_at(dirfd, &raw, flags)) {
+        Ok(info) => info,
+        Err(errno) => return errno,
+    };
+    let identity = file.stat_identity();
+    let (device, inode) = identity.unwrap_or_default();
+    let available = STATX_AVAILABLE | if identity.is_some() { STATX_INO } else { 0 };
+    let major = ((device >> 8) as u32 & 0xfff) | ((device >> 32) as u32 & !0xfff);
+    let minor = (device as u32 & 0xff) | ((device >> 12) as u32 & !0xff);
+    let mut buf = [0u8; 256]; // Linux uapi struct statx
+    buf[0..4].copy_from_slice(&available.to_le_bytes());
+    buf[4..8].copy_from_slice(&4096u32.to_le_bytes());
+    buf[16..20].copy_from_slice(&file.link_count().to_le_bytes());
+    buf[28..30].copy_from_slice(&stat_mode(file.as_ref()).to_le_bytes());
+    buf[32..40].copy_from_slice(&inode.to_le_bytes());
+    buf[40..48].copy_from_slice(&(file.size() as u64).to_le_bytes());
+    buf[136..140].copy_from_slice(&major.to_le_bytes());
+    buf[140..144].copy_from_slice(&minor.to_le_bytes());
+    write_stat_bytes(st, &buf)
 }
 
 pub fn sys_renameat(oldfd: isize, oldpath: *const u8, newfd: isize, newpath: *const u8, flags: usize) -> isize {

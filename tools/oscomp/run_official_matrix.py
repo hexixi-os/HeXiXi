@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the 2025 preliminary RISC-V64 image one original group per boot."""
+"""Run the 2025 preliminary RISC-V64 or LoongArch64 image one original group per boot."""
 
 import argparse
 import hashlib
@@ -143,18 +143,26 @@ def run_group(args, name, run, kernel):
     group_log = directory / "group.log"
     command = [
         args.qemu, "-machine", "virt", "-m", args.memory, "-smp", "1",
-        "-nographic", "-bios", "default", "-kernel", str(kernel),
-        "-append", f"oscomp.group={name}", "-no-reboot", "-snapshot",
-        "-drive", drive(args.image, "x0"),
-        "-device", "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
-        "-device", "virtio-net-device,netdev=net", "-netdev", "user,id=net", "-rtc", "base=utc",
+        "-nographic", "-kernel", str(kernel), "-no-reboot",
     ]
     with tempfile.NamedTemporaryFile(dir=directory, prefix="scratch.", suffix=".img") as scratch:
         scratch.truncate(64 * 1024 * 1024)
-        command.extend([
-            "-drive", drive(scratch.name, "x1"),
-            "-device", "virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1",
-        ])
+        if args.arch == "riscv64":
+            command.extend([
+                "-bios", "default", "-append", f"oscomp.group={name}",
+                "-snapshot", "-drive", drive(args.image, "x0"),
+                "-device", "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
+                "-device", "virtio-net-device,netdev=net", "-netdev", "user,id=net",
+                "-rtc", "base=utc", "-drive", drive(scratch.name, "x1"),
+                "-device", "virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1",
+            ])
+        else:
+            command.extend([
+                "-fw_cfg", f"name=opt/hexixi/oscomp.group,string={name}",
+                "-drive", drive(args.image, "x0") + ",readonly=on",
+                "-device", "virtio-blk-pci,drive=x0,disable-legacy=on,romfile=",
+                "-nic", "none", "-monitor", "none",
+            ])
         result_path = directory / "result.json"
         result = {"group": name, "qemu_command": command, "timeout_seconds": args.timeout}
         write_json(result_path, {**result, "status": "running"})
@@ -189,17 +197,19 @@ def run_group(args, name, run, kernel):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("image", type=Path, help="官方 RISC-V64 EXT4 镜像")
+    parser.add_argument("image", type=Path, help="对应架构的官方 EXT4 镜像")
     parser.add_argument("output", type=Path, help="保存评测记录的父目录")
     parser.add_argument("groups", nargs="*", help="测试组名，如 basic 或 basic-musl，留空运行全部")
     parser.add_argument("--suite", type=Path, default=os.getenv("SUITE", str(Path.home() / "testsuits")))
     parser.add_argument("--judges", type=Path, default=os.getenv("OSCOMP_JUDGES"),
                         help="可选的 oskernel-testsuits-cooperation 仓库")
     parser.add_argument("--kernel", type=Path, default=os.getenv("KERNEL"), help="复用已构建的内核")
-    parser.add_argument("--qemu", default=os.getenv("QEMU", "qemu-system-riscv64"))
+    parser.add_argument("--arch", choices=("riscv64", "loongarch64"), default="riscv64")
+    parser.add_argument("--qemu", default=os.getenv("QEMU"))
     parser.add_argument("--memory", default=os.getenv("QEMU_MEM", "1G"))
     parser.add_argument("--timeout", type=float, default=os.getenv("QEMU_TIMEOUT", "200"))
     args = parser.parse_intermixed_args()
+    args.qemu = args.qemu or f"qemu-system-{args.arch}"
     try:
         names = select_groups(args.groups)
     except ValueError as error:
@@ -220,9 +230,11 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     run = Path(tempfile.mkdtemp(prefix="run.", dir=args.output.resolve()))
     print(f"评测记录 {run}", flush=True)
-    kernel = args.kernel.resolve() if args.kernel else run / "kernel-rv"
+    target, output = ("all", "KERNEL_OUT") if args.arch == "riscv64" else ("kernel-la", "LA_KERNEL_OUT")
+    kernel = args.kernel.resolve() if args.kernel else run / ("kernel-rv" if target == "all" else target)
     metadata = {
         "source": checkout(REPO),
+        "arch": args.arch,
         "suite": checkout(args.suite),
         "judge_checkout": checkout(args.judges) if args.judges else None,
         "qemu_version": subprocess.check_output([args.qemu, "--version"], text=True).splitlines()[0],
@@ -235,7 +247,7 @@ def main():
     write_json(run / "run.meta.json", metadata)
     if not args.kernel:
         with (run / "build.log").open("wb") as log:
-            build = subprocess.run(["make", "-C", str(REPO), "all", f"KERNEL_OUT={kernel}"],
+            build = subprocess.run(["make", "-C", str(REPO), target, f"{output}={kernel}"],
                                    stdout=log, stderr=subprocess.STDOUT)
         if build.returncode:
             sys.exit(f"内核构建失败，见 {run / 'build.log'}")

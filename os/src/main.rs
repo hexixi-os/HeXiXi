@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-#![feature(panic_info_message)]
+#![cfg_attr(target_arch = "riscv64", feature(panic_info_message))]
 #![feature(alloc_error_handler)]
 
 extern crate alloc;
@@ -8,12 +8,17 @@ extern crate alloc;
 #[macro_use]
 extern crate bitflags;
 
-#[cfg(feature = "board_k210")]
+#[cfg(all(target_arch = "riscv64", feature = "board_k210"))]
 #[path = "boards/k210.rs"]
 mod board;
-#[cfg(not(any(feature = "board_k210")))]
+#[cfg(all(target_arch = "riscv64", not(feature = "board_k210")))]
 #[path = "boards/qemu.rs"]
 mod board;
+#[cfg(target_arch = "loongarch64")]
+#[path = "boards/loongarch_virt.rs"]
+mod board;
+
+mod arch;
 
 #[macro_use]
 mod console;
@@ -27,16 +32,11 @@ mod fork_stats;
 mod fs;
 mod lang_items;
 mod mm;
-mod sbi;
 mod sync;
 mod syscall;
 mod task;
 mod timer;
 mod trap;
-
-use core::arch::global_asm;
-
-global_asm!(include_str!("entry.asm"));
 
 fn clear_bss() {
     extern "C" {
@@ -53,7 +53,7 @@ fn clear_bss() {
 pub fn rust_main() -> ! {
     clear_bss();
     println!("[kernel] Hello, world!");
-    let boot = fdt::detect_boot_info();
+    let boot = arch::boot_info();
     match boot.ram_end {
         Some(end) => {
             // 末尾留 1MB 余量，避免越过 RAM
@@ -61,9 +61,10 @@ pub fn rust_main() -> ! {
             mm::set_ram_end(end);
             println!("[kernel] DTB memory end: {:#x}", end);
         }
-        None => println!("[kernel] DTB memory: not found, using default"),
+        None => println!("[kernel] Using default RAM end: {:#x}", config::MEMORY_END),
     }
     mm::init();
+    #[cfg(target_arch = "riscv64")]
     mm::remap_test();
     trap::init();
     trap::enable_timer_interrupt();

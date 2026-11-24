@@ -1,5 +1,18 @@
 # 测试状态
 
+## 2026-11-24 PR-15 LoongArch64
+
+QEMU 8.2.2 单核下，LoongArch64 内核从 ELF 直启，通过现代 VirtIO PCI 读取只读 EXT4，加载用户程序后正常关机。专项测试核对了 Linux `clone` 的 TLS 和 child TID 参数顺序，修正前缺少成功标记，修正后通过。缺页入口在遍历三层页表前检查 39 位规范地址。
+
+| 官方 2025 初赛原盘 | basic-musl | basic-glibc |
+| --- | --- | --- |
+| LoongArch64 | 102/102，正常退出 | 102/102，外层脚本退出 139 |
+| RISC-V64 | 102/102，正常退出 | 102/102，外层脚本退出 139 |
+
+LoongArch64 原盘的两组 basic ELF 均声明了全局路径缺失的 glibc 解释器。只有符合既有检查的无依赖、无重定位 PIE 在这种情况下直接启动。三项用例通过新增的 `statx` 获取文件大小和类型等基本属性。盘内 glibc BusyBox 仍在结束标记后发生用户态取指异常，测试组的完整输出已送交判分器。
+
+RISC-V64 的 basic ABI、可写 Overlay、mmap/VMA、fork COW、页缓存、ELF 按需加载、动态 ELF、pthread 和 easy-fs `usertests` 通过。LoongArch64 验证范围为单核 QEMU、低地址连续 RAM 和标量浮点上下文。构建与复跑命令见[构建说明](BUILD.md#构建和运行-loongarch64)。
+
 ## 2026-11-24 PR-14 可写 Overlay
 
 在 QEMU 8.2.2 单核、768 MiB 内存和只读 EXT4 测试盘上运行 `tools/oscomp/test_overlay_fs.sh`。PR-13 在写到 1 MiB 时复现 `EFBIG`。PR-14 顺序写入 100 MiB 并读回文件末页，随后在 2 GiB 以上的偏移写入并读回稀疏文件。测试盘在退出前后的 SHA-256 一致。

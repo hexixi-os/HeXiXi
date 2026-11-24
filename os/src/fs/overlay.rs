@@ -19,7 +19,7 @@ static OVERLAY_PAGES: AtomicUsize = AtomicUsize::new(0);
 static NEXT_INODE: AtomicUsize = AtomicUsize::new(2);
 
 fn data_page_limit() -> usize {
-    let ram_pages = ram_end().saturating_sub(0x8000_0000) / PAGE_SIZE;
+    let ram_pages = ram_end().saturating_sub(crate::arch::RAM_BASE) / PAGE_SIZE;
     MAX_DATA_PAGES.min(ram_pages / 4)
 }
 
@@ -393,7 +393,7 @@ impl FileData {
             let start = pos % PAGE_SIZE;
             let count = (len - copied).min(PAGE_SIZE - start);
             if let Some(page) = self.pages.get(&(pos / PAGE_SIZE)) {
-                let src = usize::from(PhysAddr::from(page.ppn)) as *const u8;
+                let src = PhysAddr::from(page.ppn).kernel_address() as *const u8;
                 core::ptr::copy(src.add(start), dst.add(copied), count);
             } else if pos < self.lower_len {
                 self.read_lower(pos, core::slice::from_raw_parts_mut(dst.add(copied), count));
@@ -415,7 +415,7 @@ impl FileData {
                 Some(page) => page,
                 None => break,
             };
-            let dst = usize::from(PhysAddr::from(page.ppn)) as *mut u8;
+            let dst = PhysAddr::from(page.ppn).kernel_address() as *mut u8;
             core::ptr::copy(src.add(written), dst.add(start), count);
             // The source may be in the shared tail of this file. Copy before zeroing any gap.
             if self.len < pos {

@@ -55,7 +55,7 @@ pub fn block_current_and_run_next() {
     drop(task); // The process and the wait queue hold the task while it is blocked.
     schedule(task_cx_ptr);
 }
-#[cfg(feature = "board_qemu")]
+#[cfg(all(feature = "board_qemu", target_arch = "riscv64"))]
 use crate::board::QEMUExit;
 
 pub fn exit_current_and_run_next(exit_code: i32) {
@@ -105,17 +105,18 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
     // the process should terminate at once
     if group || last_thread || (tid == 0 && legacy_exit) {
         let pid = process.getpid();
-        #[cfg(feature = "board_qemu")]
+        #[cfg(any(feature = "board_qemu", target_arch = "loongarch64"))]
         if pid == IDLE_PID {
             println!(
                 "[kernel] Idle process exit with exit_code {} ...",
                 exit_code
             );
+            #[cfg(target_arch = "loongarch64")]
+            crate::arch::shutdown();
+            #[cfg(target_arch = "riscv64")]
             if exit_code != 0 {
-                //crate::sbi::shutdown(255); //255 == -1 for err hint
                 crate::board::QEMU_EXIT_HANDLE.exit_failure();
             } else {
-                //crate::sbi::shutdown(0); //0 for success hint
                 crate::board::QEMU_EXIT_HANDLE.exit_success();
             }
         }

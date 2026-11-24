@@ -12,6 +12,7 @@ pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
 pub(crate) use frame_allocator::frame_alloc_charged;
 pub use frame_allocator::{frame_alloc, frame_dealloc, free_pages, ram_end, set_ram_end, FrameTracker};
 pub use memory_set::handle_user_page_fault;
+#[cfg(target_arch = "riscv64")]
 pub use memory_set::remap_test;
 pub use memory_set::{kernel_token, MapPermission, MemorySet, KERNEL_SPACE};
 pub use vma::{PageFault, VmaBacking, USER_END};

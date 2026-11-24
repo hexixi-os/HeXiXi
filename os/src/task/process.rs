@@ -207,8 +207,8 @@ impl ProcessControlBlock {
         }
         let trap = inner.get_trap_cx();
         trap.set_sp(sp);
-        trap.x[10] = args.len();
-        trap.x[11] = sp;
+        trap.x[crate::arch::REG_A0] = args.len();
+        trap.x[crate::arch::REG_A0 + 1] = sp;
     }
 
     /// Only support processes with a single thread.
@@ -377,8 +377,8 @@ impl ProcessControlBlock {
             task.kstack.get_top(),
             trap_handler as usize,
         );
-        trap_cx.x[10] = args.len();
-        trap_cx.x[11] = user_sp + core::mem::size_of::<usize>();
+        trap_cx.x[crate::arch::REG_A0] = args.len();
+        trap_cx.x[crate::arch::REG_A0 + 1] = user_sp + core::mem::size_of::<usize>();
         *task_inner.get_trap_cx() = trap_cx;
         Ok(())
     }
@@ -484,9 +484,9 @@ impl ProcessControlBlock {
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.kernel_sp = task.kstack.get_top();
         if stack != 0 {
-            trap_cx.x[2] = stack;
+            trap_cx.x[crate::arch::REG_SP] = stack;
         }
-        trap_cx.x[10] = 0;
+        trap_cx.x[crate::arch::REG_A0] = 0;
         drop(task_inner);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add this thread to scheduler

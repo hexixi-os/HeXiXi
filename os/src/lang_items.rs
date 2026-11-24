@@ -1,6 +1,5 @@
-use crate::sbi::shutdown;
+use crate::arch::shutdown;
 use crate::task::current_kstack_top;
-use core::arch::asm;
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 
@@ -10,7 +9,7 @@ struct RawConsole;
 impl Write for RawConsole {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for b in s.bytes() {
-            crate::sbi::console_putchar(b as usize);
+            crate::arch::console_putchar(b as usize);
         }
         Ok(())
     }
@@ -26,9 +25,12 @@ fn panic(info: &PanicInfo) -> ! {
     if let Some(location) = info.location() {
         let _ = write!(c, " at {}:{}", location.file(), location.line());
     }
+    #[cfg(target_arch = "riscv64")]
     if let Some(message) = info.message() {
         let _ = write!(c, " msg={}", message);
     }
+    #[cfg(target_arch = "loongarch64")]
+    let _ = write!(c, " msg={}", info.message());
     let _ = write!(c, "\n[kernel] last syscalls:");
     for i in 0..8 {
         let v = crate::syscall::LAST_SYSCALLS[i].load(core::sync::atomic::Ordering::Relaxed);
@@ -41,10 +43,10 @@ fn panic(info: &PanicInfo) -> ! {
     shutdown()
 }
 
+#[inline(never)]
 unsafe fn backtrace(c: &mut RawConsole) {
-    let mut fp: usize;
+    let mut fp = crate::arch::frame_pointer();
     let stop = current_kstack_top();
-    asm!("mv {}, s0", out(reg) fp);
     let _ = write!(c, "---START BACKTRACE---\n");
     for i in 0..10 {
         if fp == stop || fp == 0 {

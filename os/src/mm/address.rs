@@ -2,10 +2,11 @@ use super::PageTableEntry;
 use crate::config::{PAGE_SIZE, PAGE_SIZE_BITS};
 use core::fmt::{self, Debug, Formatter};
 
-const PA_WIDTH_SV39: usize = 56;
-const VA_WIDTH_SV39: usize = 39;
-const PPN_WIDTH_SV39: usize = PA_WIDTH_SV39 - PAGE_SIZE_BITS;
-const VPN_WIDTH_SV39: usize = VA_WIDTH_SV39 - PAGE_SIZE_BITS;
+const PA_BITS: usize = crate::arch::PA_BITS;
+// Both backends use three 9-bit levels for the kernel address-space layout.
+const VA_BITS: usize = 39;
+const PPN_BITS: usize = PA_BITS - PAGE_SIZE_BITS;
+const VPN_BITS: usize = VA_BITS - PAGE_SIZE_BITS;
 
 /// Definitions
 #[repr(C)]
@@ -53,22 +54,22 @@ impl Debug for PhysPageNum {
 
 impl From<usize> for PhysAddr {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << PA_WIDTH_SV39) - 1))
+        Self(v & ((1 << PA_BITS) - 1))
     }
 }
 impl From<usize> for PhysPageNum {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << PPN_WIDTH_SV39) - 1))
+        Self(v & ((1 << PPN_BITS) - 1))
     }
 }
 impl From<usize> for VirtAddr {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << VA_WIDTH_SV39) - 1))
+        Self(v & ((1 << VA_BITS) - 1))
     }
 }
 impl From<usize> for VirtPageNum {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << VPN_WIDTH_SV39) - 1))
+        Self(v & ((1 << VPN_BITS) - 1))
     }
 }
 impl From<PhysAddr> for usize {
@@ -83,8 +84,8 @@ impl From<PhysPageNum> for usize {
 }
 impl From<VirtAddr> for usize {
     fn from(v: VirtAddr) -> Self {
-        if v.0 >= (1 << (VA_WIDTH_SV39 - 1)) {
-            v.0 | (!((1 << VA_WIDTH_SV39) - 1))
+        if v.0 >= (1 << (VA_BITS - 1)) {
+            v.0 | (!((1 << VA_BITS) - 1))
         } else {
             v.0
         }
@@ -160,31 +161,26 @@ impl VirtPageNum {
 }
 
 impl PhysAddr {
+    pub fn kernel_address(self) -> usize {
+        crate::arch::phys_to_virt(self.0)
+    }
     pub fn get_ref<T>(&self) -> &'static T {
-        unsafe { (self.0 as *const T).as_ref().unwrap() }
+        assert_ne!(self.0, 0, "null physical address");
+        unsafe { &*(self.kernel_address() as *const T) }
     }
     pub fn get_mut<T>(&self) -> &'static mut T {
-        unsafe {
-            match (self.0 as *mut T).as_mut() {
-                Some(v) => v,
-                None => {
-                    let ra: usize; unsafe { core::arch::asm!("mv {}, ra", out(reg) ra) };
-                    println!("[mm] get_mut bad pa={:#x} sepc={:#x} last_syscall={} ra={:#x}",
-                        self.0, riscv::register::sepc::read(), crate::syscall::LAST_SYSCALL.load(core::sync::atomic::Ordering::Relaxed), ra);
-                    panic!("bad phys addr");
-                }
-            }
-        }
+        assert_ne!(self.0, 0, "null physical address");
+        unsafe { &mut *(self.kernel_address() as *mut T) }
     }
 }
 impl PhysPageNum {
     pub fn get_pte_array(&self) -> &'static mut [PageTableEntry] {
         let pa: PhysAddr = (*self).into();
-        unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut PageTableEntry, 512) }
+        unsafe { core::slice::from_raw_parts_mut(pa.kernel_address() as *mut PageTableEntry, 512) }
     }
     pub fn get_bytes_array(&self) -> &'static mut [u8] {
         let pa: PhysAddr = (*self).into();
-        unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut u8, 4096) }
+        unsafe { core::slice::from_raw_parts_mut(pa.kernel_address() as *mut u8, 4096) }
     }
     pub fn get_mut<T>(&self) -> &'static mut T {
         let pa: PhysAddr = (*self).into();

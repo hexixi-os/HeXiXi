@@ -8,6 +8,7 @@ bitflags! {
         const SIGUSR1   = 1 << 10;
         const SIGUSR2   = 1 << 12;
         const SIGILL    = 1 << 4;
+        const SIGTRAP   = 1 << 5;
         const SIGTERM   = 1 << 15;
         const SIGCHLD   = 1 << 17;
         const SIGABRT   = 1 << 6;
@@ -26,6 +27,8 @@ impl SignalFlags {
             Some((-15, "Killed, SIGTERM=15"))
         } else if self.contains(Self::SIGILL) {
             Some((-4, "Illegal Instruction, SIGILL=4"))
+        } else if self.contains(Self::SIGTRAP) {
+            Some((-5, "Trace or Breakpoint Trap, SIGTRAP=5"))
         } else if self.contains(Self::SIGABRT) {
             Some((-6, "Aborted, SIGABRT=6"))
         } else if self.contains(Self::SIGFPE) {

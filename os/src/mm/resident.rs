@@ -2,7 +2,6 @@ use super::{
     frame_alloc, FrameTracker, MapPermission, PTEFlags, PageFault, PageTable, VirtPageNum,
 };
 use alloc::sync::Arc;
-use core::arch::asm;
 
 pub(super) fn alloc_page() -> Result<Arc<FrameTracker>, PageFault> {
     frame_alloc().map(Arc::new).ok_or(PageFault::Invalid)
@@ -89,9 +88,7 @@ impl ResidentPage {
             Err(fault) => return fault,
         };
         table.remap(vpn, self.frame.ppn, self.flags(permissions));
-        unsafe {
-            asm!("sfence.vma");
-        }
+        crate::arch::flush_tlb();
         drop(retired);
         PageFault::Resolved
     }

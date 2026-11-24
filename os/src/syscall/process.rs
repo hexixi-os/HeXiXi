@@ -221,7 +221,7 @@ pub fn sys_uname(buf: *mut u8) -> isize {
         "rcore",
         "6.0.0-rcore",
         "#1 rCore-Tutorial",
-        "riscv64",
+        crate::arch::NAME,
         "localdomain",
     ];
     for (i, f) in fields.iter().enumerate() {

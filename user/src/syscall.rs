@@ -33,6 +33,7 @@ const SYSCALL_CONDVAR_WAIT: usize = 1032;
 fn syscall4(id: usize, args: [usize; 4]) -> isize {
     let mut ret: isize;
     unsafe {
+        #[cfg(target_arch = "riscv64")]
         asm!(
             "ecall",
             inlateout("x10") args[0] => ret,
@@ -40,6 +41,15 @@ fn syscall4(id: usize, args: [usize; 4]) -> isize {
             in("x12") args[2],
             in("x13") args[3],
             in("x17") id
+        );
+        #[cfg(target_arch = "loongarch64")]
+        asm!(
+            "syscall 0",
+            inlateout("$a0") args[0] => ret,
+            in("$a1") args[1],
+            in("$a2") args[2],
+            in("$a3") args[3],
+            in("$a7") id
         );
     }
     ret

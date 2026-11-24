@@ -1,14 +1,15 @@
 use std::{env, path::PathBuf};
 
-const RUNNER_PATH: &str = "../user/target/riscv64gc-unknown-none-elf/release/oscomp_runner";
-
 fn main() {
     if env::var_os("CARGO_FEATURE_OSCOMP_RUNNER").is_some() {
         let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-        println!("cargo:rerun-if-changed={}", RUNNER_PATH);
+        let target = env::var("TARGET").unwrap();
+        let runner_path = format!("../user/target/{target}/release/oscomp_runner");
+        let runner = manifest.join(runner_path);
+        println!("cargo:rerun-if-changed={}", runner.display());
         println!(
             "cargo:rustc-env=OSCOMP_RUNNER_ELF={}",
-            manifest.join(RUNNER_PATH).display()
+            runner.display()
         );
     }
 }

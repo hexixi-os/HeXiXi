@@ -15,26 +15,33 @@ impl BootInfo {
         (end != 0).then(|| core::str::from_utf8(&self.oscomp_group[..end]).unwrap())
     }
 
+    pub fn set_oscomp_group(&mut self, group: &[u8]) {
+        let group = if group.is_empty() || group.len() >= self.oscomp_group.len() || !group.is_ascii() {
+            b"<invalid>"
+        } else {
+            group
+        };
+        self.oscomp_group[..group.len()].copy_from_slice(group);
+    }
+
+    #[cfg(target_arch = "riscv64")]
     fn read_bootargs(&mut self, args: &[u8]) {
         let args = args.split(|&byte| byte == 0).next().unwrap_or_default();
         for arg in args.split(|byte| byte.is_ascii_whitespace()) {
             if let Some(group) = arg.strip_prefix(b"oscomp.group=") {
-                let group = if group.is_empty() || group.len() >= self.oscomp_group.len() || !group.is_ascii() {
-                    b"<invalid>"
-                } else {
-                    group
-                };
-                self.oscomp_group[..group.len()].copy_from_slice(group);
+                self.set_oscomp_group(group);
                 break;
             }
         }
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 fn read_be32(addr: usize) -> u32 {
     unsafe { u32::from_be(core::ptr::read_volatile(addr as *const u32)) }
 }
 
+#[cfg(target_arch = "riscv64")]
 fn read_be64(addr: usize) -> u64 {
     let hi = read_be32(addr) as u64;
     let lo = read_be32(addr + 4) as u64;
@@ -42,6 +49,7 @@ fn read_be64(addr: usize) -> u64 {
 }
 
 /// 解析 FDT 中的 RAM 结束地址和评测启动参数。
+#[cfg(target_arch = "riscv64")]
 pub fn detect_boot_info() -> BootInfo {
     extern "C" {
         static BOOT_DTB: usize;

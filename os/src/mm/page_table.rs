@@ -30,17 +30,20 @@ pub struct PageTableEntry {
 impl PageTableEntry {
     pub fn new(ppn: PhysPageNum, flags: PTEFlags) -> Self {
         PageTableEntry {
-            bits: ppn.0 << 10 | flags.bits as usize,
+            bits: crate::arch::pte(ppn.0, flags.bits()),
         }
+    }
+    fn directory(ppn: PhysPageNum) -> Self {
+        Self { bits: crate::arch::directory_entry(ppn.0) }
     }
     pub fn empty() -> Self {
         PageTableEntry { bits: 0 }
     }
     pub fn ppn(&self) -> PhysPageNum {
-        (self.bits >> 10 & ((1usize << 44) - 1)).into()
+        crate::arch::pte_ppn(self.bits).into()
     }
     pub fn flags(&self) -> PTEFlags {
-        PTEFlags::from_bits(self.bits as u8).unwrap()
+        PTEFlags::from_bits(crate::arch::pte_flags(self.bits)).unwrap()
     }
     pub fn is_valid(&self) -> bool {
         (self.flags() & PTEFlags::V) != PTEFlags::empty()
@@ -73,7 +76,7 @@ impl PageTable {
     /// Temporarily used to get arguments from user space.
     pub fn from_token(satp: usize) -> Self {
         Self {
-            root_ppn: PhysPageNum::from(satp & ((1usize << 44) - 1)),
+            root_ppn: PhysPageNum::from(crate::arch::token_to_root(satp)),
             frames: Vec::new(),
         }
     }
@@ -100,7 +103,7 @@ impl PageTable {
                 };
                 created[created_count] = (ppn, *idx);
                 created_count += 1;
-                *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+                *pte = PageTableEntry::directory(frame.ppn);
                 self.frames.push(frame);
             }
             ppn = pte.ppn();
@@ -181,7 +184,7 @@ impl PageTable {
         })
     }
     pub fn token(&self) -> usize {
-        8usize << 60 | self.root_ppn.0
+        crate::arch::root_to_token(self.root_ppn.0)
     }
 }
 
@@ -201,7 +204,7 @@ fn phys_addr_sane(pa: usize) -> bool {
     extern "C" {
         fn ekernel();
     }
-    let start = ekernel as usize;
+    let start = PhysAddr::from(ekernel as usize).0;
     let end = crate::mm::ram_end();
     pa >= start && pa < end
 }
@@ -221,7 +224,7 @@ fn report_bad_translation(token: usize, va: usize, pa: usize) {
             .unwrap_or(0),
         va,
         pa,
-        token & ((1usize << 44) - 1),
+        crate::arch::token_to_root(token),
         token,
         crate::syscall::LAST_SYSCALL.load(core::sync::atomic::Ordering::Relaxed)
     );
@@ -281,7 +284,7 @@ pub fn translated_byte_buffer(
         let count = (end - start).min(PAGE_SIZE - first);
         pin_user_page(token, va.floor());
         buffers.push(UserSlice {
-            ptr: (pa + first) as *mut u8,
+            ptr: crate::arch::phys_to_virt(pa + first) as *mut u8,
             len: count,
         });
         start += count;

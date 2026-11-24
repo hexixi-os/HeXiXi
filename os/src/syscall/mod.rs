@@ -49,6 +49,7 @@ const SYSCALL_TKILL: usize = 130;
 const SYSCALL_TGKILL: usize = 131;
 const SYSCALL_RT_TGSIGQUEUEINFO: usize = 240;
 const SYSCALL_NEWFSTATAT: usize = 79;
+const SYSCALL_STATX: usize = 291;
 const SYSCALL_FSYNC: usize = 81;
 const SYSCALL_FDATASYNC: usize = 82;
 const SYSCALL_SIGACTION: usize = 134;
@@ -172,7 +173,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_IOCTL => sys_ioctl(),
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_FUTEX => futex::sys_futex(args),
-        SYSCALL_CLONE => sys_clone_thread(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_CLONE => {
+            let (tls, child_tid) = if crate::arch::CLONE_CHILD_TID_FIRST {
+                (args[4], args[3])
+            } else {
+                (args[3], args[4])
+            };
+            sys_clone_thread(args[0], args[1], args[2], tls, child_tid)
+        }
         SYSCALL_READV => sys_readv(args[0], args[1] as *const u8, args[2]),
         SYSCALL_PSELECT6 => sys_pselect6(
             args[0],
@@ -215,6 +223,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[1] as *const u8,
             args[2] as *mut u8,
             args[3],
+        ),
+        SYSCALL_STATX => sys_statx(
+            args[0] as isize, args[1] as *const u8, args[2], args[3] as u32, args[4] as *mut u8,
         ),
         SYSCALL_FSYNC | SYSCALL_FDATASYNC => 0,
         SYSCALL_SIGACTION => signal::sys_rt_sigaction(args[0], args[1], args[2], args[3]),

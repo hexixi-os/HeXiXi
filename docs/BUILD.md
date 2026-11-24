@@ -111,6 +111,32 @@ qemu-system-riscv64 -machine virt -m 256M -nographic -bios default \
 bash tools/oscomp/test_overlay_fs.sh /tmp/hexixi-overlay-fs.log
 ```
 
+## 构建和运行 LoongArch64
+
+LoongArch64 使用 Rust 1.98.1 的裸机 soft-float 目标，产物为 ELF 格式的 `kernel-la`。RISC-V 的默认入口仍是 `make all`。
+
+```bash
+rustup toolchain install 1.98.1 --profile minimal
+rustup target add --toolchain 1.98.1 loongarch64-unknown-none-softfloat
+make kernel-la
+```
+
+在装有 QEMU 8.2.2、`mkfs.ext4` 和 GNU `timeout` 的环境中运行启动回归。脚本在 QEMU `virt` 单核上挂载只读 VirtIO PCI 盘，执行用户态 ELF，并核对 `clone` 的 TLS 与 child TID。
+
+```bash
+bash tools/oscomp/test_loongarch_boot.sh /tmp/hexixi-loongarch.log
+```
+
+使用 [2025 初赛原盘](https://github.com/oscomp/testsuits-for-oskernel/releases/tag/pre-20250615) 复跑 basic。解压 `sdcard-la.img.xz` 后传入原盘路径，`--suite` 指向包含官方 basic 判分器的源码检出。
+
+```bash
+python3 tools/oscomp/run_official_matrix.py --arch loongarch64 \
+    /path/to/sdcard-la.img /tmp/hexixi-loongarch-basic basic \
+    --suite /path/to/testsuits --kernel kernel-la
+```
+
+LoongArch64 的 `virt` 测试使用 QEMU 直启 ELF，通过 `fw_cfg` 传入单个测试组。虚拟机配置 1 GiB，内核分配器使用低地址连续 RAM。硬件范围为单核 QEMU `virt`，用户上下文保存整数和标量浮点寄存器。成绩和已知限制见[测试状态](TEST_STATUS.md)。
+
 ## 常见问题
 
 | 现象 | 原因 | 处理 |

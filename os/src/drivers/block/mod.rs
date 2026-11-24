@@ -1,10 +1,16 @@
+#[cfg(target_arch = "riscv64")]
 mod virtio_blk;
+#[cfg(target_arch = "loongarch64")]
+mod virtio_pci;
 
-#[cfg(feature = "board_k210")]
+#[cfg(all(target_arch = "riscv64", feature = "board_k210"))]
 mod sdcard;
-#[cfg(feature = "board_k210")]
+#[cfg(all(target_arch = "riscv64", feature = "board_k210"))]
 pub use sdcard::SDCardWrapper;
+#[cfg(target_arch = "riscv64")]
 pub use virtio_blk::VirtIOBlock;
+#[cfg(target_arch = "loongarch64")]
+pub use virtio_pci::VirtIOBlock;
 
 use crate::board::BlockDeviceImpl;
 use alloc::sync::Arc;

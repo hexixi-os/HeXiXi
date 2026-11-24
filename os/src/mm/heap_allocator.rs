@@ -25,7 +25,7 @@ pub fn init_heap() {
     extern "C" {
         fn ekernel();
     }
-    let start = (ekernel as usize + 0xFFF) & !0xFFF;
+    let start = (super::PhysAddr::from(ekernel as usize).0 + 0xFFF) & !0xFFF;
     let ram_end = crate::mm::frame_allocator::ram_end();
     let avail = ram_end.saturating_sub(start);
     // 用一半 RAM、上限 512MB：
@@ -34,8 +34,9 @@ pub fn init_heap() {
     let size = ((avail / 2).clamp(0x400_0000, 0x2000_0000)) & !0xFFF;
     // 清零：物理内存可能残留旧数据，避免未初始化读
     unsafe {
-        core::ptr::write_bytes(start as *mut u8, 0, size);
-        HEAP_ALLOCATOR.lock().init(start, size);
+        let address = crate::arch::phys_to_virt(start);
+        core::ptr::write_bytes(address as *mut u8, 0, size);
+        HEAP_ALLOCATOR.lock().init(address, size);
     }
     HEAP_START.store(start, Ordering::Relaxed);
     HEAP_END.store(start + size, Ordering::Relaxed);

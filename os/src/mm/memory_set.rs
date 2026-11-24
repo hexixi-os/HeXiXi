@@ -5,16 +5,18 @@ use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use super::vma::{PageFault, VmaBacking, VmaSpace, USER_END};
-use crate::config::{MMIO, PAGE_SIZE, TRAMPOLINE, USER_STACK_SIZE};
+#[cfg(target_arch = "riscv64")]
+use crate::config::MMIO;
+use crate::config::{PAGE_SIZE, TRAMPOLINE, USER_STACK_SIZE};
 use crate::fs::{open_executable, resolve_path, Executable};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::{arch::asm, ops::Range};
+use core::ops::Range;
 use lazy_static::*;
-use riscv::register::satp;
 
+#[cfg(target_arch = "riscv64")]
 extern "C" {
     fn stext();
     fn etext();
@@ -142,7 +144,7 @@ impl MemorySet {
         }
         let mut tables = Vec::new();
         let retired = self.vmas.unmap(&mut self.page_table, range, &mut tables);
-        unsafe { asm!("sfence.vma"); }
+        crate::arch::flush_tlb();
         drop((retired, tables));
         Ok(())
     }
@@ -153,7 +155,7 @@ impl MemorySet {
             &mut self.page_table, identity, first_invalid, &mut tables,
         );
         if !retired.is_empty() {
-            unsafe { asm!("sfence.vma"); }
+            crate::arch::flush_tlb();
         }
         drop((retired, tables));
     }
@@ -187,7 +189,7 @@ impl MemorySet {
                 self.page_table.set_flags(vpn, page.resident.flags(permissions));
             }
         }
-        unsafe { asm!("sfence.vma"); }
+        crate::arch::flush_tlb();
         Ok(())
     }
 
@@ -227,6 +229,12 @@ impl MemorySet {
         assert!(self.try_map_trampoline(), "out of page-table frames for the trampoline");
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    fn try_map_trampoline(&mut self) -> bool {
+        true
+    }
+
+    #[cfg(target_arch = "riscv64")]
     fn try_map_trampoline(&mut self) -> bool {
         self.page_table.try_map(
             VirtAddr::from(TRAMPOLINE).into(),
@@ -234,7 +242,14 @@ impl MemorySet {
             PTEFlags::R | PTEFlags::X,
         )
     }
+    #[cfg(target_arch = "loongarch64")]
+    pub fn new_kernel() -> Self {
+        // The boot DMW maps kernel RAM. PGDH is used for framed kernel stacks.
+        Self::new_bare()
+    }
+
     /// Without kernel stacks.
+    #[cfg(target_arch = "riscv64")]
     pub fn new_kernel() -> Self {
         let mut memory_set = Self::new_bare();
         // map trampoline
@@ -417,15 +432,11 @@ impl MemorySet {
             }
         }
         self.vmas.write_protect_private(&mut self.page_table);
-        unsafe { asm!("sfence.vma"); }
+        crate::arch::flush_tlb();
         Ok(child)
     }
     pub fn activate(&self) {
-        let satp = self.page_table.token();
-        unsafe {
-            satp::write(satp);
-            asm!("sfence.vma");
-        }
+        crate::arch::activate_kernel_table(self.page_table.token());
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
@@ -495,7 +506,7 @@ impl MapArea {
         for &vpn in self.data_frames.keys() {
             page_table.unmap_and_reclaim(vpn, &mut tables);
         }
-        unsafe { asm!("sfence.vma"); }
+        crate::arch::flush_tlb();
         drop((self, tables));
     }
 
@@ -555,7 +566,7 @@ pub fn handle_user_page_fault(stval: usize, access: MapPermission) -> PageFault 
     inner.memory_set.handle_page_fault(vpn, access)
 }
 
-#[allow(unused)]
+#[cfg(target_arch = "riscv64")]
 pub fn remap_test() {
     let mut kernel_space = KERNEL_SPACE.exclusive_access();
     let mid_text: VirtAddr = ((stext as usize + etext as usize) / 2).into();

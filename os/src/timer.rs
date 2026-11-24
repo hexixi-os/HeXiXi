@@ -1,38 +1,36 @@
 use core::cmp::Ordering;
 
-use crate::config::CLOCK_FREQ;
-use crate::sbi::set_timer;
+use crate::arch::{read_ticks, set_timer, timer_frequency};
 use crate::sync::UPSafeCell;
 use crate::task::{add_task, TaskControlBlock};
 use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
 use lazy_static::*;
-use riscv::register::time;
 
 const TICKS_PER_SEC: usize = 100;
 const MSEC_PER_SEC: usize = 1000;
 
 pub fn get_time() -> usize {
-    time::read()
+    read_ticks()
 }
 
 pub fn get_time_ms() -> usize {
-    time::read() / (CLOCK_FREQ / MSEC_PER_SEC)
+    read_ticks() / (timer_frequency() / MSEC_PER_SEC)
 }
 
 /// 微秒级时间。基准测试（lmbench/unixbench）需要 us 级分辨率，
 /// 原来只给 ms，自适应迭代次数会涨到 1<<27 而卡住。
 pub fn get_time_us() -> usize {
-    time::read() * 1_000_000 / CLOCK_FREQ
+    read_ticks() * 1_000_000 / timer_frequency()
 }
 
 /// 纳秒级时间（12.5MHz 时基 → 80ns 精度）
 pub fn get_time_ns() -> usize {
-    time::read() * (1_000_000_000 / CLOCK_FREQ)
+    read_ticks() * (1_000_000_000 / timer_frequency())
 }
 
 pub fn set_next_trigger() {
-    set_timer(get_time() + CLOCK_FREQ / TICKS_PER_SEC);
+    set_timer(get_time() + timer_frequency() / TICKS_PER_SEC);
 }
 
 pub struct TimerCondVar {

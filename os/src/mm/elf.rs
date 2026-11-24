@@ -51,7 +51,7 @@ impl ElfImage {
         if source.read_at(0, &mut header) != header.len()
             || header[..7] != *b"\x7fELF\x02\x01\x01"
             || !matches!(u16_at(&header, 16), 2 | 3) // ET_EXEC or ET_DYN
-            || u16_at(&header, 18) != 243 // EM_RISCV
+            || u16_at(&header, 18) != crate::arch::ELF_MACHINE
             || u32_at(&header, 20) != 1
             || u16_at(&header, 52) as usize != ELF_HEADER_SIZE
             || u16_at(&header, 54) as usize != PROGRAM_HEADER_SIZE
@@ -235,7 +235,7 @@ impl ElfImage {
             .or_else(|| path.strip_prefix("glibc/basic/"));
         if !self.position_independent
             || !case.map_or(false, |name| !name.is_empty() && !name.contains('/'))
-            || headers.interpreter.as_deref() != Some("/lib/ld-linux-riscv64-lp64d.so.1")
+            || headers.interpreter.as_deref() != Some(crate::arch::OFFICIAL_BASIC_INTERPRETER)
         {
             return false;
         }
@@ -267,8 +267,8 @@ impl ElfImage {
         for entry in table.chunks_exact(16) {
             match word_at(entry, 0) {
                 0 => return true, // DT_NULL
-                // String/symbol table metadata, flags, DT_DEBUG and DT_GNU_HASH.
-                5 | 6 | 10 | 11 | 21 | 30 | 0x6ffffef5 | 0x6ffffffb => {}
+                // String/symbol and hash tables, flags and DT_DEBUG.
+                4 | 5 | 6 | 10 | 11 | 21 | 30 | 0x6ffffef5 | 0x6ffffffb => {}
                 7 | 8 if word_at(entry, 8) == 0 => {} // DT_RELA, DT_RELASZ
                 9 => {}                               // DT_RELAENT
                 _ => return false,

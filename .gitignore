@@ -16,3 +16,4 @@ tools/kflash.py
 pushall.sh
 .vscode/*.log
 kernel-rv
+kernel-la

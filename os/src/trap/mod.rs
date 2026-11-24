@@ -1,46 +1,22 @@
 mod context;
 
-use crate::config::TRAMPOLINE;
+use crate::arch::{self, TrapCause, REG_A0, REG_FP, REG_SP, REG_SYSCALL};
 use crate::syscall::syscall;
 use crate::task::{
     check_signals_of_current, current_add_signal, current_trap_cx, current_trap_cx_user_va,
     current_user_token, SignalFlags,
 };
 use crate::timer::{check_timer, set_next_trigger};
-use core::arch::{asm, global_asm};
-use riscv::register::{
-    mtvec::TrapMode,
-    scause::{self, Exception, Interrupt, Trap},
-    sie, stval, stvec,
-};
-
-global_asm!(include_str!("trap.S"));
 
 pub fn init() {
-    set_kernel_trap_entry();
+    arch::install_kernel_trap();
 }
 
-fn set_kernel_trap_entry() {
-    unsafe {
-        stvec::write(trap_from_kernel as usize, TrapMode::Direct);
-    }
-}
-
-fn set_user_trap_entry() {
-    unsafe {
-        stvec::write(TRAMPOLINE as usize, TrapMode::Direct);
-    }
-}
-
-pub fn enable_timer_interrupt() {
-    unsafe {
-        sie::set_stimer();
-    }
-}
+pub use arch::enable_timer_interrupt;
 
 /// 用户态非法访问诊断。是否杀进程由调用方决定：
 /// 用户注册了 SIGSEGV handler 时应该投递 handler（lat_sig 的 prot 用例就靠这个）。
-fn report_user_fault(cause: Trap, stval: usize) {
+fn report_user_fault(cause: TrapCause, stval: usize) {
     let cx = current_trap_cx();
     println!(
         "[fault] pid={} {:?} sepc={:#x} stval={:#x} sp={:#x} ra={:#x} s0={:#x}",
@@ -48,13 +24,13 @@ fn report_user_fault(cause: Trap, stval: usize) {
         cause,
         cx.sepc,
         stval,
-        cx.x[2],
+        cx.x[REG_SP],
         cx.x[1],
-        cx.x[8]
+        cx.x[REG_FP]
     );
 }
 
-fn handle_user_fault(cause: Trap, stval: usize, signal: SignalFlags) {
+fn handle_user_fault(cause: TrapCause, stval: usize, signal: SignalFlags) {
     report_user_fault(cause, stval);
     let signo = signal.bits().trailing_zeros() as usize;
     if crate::task::current_has_handler(signo) {
@@ -67,22 +43,19 @@ fn handle_user_fault(cause: Trap, stval: usize, signal: SignalFlags) {
 
 #[no_mangle]
 pub fn trap_handler() -> ! {
-    set_kernel_trap_entry();
+    arch::install_kernel_trap();
     // 在别人的内核栈上析构已退出线程（不能在自己的栈上析构）
     crate::task::drain_recycled_tasks();
-    let scause = scause::read();
-    let stval = stval::read();
-    match scause.cause() {
-        Trap::Exception(Exception::UserEnvCall) => {
+    let (cause, address, _) = arch::trap_info();
+    match cause {
+        TrapCause::Syscall => {
             // jump to next instruction anyway
             let mut cx = current_trap_cx();
             cx.sepc += 4;
             // get system call return value
-            let id = cx.x[17];
-            let result = syscall(
-                id,
-                [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
-            );
+            let id = cx.x[REG_SYSCALL];
+            let args = cx.x[REG_A0..REG_A0 + 6].try_into().unwrap();
+            let result = syscall(id, args);
             {
                 let task = crate::task::current_task().unwrap();
                 let mut inner = task.inner_exclusive_access();
@@ -93,36 +66,38 @@ pub fn trap_handler() -> ! {
             cx = current_trap_cx();
             if id != 139 || result < 0 {
                 // 139 = rt_sigreturn，已恢复完整上下文，不能覆盖 a0
-                cx.x[10] = result as usize;
+                cx.x[REG_A0] = result as usize;
             }
         }
-        Trap::Exception(Exception::StorePageFault)
-        | Trap::Exception(Exception::LoadPageFault)
-        | Trap::Exception(Exception::InstructionPageFault) => {
+        TrapCause::StorePageFault | TrapCause::LoadPageFault | TrapCause::InstructionPageFault => {
             use crate::mm::{MapPermission, PageFault};
-            let access = match scause.cause() {
-                Trap::Exception(Exception::StorePageFault) => MapPermission::W,
-                Trap::Exception(Exception::InstructionPageFault) => MapPermission::X,
+            let access = match cause {
+                TrapCause::StorePageFault => MapPermission::W,
+                TrapCause::InstructionPageFault => MapPermission::X,
                 _ => MapPermission::R,
             };
-            match crate::mm::handle_user_page_fault(stval, access) {
+            match crate::mm::handle_user_page_fault(address, access) {
                 PageFault::Resolved => {
-                    unsafe { asm!("sfence.vma"); }
+                    arch::flush_tlb();
                     trap_return();
                 }
-                PageFault::FileUnavailable => handle_user_fault(scause.cause(), stval, SignalFlags::SIGBUS),
-                PageFault::Invalid => handle_user_fault(scause.cause(), stval, SignalFlags::SIGSEGV),
+                PageFault::FileUnavailable => {
+                    handle_user_fault(cause, address, SignalFlags::SIGBUS)
+                }
+                PageFault::Invalid => handle_user_fault(cause, address, SignalFlags::SIGSEGV),
             }
         }
-        Trap::Exception(Exception::StoreFault)
-        | Trap::Exception(Exception::InstructionFault)
-        | Trap::Exception(Exception::LoadFault) => {
-            handle_user_fault(scause.cause(), stval, SignalFlags::SIGSEGV);
+        TrapCause::AccessFault => {
+            handle_user_fault(cause, address, SignalFlags::SIGSEGV);
         }
-        Trap::Exception(Exception::IllegalInstruction) => {
+        TrapCause::IllegalInstruction => {
             current_add_signal(SignalFlags::SIGILL);
         }
-        Trap::Interrupt(Interrupt::SupervisorTimer) => {
+        #[cfg(target_arch = "loongarch64")]
+        TrapCause::Breakpoint => handle_user_fault(cause, address, SignalFlags::SIGTRAP),
+        #[cfg(target_arch = "loongarch64")]
+        TrapCause::FloatingPoint => handle_user_fault(cause, address, SignalFlags::SIGFPE),
+        TrapCause::Timer => {
             set_next_trigger();
             crate::syscall::signal::check_alarm();
             check_timer();
@@ -131,12 +106,8 @@ pub fn trap_handler() -> ! {
             // select(0) 轮询、hackbench 压测）会把其它进程饿死。
             crate::task::suspend_current_and_run_next();
         }
-        _ => {
-            panic!(
-                "Unsupported trap {:?}, stval = {:#x}!",
-                scause.cause(),
-                stval
-            );
+        TrapCause::Unknown(raw) => {
+            panic!("Unsupported trap {:#x}, stval = {:#x}!", raw, address);
         }
     }
     crate::syscall::signal::deliver_signal();
@@ -150,45 +121,30 @@ pub fn trap_handler() -> ! {
 
 #[no_mangle]
 pub fn trap_return() -> ! {
-    set_user_trap_entry();
     let trap_cx_user_va = current_trap_cx_user_va();
-    let user_satp = current_user_token();
+    let user_token = current_user_token();
     let task = crate::task::current_task().unwrap();
     let child_tid = task.inner_exclusive_access().set_child_tid.take();
     if let Some(address) = child_tid {
-        if let Some(word) = crate::mm::try_translated_refmut(user_satp, address as *mut i32) {
+        if let Some(word) = crate::mm::try_translated_refmut(user_token, address as *mut i32) {
             *word = task.linux_tid() as i32;
         }
     }
     drop(task);
-    extern "C" {
-        fn __alltraps();
-        fn __restore();
-    }
-    let restore_va = __restore as usize - __alltraps as usize + TRAMPOLINE;
-    unsafe {
-        asm!(
-            "fence.i",
-            "jr {restore_va}",
-            restore_va = in(reg) restore_va,
-            in("a0") trap_cx_user_va,
-            in("a1") user_satp,
-            options(noreturn)
-        );
-    }
+    unsafe { arch::return_to_user(current_trap_cx(), trap_cx_user_va, user_token) }
 }
 
 #[no_mangle]
 pub fn trap_from_kernel() -> ! {
     use core::fmt::Write;
-    use riscv::register::sepc;
+    let (cause, address, pc) = arch::trap_info();
 
     /// 裸串口 writer：panic 时堆可能已损坏，不能用 println!
     struct RawConsole;
     impl Write for RawConsole {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
             for b in s.bytes() {
-                crate::sbi::console_putchar(b as usize);
+                crate::arch::console_putchar(b as usize);
             }
             Ok(())
         }
@@ -201,9 +157,9 @@ pub fn trap_from_kernel() -> ! {
     let _ = write!(
         c,
         "\n[kfault] scause={:?} stval={:#x} sepc={:#x} pid={} last_sys={}\n",
-        scause::read().cause(),
-        stval::read(),
-        sepc::read(),
+        cause,
+        address,
+        pc,
         pid,
         crate::syscall::LAST_SYSCALL.load(core::sync::atomic::Ordering::Relaxed)
     );
@@ -213,7 +169,7 @@ pub fn trap_from_kernel() -> ! {
         let _ = write!(c, " {}", v);
     }
     let _ = write!(c, "\n");
-    panic!("a trap {:?} from kernel!", scause::read().cause());
+    panic!("a trap {:?} from kernel!", cause);
 }
 
 pub use context::TrapContext;

@@ -38,7 +38,7 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         new_task.kstack.get_top(),
         trap_handler as usize,
     );
-    (*new_task_trap_cx).x[10] = arg;
+    (*new_task_trap_cx).x[crate::arch::REG_A0] = arg;
     new_task_tid as isize
 }
 pub fn sys_gettid() -> isize {
@@ -166,11 +166,11 @@ pub fn sys_clone_thread(flags: usize, stack: usize, ptid: usize, tls: usize, cti
     // 关键：内核栈必须是新线程自己的，否则切换过去会踩父线程的栈
     new_cx.kernel_sp = new_task.kstack.get_top();
     // 子线程从 ecall 之后继续，返回 0；栈/线程指针由调用者给出
-    new_cx.x[2] = stack;
+    new_cx.x[crate::arch::REG_SP] = stack;
     if flags & CLONE_SETTLS != 0 {
-        new_cx.x[4] = tls;
+        new_cx.x[crate::arch::REG_TP] = tls;
     }
-    new_cx.x[10] = 0;
+    new_cx.x[crate::arch::REG_A0] = 0;
     drop(new_task_inner);
     add_task(new_task);
     linux_tid as isize
