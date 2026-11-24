@@ -295,6 +295,8 @@ impl MemorySet {
                     dst_ppn
                         .get_bytes_array()
                         .copy_from_slice(src_ppn.get_bytes_array());
+                    #[cfg(feature = "elf_startup_stats")]
+                    crate::fork_stats::on_frame_copy();
                 }
             }
             memory_set.areas.push(new_area);

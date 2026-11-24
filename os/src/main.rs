@@ -22,6 +22,8 @@ mod drivers;
 #[cfg(feature = "elf_startup_stats")]
 mod exec_stats;
 mod fdt;
+#[cfg(feature = "elf_startup_stats")]
+mod fork_stats;
 mod fs;
 mod lang_items;
 mod mm;

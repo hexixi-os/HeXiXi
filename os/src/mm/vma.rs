@@ -160,6 +160,8 @@ impl ResidentPage {
             .ppn
             .get_bytes_array()
             .copy_from_slice(self.frame.ppn.get_bytes_array());
+        #[cfg(feature = "elf_startup_stats")]
+        crate::fork_stats::on_frame_copy();
         Ok(Self {
             frame,
             copy_on_write: false,

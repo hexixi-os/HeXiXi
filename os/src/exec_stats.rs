@@ -62,12 +62,11 @@ pub(crate) fn measure(path: *const u8, load: impl FnOnce() -> isize) -> isize {
 }
 
 pub(crate) fn complete() {
-    let sample = current_process()
-        .inner_exclusive_access()
-        .pending_exec
-        .take();
+    let process = current_process();
+    let sample = process.inner_exclusive_access().pending_exec.take();
     if let Some(sample) = sample {
         let first_call = Counters::now().since(&sample.start);
+        crate::fork_stats::complete(process.getpid(), &sample.path);
         println!(
             "[elf-startup] path={} prepare_frames={} prepare_sectors={} prepare_us={} first_call_frames={} first_call_sectors={} first_call_us={}",
             sample.path, sample.prepared.frames, sample.prepared.sectors, sample.prepared.us,

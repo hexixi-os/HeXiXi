@@ -321,6 +321,8 @@ impl ProcessControlBlock {
 
     /// Only support processes with a single thread.
     pub fn fork(self: &Arc<Self>, stack: usize) -> Arc<Self> {
+        #[cfg(feature = "elf_startup_stats")]
+        crate::fork_stats::begin();
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
@@ -407,6 +409,8 @@ impl ProcessControlBlock {
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add this thread to scheduler
         add_task(task);
+        #[cfg(feature = "elf_startup_stats")]
+        crate::fork_stats::prepared(child.getpid());
         child
     }
 

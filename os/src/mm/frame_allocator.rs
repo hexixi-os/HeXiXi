@@ -127,13 +127,18 @@ pub fn frame_alloc() -> Option<FrameTracker> {
     }
     ppn.map(|ppn| {
         #[cfg(feature = "elf_startup_stats")]
-        crate::exec_stats::on_frame_alloc();
+        {
+            crate::exec_stats::on_frame_alloc();
+            crate::fork_stats::on_frame_alloc();
+        }
         FrameTracker::new(ppn)
     })
 }
 
 pub fn frame_dealloc(ppn: PhysPageNum) {
     FRAME_ALLOCATOR.exclusive_access().dealloc(ppn);
+    #[cfg(feature = "elf_startup_stats")]
+    crate::fork_stats::on_frame_free();
 }
 
 #[allow(unused)]
