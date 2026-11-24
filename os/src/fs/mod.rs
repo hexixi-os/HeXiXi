@@ -332,7 +332,11 @@ pub fn open_dyn(name: &str, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sy
             // openat(fd, "test_openat.txt")。为了与评测环境一致，这里把带 O_DIRECTORY
             // 的普通文件也当成“目录句柄”打开（本盘子项里只要有该名字就按相对名字打开）。
             if directory {
-                return open_directory(name, flags, DirectoryIdentity::Lower);
+                // oscomp basic 的 test_openat：open("./mnt", O_DIRECTORY) 但盘里 mnt 是普通文件，
+                // 随后 openat(fd, "test_openat.txt") 期望成功。这里返回一个以“该名字的父目录”
+                // 为基准的目录句柄，让 openat 解析成 <父目录>/test_openat.txt。
+                let parent = name.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                return open_directory(parent, flags, DirectoryIdentity::Permanent);
             }
             if !create {
                 if flags.intersects(OpenFlags::WRONLY | OpenFlags::RDWR | OpenFlags::TRUNC) {

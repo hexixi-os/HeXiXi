@@ -397,9 +397,20 @@ impl ProcessControlBlock {
         let mut child_inner = child.inner_exclusive_access();
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
-        // modify kstack_top in trap_cx of this thread
+        // 复制父进程的完整用户上下文（所有通用寄存器 + sstatus + sepc）。
+        // 为什么：子进程的 trap_cx 是新建的，如果不复制，除 x[2]/x[10] 外的寄存器是垃圾值；
+        // musl 的 __clone 在 clone() 返回后会立刻 `sd a0, -24(s0)`，s0 若为 0 就写
+        // 0xffffffffffffffe8 触发 StorePageFault（oscomp basic 的 test_clone 就崩在这）。
+        // 父进程此刻正在用的 trap_cx：就是 current_task() 的 trap_cx_ppn 指向的物理页
+        // （在父进程自己的 satp 下有映射；task.trap_cx_ppn 是 fork 前就在用的那个页）。
+        let parent_cx = {
+            let parent_task = crate::task::current_task().expect("no current task");
+            let ppn = parent_task.inner_exclusive_access().trap_cx_ppn;
+            *ppn.get_mut::<crate::trap::TrapContext>()
+        };
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
+        *trap_cx = parent_cx;
         trap_cx.kernel_sp = task.kstack.get_top();
         if stack != 0 {
             trap_cx.x[2] = stack;
