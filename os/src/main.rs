@@ -19,6 +19,8 @@ mod board;
 mod console;
 mod config;
 mod drivers;
+#[cfg(feature = "elf_startup_stats")]
+mod exec_stats;
 mod fdt;
 mod fs;
 mod lang_items;

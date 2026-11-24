@@ -148,6 +148,8 @@ pub static LAST_SYSCALL_IDX: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
+    #[cfg(feature = "elf_startup_stats")]
+    crate::exec_stats::complete();
     // 已被 SIGKILL/SIGTERM 的进程不再服务任何系统调用（超时杀进程必死）
     crate::task::check_kill_current();
     LAST_SYSCALL.store(syscall_id, core::sync::atomic::Ordering::Relaxed);
@@ -262,7 +264,14 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETPID => sys_getpid(),
         SYSCALL_GETPPID => sys_getppid(),
         SYSCALL_FORK => sys_fork(),
-        SYSCALL_EXEC => sys_exec(args[0] as *const u8, args[1] as *const usize),
+        SYSCALL_EXEC => {
+            let path = args[0] as *const u8;
+            let load = || sys_exec(path, args[1] as *const usize);
+            #[cfg(feature = "elf_startup_stats")]
+            return crate::exec_stats::measure(path, load);
+            #[cfg(not(feature = "elf_startup_stats"))]
+            load()
+        }
         SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),
         SYSCALL_GETTID => sys_gettid(),

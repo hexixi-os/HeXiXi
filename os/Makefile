@@ -73,6 +73,9 @@ fs-img: $(APPS)
 $(APPS):
 
 FEATURES := board_$(BOARD)
+ifeq ($(ELF_STARTUP_STATS),1)
+FEATURES += elf_startup_stats
+endif
 ifeq ($(BOARD):$(OSCOMP),qemu:1)
 FEATURES += oscomp_runner
 kernel: oscomp-runner

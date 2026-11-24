@@ -38,6 +38,8 @@ fn read_at(mut offset: u64, mut buf: &mut [u8]) {
         let start = (offset % SECTOR_SIZE as u64) as usize;
         let len = buf.len().min(SECTOR_SIZE - start);
         BLOCK_DEVICE.read_block((offset / SECTOR_SIZE as u64) as usize, &mut sector.0);
+        #[cfg(feature = "elf_startup_stats")]
+        crate::exec_stats::on_ext4_sector_read();
         buf[..len].copy_from_slice(&sector.0[start..start + len]);
         buf = &mut buf[len..];
         offset += len as u64;

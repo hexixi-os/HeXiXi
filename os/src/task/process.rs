@@ -51,6 +51,8 @@ pub struct ProcessControlBlockInner {
     pub in_sigalrm: bool,
     /// RLIMIT_NOFILE 的当前上限（fd 表硬上限；setrlimit/prlimit64 会改）
     pub nofile_limit: usize,
+    #[cfg(feature = "elf_startup_stats")]
+    pub(crate) pending_exec: Option<crate::exec_stats::PendingExec>,
 }
 
 impl ProcessControlBlockInner {
@@ -135,6 +137,8 @@ impl ProcessControlBlock {
                     signal_pending: 0,
                     in_sigalrm: false,
                     nofile_limit: 1024,
+                    #[cfg(feature = "elf_startup_stats")]
+                    pending_exec: None,
                 })
             },
         });
@@ -352,6 +356,8 @@ impl ProcessControlBlock {
                     signal_pending: 0,
                     in_sigalrm: false,
                     nofile_limit: 1024,
+                    #[cfg(feature = "elf_startup_stats")]
+                    pending_exec: None,
                 })
             },
         });

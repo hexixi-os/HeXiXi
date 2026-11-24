@@ -125,7 +125,11 @@ pub fn frame_alloc() -> Option<FrameTracker> {
     if ppn.is_none() {
         println!("[mm] OUT OF FRAMES");
     }
-    ppn.map(FrameTracker::new)
+    ppn.map(|ppn| {
+        #[cfg(feature = "elf_startup_stats")]
+        crate::exec_stats::on_frame_alloc();
+        FrameTracker::new(ppn)
+    })
 }
 
 pub fn frame_dealloc(ppn: PhysPageNum) {

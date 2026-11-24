@@ -20,6 +20,7 @@ easy-fs = { path = "../easy-fs" }
 board_qemu = []
 board_k210 = []
 oscomp_runner = []
+elf_startup_stats = []
 
 [profile.release]
 debug = true
