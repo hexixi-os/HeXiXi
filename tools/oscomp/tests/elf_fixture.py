@@ -13,11 +13,11 @@ def load(flags, offset, address, filesz, memsz):
     return (1, flags, offset, address, address, filesz, memsz, PAGE)
 
 
-def executable(programs, payloads):
+def executable(programs, payloads, entry=TEXT):
     end = max(offset + len(data) for offset, data in payloads)
     image = bytearray(end)
     ident = b"\x7fELF\x02\x01\x01" + bytes(9)
-    HEADER.pack_into(image, 0, ident, 2, 243, 1, TEXT, HEADER.size, 0, 0,
+    HEADER.pack_into(image, 0, ident, 2, 243, 1, entry, HEADER.size, 0, 0,
                      HEADER.size, PROGRAM_HEADER.size, len(programs), 0, 0, 0)
     for index, program in enumerate(programs):
         PROGRAM_HEADER.pack_into(image, HEADER.size + index * PROGRAM_HEADER.size, *program)
@@ -111,6 +111,23 @@ def write_fixtures(root):
     root.joinpath("elf-short-header").write_bytes(b"\x7fELF")
     root.joinpath("elf-short-segment").write_bytes(startup[:0x2001])
     root.joinpath("elf-long-interpreter").write_bytes(b"#!/" + b"x" * 300 + b"\n")
+    (root / "elf-overlap-loader").write_bytes(executable(
+        [load(5, 0x1000, TEXT, len(warmup), len(warmup))], [(0x1000, warmup)],
+    ))
+    for name, interpreter in [
+        ("elf-missing-pt-interp", b"/lib/missing-interpreter.so\0"),
+        ("elf-invalid-pt-interp", b"/lib/unterminated.so"),
+        ("elf-non-elf-pt-interp", b"/elf-short-header\0"),
+        ("elf-overlap-pt-interp", b"/elf-overlap-loader\0"),
+    ]:
+        # The interpreter name is file data and does not need its own mapped page.
+        interp_offset = 0x100
+        text = struct.pack("<3I", *exit_code(42))
+        image = executable([
+            (3, 4, interp_offset, 0, 0, len(interpreter), len(interpreter), 1),
+            load(5, 0, TEXT, PAGE + len(text), PAGE + len(text)),
+        ], [(interp_offset, interpreter), (PAGE, text)], entry=TEXT + PAGE)
+        root.joinpath(name).write_bytes(image)
 
 
 if __name__ == "__main__":

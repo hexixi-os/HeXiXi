@@ -201,22 +201,31 @@ impl ProcessControlBlock {
     pub fn exec(
         self: &Arc<Self>,
         source: Executable,
+        path: &str,
+        exec_name: &str,
         args: Vec<Vec<u8>>,
         envs: Vec<Vec<u8>>,
     ) -> Result<(), isize> {
-        const AUXV_ENTRIES: usize = 15;
+        const AUXV_ENTRIES: usize = 16;
         if self.inner_exclusive_access().thread_count() != 1 {
             return Err(-16); // EBUSY
         }
-        let (mut memory_set, elf) = MemorySet::from_elf(source)?;
+        let (mut memory_set, elf) = MemorySet::from_exec(source, path)?;
         let new_token = memory_set.token();
-        let heap_base = 0x2000_0000.max(elf.stack_base + USER_STACK_SIZE + PAGE_SIZE);
+        let heap_start = 0x2000_0000.max(elf.stack_base + USER_STACK_SIZE + PAGE_SIZE);
+        // A fixed-address interpreter can already occupy the usual heap start.
+        let heap_base = memory_set
+            .find_vacant((heap_start / PAGE_SIZE).into(), 1)
+            .ok_or(-12isize)?
+            .start.0 * PAGE_SIZE;
         let string_bytes = args.iter().chain(&envs).try_fold(0usize, |total, s| {
             total.checked_add(s.len() + 1)
         }).ok_or(-7isize)?;
         let stack_words = 3 + args.len() + envs.len() + AUXV_ENTRIES * 2;
         // Leave room for AT_RANDOM and the two alignment adjustments.
-        let fixed_bytes = elf.programs.len() + stack_words * core::mem::size_of::<usize>() + 16 + 7 + 15;
+        let phdr_copy_bytes = if elf.program_addr.is_some() { 0 } else { elf.programs.len() };
+        let fixed_bytes = phdr_copy_bytes + stack_words * core::mem::size_of::<usize>()
+            + exec_name.len() + 1 + 16 + 7 + 15;
         if fixed_bytes > USER_STACK_SIZE || string_bytes > USER_STACK_SIZE - fixed_bytes {
             return Err(-7); // E2BIG
         }
@@ -270,13 +279,22 @@ impl ProcessControlBlock {
         }
         arg_ptrs.reverse();
 
-        // 2. 程序头表副本（AT_PHDR 指向它）
-        sp -= elf.programs.len();
-        sp -= sp % 8;
-        let phdr_addr = sp;
-        for (i, &byte) in elf.programs.iter().enumerate() {
-            *translated_refmut(new_token, (phdr_addr + i) as *mut u8) = byte;
+        sp -= exec_name.len() + 1;
+        let execfn_addr = sp;
+        for (i, byte) in exec_name.bytes().chain(core::iter::once(0)).enumerate() {
+            *translated_refmut(new_token, (execfn_addr + i) as *mut u8) = byte;
         }
+        // ld.so derives the main executable's load bias from its mapped program table.
+        let phdr_addr = if let Some(address) = elf.program_addr {
+            address
+        } else {
+            sp -= elf.programs.len();
+            sp -= sp % 8;
+            for (i, &byte) in elf.programs.iter().enumerate() {
+                *translated_refmut(new_token, (sp + i) as *mut u8) = byte;
+            }
+            sp
+        };
 
         // 3. AT_RANDOM 的 16 字节
         sp -= 16;
@@ -291,7 +309,8 @@ impl ProcessControlBlock {
             (3, phdr_addr),
             (4, elf.program_entry_size()),
             (5, elf.program_count()),
-            (6, 4096),
+            (6, PAGE_SIZE),
+            (7, elf.interpreter_base),
             (9, elf.entry),
             (11, 0),
             (12, 0),
@@ -299,7 +318,7 @@ impl ProcessControlBlock {
             (14, 0),
             (23, 0),
             (25, random_addr),
-            (31, arg_ptrs.first().copied().unwrap_or(0)),
+            (31, execfn_addr),
             (17, 100),
             (16, 0),
             (0, 0),
@@ -325,7 +344,7 @@ impl ProcessControlBlock {
         let user_sp = base;
         // initialize trap_cx
         let mut trap_cx = TrapContext::app_init_context(
-            elf.entry,
+            elf.start_entry,
             user_sp,
             KERNEL_SPACE.exclusive_access().token(),
             task.kstack.get_top(),

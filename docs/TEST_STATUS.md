@@ -1,5 +1,31 @@
 # 测试状态
 
+## 2026-11-24 PR-12 动态 ELF
+
+在 QEMU 8.2.2 上以 `execve` 启动 musl 1.2.0 PIE、glibc 2.31 PIE 和高地址 glibc 2.31 非 PIE。三个程序均经各自的加载器链接 libc，读取参数和环境变量，输出 Hello World 并以 0 退出。两个 glibc 程序同时验证堆能扩展和收缩。主程序和解释器的 `PT_LOAD` 复用 ELF 缺页与文件页缓存。解释器缺失、路径未终止、解释器格式错误及映射冲突均纳入 ELF 回归。
+
+原盘 `basic-musl` 和 `basic-glibc` 均为 **102/102**，各 32 个用例全部满分。musl 正常关机，glibc BusyBox 仍在结束标记后以 139 退出。原盘 basic 的无依赖、无重定位程序在其声明的解释器缺失时沿用直启。basic ABI、静态 ELF 按需加载、fork COW、`mmap`/VMA 和 LRU `mixed32` 回归通过。
+
+在 Linux 环境下复跑动态 ELF。下例使用 Bootlin RISC-V64 软浮点 musl 交叉编译器、Ubuntu RISC-V64 glibc 交叉编译器和从官方盘提取的静态 BusyBox。若更换工具链，用 `readelf -l` 确认各程序的解释器路径，按该路径放置普通文件。
+
+```bash
+fixture=$(mktemp -d)
+mkdir -p "$fixture/lib"
+musl_cc=/path/to/riscv64-buildroot-linux-musl-gcc
+glibc_cc=riscv64-linux-gnu-gcc
+source_file=tools/oscomp/tests/elf_hello.c
+"$musl_cc" -fPIE -pie -O2 "$source_file" -o "$fixture/hello-musl"
+"$glibc_cc" -fPIE -pie -O2 "$source_file" -o "$fixture/hello-glibc"
+"$glibc_cc" -fno-pie -no-pie -Wl,-Ttext-segment=0x50000000 -O2 "$source_file" -o "$fixture/hello-glibc-exec"
+install -m755 "$("$musl_cc" -print-file-name=libc.so)" "$fixture/lib/ld-musl-riscv64-sf.so.1"
+for library in ld-linux-riscv64-lp64d.so.1 libc.so.6; do
+    install -m755 "$("$glibc_cc" -print-file-name="$library")" "$fixture/lib/$library"
+done
+debugfs -R "dump /musl/busybox $fixture/busybox" /path/to/sdcard-rv.img
+chmod +x "$fixture/busybox"
+tools/oscomp/test_elf_dynamic.sh "$fixture" "$fixture/serial.log"
+```
+
 ## 2026-11-24 PR-11 官方原盘评测基线
 
 第一阶段基线 `c5903f1f` 在快进合入本地 `oscomp-adaptation` 前通过原盘 `basic-musl`，得分 102/102，32 个用例全部满分并正常关机。该基线与 PR-11 的评测内核均通过 basic ABI、ELF 按需加载、fork COW 和 `mmap`/VMA 回归。两者的默认 LRU 在 `mixed32` 页缓存回归中均读取 25,600 个扇区，热点未命中 96 次。

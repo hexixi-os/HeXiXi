@@ -72,5 +72,6 @@ python3 tools/oscomp/run_official_matrix.py ~/sdcard-rv.img ~/oscomp-work/offici
 
 - EXT4 只读，写入由内存 overlay 提供。
 - 当前为 RISC-V64 单核构建，使用 FIFO 轮转调度。
-- 网卡驱动、TCP/IP 协议栈和动态 ELF 解释器加载仍待实现。
+- 网卡驱动和 TCP/IP 协议栈仍待实现。
+- 动态 ELF 需要在 `PT_INTERP` 指定的路径提供解释器普通文件，共享库须位于加载器的搜索路径。原盘把 libc 放在 `/musl/lib` 与 `/glibc/lib`，部署通用动态程序需要布置运行时文件。
 - 本地矩阵接入 basic、busybox、lua、libctest、iozone 五组的公开判分器。其余组保留原始输出和可提取的用例结果，尚无本地总分。

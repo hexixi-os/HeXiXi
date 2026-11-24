@@ -20,7 +20,16 @@ fn run(path: &str) {
 }
 
 fn reject(path: &str) {
-    assert_eq!(exec(path, &[path.as_ptr(), core::ptr::null()]), -8);
+    reject_with(path, -8);
+}
+
+fn reject_with(path: &str, errno: isize) {
+    assert_eq!(
+        exec(path, &[path.as_ptr(), core::ptr::null()]),
+        errno,
+        "exec errno for {}",
+        path
+    );
 }
 
 fn reject_bad_argv() {
@@ -52,6 +61,10 @@ fn main() -> i32 {
     reject("elf-short-header\0");
     reject("elf-short-segment\0");
     reject("elf-long-interpreter\0");
+    reject_with("elf-missing-pt-interp\0", -2);
+    reject("elf-invalid-pt-interp\0");
+    reject_with("elf-non-elf-pt-interp\0", -80);
+    reject_with("elf-overlap-pt-interp\0", -80);
     reject_bad_argv();
     println!("elf-demand-test-ok");
     0

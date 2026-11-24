@@ -11,7 +11,6 @@ use crate::task::{
     suspend_current_and_run_next, SignalFlags,
 };
 use crate::timer::get_time_ms;
-use alloc::string::String;
 use alloc::vec::Vec;
 
 pub fn sys_exit(exit_code: i32) -> ! {
@@ -67,7 +66,7 @@ pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isiz
     let prefix_len = source.read_at(0, &mut prefix);
     let prefix = &prefix[..prefix_len];
     let (source, args) = if prefix.starts_with(b"#!") {
-        match script_interpreter(prefix, prefix_len < source.len(), raw_path, args) {
+        match script_interpreter(prefix, prefix_len < source.len(), &raw_path, args) {
             Ok(interpreter) => interpreter,
             Err(errno) => return errno,
         }
@@ -75,7 +74,7 @@ pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isiz
         (source, args)
     };
     let argc = args.len();
-    match current_process().exec(source, args, envs) {
+    match current_process().exec(source, &path, &raw_path, args, envs) {
         Ok(()) => argc as isize, // trap_handler writes the syscall result to the new a0.
         Err(errno) => errno,
     }
@@ -111,7 +110,7 @@ fn exec_arguments(token: usize, args: *const usize) -> Result<Vec<Vec<u8>>, isiz
 fn script_interpreter(
     prefix: &[u8],
     more_data: bool,
-    path: String,
+    path: &str,
     args: Vec<Vec<u8>>,
 ) -> Result<(Executable, Vec<Vec<u8>>), isize> {
     let newline = prefix.iter().position(|&byte| byte == b'\n');
@@ -144,7 +143,7 @@ fn script_interpreter(
     if let Some(argument) = argument {
         new_args.push(argument.as_bytes().to_vec());
     }
-    new_args.push(path.into_bytes());
+    new_args.push(path.as_bytes().to_vec());
     new_args.extend(args.into_iter().skip(1));
     Ok((source, new_args))
 }

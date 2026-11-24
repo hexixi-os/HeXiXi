@@ -5,8 +5,8 @@ use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use super::vma::{PageFault, VmaBacking, VmaSpace, USER_END};
-use crate::config::{MMIO, PAGE_SIZE, TRAMPOLINE};
-use crate::fs::Executable;
+use crate::config::{MMIO, PAGE_SIZE, TRAMPOLINE, USER_STACK_SIZE};
+use crate::fs::{open_executable, resolve_path, Executable};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -293,19 +293,75 @@ impl MemorySet {
         memory_set
     }
     pub fn from_elf(source: Executable) -> Result<(Self, ElfHeaders), isize> {
-        let (image, headers) = ElfImage::parse(source)?;
-        let image = Arc::new(image);
+        Self::load_elf(source, None)
+    }
+
+    pub fn from_exec(source: Executable, path: &str) -> Result<(Self, ElfHeaders), isize> {
+        Self::load_elf(source, Some(path))
+    }
+
+    fn load_elf(source: Executable, path: Option<&str>) -> Result<(Self, ElfHeaders), isize> {
+        const ENOEXEC: isize = -8;
+        const ELIBBAD: isize = -80;
+        const PIE_BASE: usize = 0x0400_0000;
+        const INTERPRETER_BASE: usize = 0x4000_0000;
+        const HEAP_GAP: usize = 0x0400_0000;
+
+        let (mut image, mut headers) = ElfImage::parse(source)?;
+        let interpreter = match (path, headers.interpreter.as_deref()) {
+            (_, None) => None,
+            (None, Some(_)) => return Err(ENOEXEC), // Kernel-started init is static.
+            (Some(path), Some(interpreter)) => {
+                match open_executable(&resolve_path(interpreter)?) {
+                    Ok(source) => Some(source),
+                    Err(-2) if image.is_official_basic(path, &headers) => None,
+                    Err(errno) => return Err(errno),
+                }
+            }
+        };
+        image.load_at(&mut headers, if interpreter.is_some() { PIE_BASE } else { 0 })?;
+        headers.stack_base = image.stack_base()?;
+
         let mut memory_set = Self::new_bare();
         memory_set.map_trampoline();
+        memory_set.map_elf_image(image);
+        if let Some(source) = interpreter {
+            if headers.program_addr.is_none() {
+                return Err(ENOEXEC);
+            }
+            let (mut loader, mut loader_headers) = ElfImage::parse(source).map_err(|_| ELIBBAD)?;
+            if loader_headers.interpreter.is_some() {
+                return Err(ELIBBAD);
+            }
+            let stack_start = (headers.stack_base - PAGE_SIZE) / PAGE_SIZE;
+            let stack_end = headers.stack_base + USER_STACK_SIZE + PAGE_SIZE;
+            // Leave room for brk to grow even when the main image is linked high.
+            let minimum_bias = INTERPRETER_BASE.max(stack_end + HEAP_GAP);
+            headers.interpreter_base = loader
+                .load_at(&mut loader_headers, minimum_bias)
+                .map_err(|_| ELIBBAD)?;
+            if loader.areas().iter().any(|(range, _)| {
+                !memory_set.vacant(range)
+                    || (range.start.0 < stack_end / PAGE_SIZE && range.end.0 > stack_start)
+            }) {
+                return Err(ELIBBAD);
+            }
+            headers.start_entry = loader_headers.entry;
+            memory_set.map_elf_image(loader);
+        }
+        Ok((memory_set, headers))
+    }
+
+    fn map_elf_image(&mut self, image: ElfImage) {
+        let image = Arc::new(image);
         for (range, permissions) in image.areas() {
             let address = range.start.0 * PAGE_SIZE;
-            memory_set.insert_vma(
+            self.insert_vma(
                 range,
                 permissions,
                 VmaBacking::Executable { image: Arc::clone(&image), address },
             );
         }
-        Ok((memory_set, headers))
     }
     pub fn fork(&mut self) -> Result<Self, isize> {
         const ENOMEM: isize = -12;

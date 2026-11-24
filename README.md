@@ -7,8 +7,9 @@
 
 - 内核约 7700 行 Rust，实现了 100 多个 Linux 系统调用（`fork`/`exec`/`clone`/`futex`/`mmap`/信号等）。
 - 文件系统：只读 EXT4（评测盘）。写入的文件只存在内存里，重启就没了。
-- 单核，没有网卡驱动和网络协议栈，不支持动态链接。
-- 评测方式：QEMU 内核内嵌 runner，在官方布局盘上进入 `/musl` 执行原版 `basic_testcode.sh`，跑完关机。
+- 单核，网卡驱动和网络协议栈仍待实现。
+- RISC-V64 `execve` 支持 ELF 解释器，已验证动态链接的 musl 和 glibc Hello World。
+- QEMU 内核内嵌 runner，可按组执行官方盘 `/musl` 和 `/glibc` 下的原版脚本。
 - **基线**：2025 官方发布的 RISC-V64 原盘已在本地 QEMU 上跑通 `basic-musl`。分数和失败用例见 [测试状态](docs/TEST_STATUS.md)。
 
 评测适配基于 `oscomp-adaptation`，`main` 为原版教学内核基线。
