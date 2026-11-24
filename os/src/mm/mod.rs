@@ -1,4 +1,5 @@
 mod address;
+mod elf;
 mod frame_allocator;
 mod heap_allocator;
 mod memory_set;

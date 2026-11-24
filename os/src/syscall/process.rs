@@ -1,15 +1,14 @@
-use crate::config::PAGE_SIZE;
+use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::mm::{MapPermission, VirtPageNum, VmaBacking, USER_END};
 use core::ops::Range;
-use crate::fs::{open_file, OpenFlags};
-use crate::mm::{translated_path, translated_ref, translated_refmut, translated_str};
+use crate::fs::{open_executable, Executable};
+use crate::mm::{translated_byte_buffer, translated_path, translated_ref, translated_refmut, UserBuffer};
 use crate::task::{
     current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
     suspend_current_and_run_next, SignalFlags,
 };
 use crate::timer::get_time_ms;
 use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 pub fn sys_exit(exit_code: i32) -> ! {
@@ -34,7 +33,7 @@ pub fn sys_fork() -> isize {
     current_process().fork(0).getpid() as isize
 }
 
-pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
+pub fn sys_exec(path: *const u8, args: *const usize) -> isize {
     let token = current_user_token();
     let raw_path = match translated_path(token, path) {
         Ok(path) => path,
@@ -45,75 +44,98 @@ pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
         Ok(path) => path,
         Err(errno) => return errno,
     };
-    let mut args_vec: Vec<String> = Vec::new();
-    loop {
-        let arg_str_ptr = *translated_ref(token, args);
-        if arg_str_ptr == 0 {
-            break;
+    let args = match exec_arguments(token, args) {
+        Ok(args) => args,
+        Err(errno) => return errno,
+    };
+    let source = match open_executable(&path) {
+        Ok(source) => source,
+        Err(errno) => return errno,
+    };
+    let mut prefix = [0; 256];
+    let prefix_len = source.read_at(0, &mut prefix);
+    let prefix = &prefix[..prefix_len];
+    let (source, args) = if prefix.starts_with(b"#!") {
+        match script_interpreter(prefix, prefix_len < source.len(), raw_path, args) {
+            Ok(interpreter) => interpreter,
+            Err(errno) => return errno,
         }
-        args_vec.push(translated_str(token, arg_str_ptr as *const u8));
-        unsafe {
-            args = args.add(1);
-        }
-    }
-    if let Some(all_data) = crate::fs::read_file_all(path.as_str()) {
-        let process = current_process();
-        // 支持 shebang：把脚本交给解释器运行（Linux 的 binfmt_script 行为）
-        if all_data.starts_with(b"#!") {
-            let end = all_data.iter().position(|&c| c == b'\n').unwrap_or(all_data.len());
-            let line = core::str::from_utf8(&all_data[2..end]).unwrap_or("").trim();
-            let mut it = line.split_whitespace();
-            let interp = it.next().unwrap_or("");
-            let extra = it.next();
-            let interp_name = interp.trim_start_matches('/');
-            let basename = interp_name.rsplit('/').next().unwrap_or(interp_name);
-            // argv = [解释器, 可选解释器参数(缺省用 basename), 脚本, ...原参数]
-            let (prog, interp_arg, interp_data) = if let Some(d) = crate::fs::read_file_all(interp_name) {
-                (alloc::string::String::from(interp_name), extra.map(|s| alloc::string::String::from(s)), d)
-            } else if let Some((prog, data)) = crate::fs::read_file_all("busybox")
-                .map(|data| ("busybox", data))
-                .or_else(|| {
-                    if interp == "/bin/sh" {
-                        crate::fs::read_file_all("musl/busybox").map(|data| ("/musl/busybox", data))
-                    } else {
-                        None
-                    }
-                })
-            {
-                // 回退到 busybox 时用 sh 解释（#!/bin/bash 也能跑）
-                let arg = match extra {
-                    Some(s) => alloc::string::String::from(s),
-                    None => alloc::string::String::from("sh"),
-                };
-                (String::from(prog), Some(arg), data)
-            } else {
-                return -1;
-            };
-            let mut new_args: Vec<String> = Vec::new();
-            new_args.push(prog);
-            if let Some(a) = interp_arg {
-                new_args.push(a);
-            }
-            new_args.push(raw_path.clone());
-            // Linux 的 binfmt_script：新 argv = [解释器, 可选参数, 脚本路径, 原 argv[1..]]
-            for a in args_vec.iter().skip(1) {
-                new_args.push(a.clone());
-            }
-            process.exec(interp_data.as_slice(), new_args);
-            return 0;
-        }
-        // 不是 ELF 也不是脚本：返回 ENOEXEC(-8) 而不是 EPERM，
-        // 这样 busybox sh 的 exec 失败后会按 POSIX 语义把文件当 shell 脚本执行
-        if !all_data.starts_with(b"\x7fELF") {
-            return -8;
-        }
-        let argc = args_vec.len();
-        process.exec(all_data.as_slice(), args_vec);
-        // return argc because cx.x[10] will be covered with it later
-        argc as isize
     } else {
-        -2 // ENOENT
+        (source, args)
+    };
+    let argc = args.len();
+    match current_process().exec(source, args) {
+        Ok(()) => argc as isize, // trap_handler writes the syscall result to the new a0.
+        Err(errno) => errno,
     }
+}
+
+fn exec_arguments(token: usize, args: *const usize) -> Result<Vec<String>, isize> {
+    const WORD: usize = core::mem::size_of::<usize>();
+    let mut result = Vec::new();
+    if args.is_null() {
+        return Ok(result);
+    }
+    let mut address = args as usize;
+    let mut remaining = USER_STACK_SIZE;
+    loop {
+        let buffers = translated_byte_buffer(token, address as *const u8, WORD, MapPermission::R)
+            .ok_or(-14isize)?;
+        let mut bytes = [0; WORD];
+        for (byte, user) in bytes.iter_mut().zip(UserBuffer::new(buffers)) {
+            *byte = unsafe { user.read() };
+        }
+        let pointer = usize::from_ne_bytes(bytes);
+        if pointer == 0 {
+            return Ok(result);
+        }
+        let arg = translated_path(token, pointer as *const u8)
+            .map_err(|errno| if errno == -36 { -7 } else { errno })?;
+        remaining = remaining.checked_sub(arg.len() + 1 + WORD).ok_or(-7isize)?;
+        result.push(arg);
+        address = address.checked_add(WORD).ok_or(-14isize)?;
+    }
+}
+
+fn script_interpreter(
+    prefix: &[u8],
+    more_data: bool,
+    path: String,
+    args: Vec<String>,
+) -> Result<(Executable, Vec<String>), isize> {
+    let newline = prefix.iter().position(|&byte| byte == b'\n');
+    let end = newline.unwrap_or(prefix.len());
+    let line = core::str::from_utf8(&prefix[2..end]).map_err(|_| -8isize)?.trim_start();
+    let mut tokens = line.split_whitespace();
+    let interpreter = tokens.next().ok_or(-8isize)?;
+    if more_data && newline.is_none() && interpreter.len() == line.len() {
+        return Err(-8); // The window ended inside the interpreter name.
+    }
+    let argument = tokens.next();
+    let name = interpreter.trim_start_matches('/');
+    let (program, argument, source) = match open_executable(name) {
+        Ok(source) => (name, argument, source),
+        Err(_) => {
+            let (program, source) = open_executable("busybox")
+                .map(|source| ("busybox", source))
+                .or_else(|errno| {
+                    if interpreter == "/bin/sh" {
+                        open_executable("musl/busybox").map(|source| ("/musl/busybox", source))
+                    } else {
+                        Err(errno)
+                    }
+                })?;
+            (program, argument.or(Some("sh")), source)
+        }
+    };
+    let mut new_args = Vec::with_capacity(args.len() + 3);
+    new_args.push(String::from(program));
+    if let Some(argument) = argument {
+        new_args.push(String::from(argument));
+    }
+    new_args.push(path);
+    new_args.extend(args.into_iter().skip(1));
+    Ok((source, new_args))
 }
 
 /// If there is not a child process whose pid is same as given, return -1.

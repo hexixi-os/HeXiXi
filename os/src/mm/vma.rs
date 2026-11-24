@@ -1,3 +1,4 @@
+use super::elf::ElfImage;
 use super::{frame_alloc, FrameTracker, MapPermission, PTEFlags, PageTable, VirtPageNum};
 use crate::{config::PAGE_SIZE, fs::File, sync::UPSafeCell};
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
@@ -24,6 +25,10 @@ pub enum VmaBacking {
         offset: usize,
         shared: bool,
         _lease: Option<Arc<()>>,
+    },
+    Executable {
+        image: Arc<ElfImage>,
+        address: usize,
     },
 }
 
@@ -52,6 +57,7 @@ impl VmaBacking {
     fn advance(&mut self, bytes: usize) {
         match self {
             Self::File { offset, .. } | Self::SharedAnonymous { offset, .. } => *offset += bytes,
+            Self::Executable { address, .. } => *address += bytes,
             Self::Anonymous => (),
         }
     }
@@ -102,12 +108,32 @@ impl VmaBacking {
                 let page = file.mapping_page(offset).ok_or(PageFault::Invalid)?;
                 (page, !shared)
             }
+            Self::Executable { image, address } => return load_elf_page(image, address + bytes),
         };
         Ok(ResidentPage {
             frame,
             copy_on_write,
         })
     }
+}
+
+fn load_elf_page(image: &ElfImage, address: usize) -> Result<ResidentPage, PageFault> {
+    let mut parts = image.page_parts(address).peekable();
+    // A complete file page can be shared. Leave its writable mappings protected until a store.
+    if let Some(&(0, offset, PAGE_SIZE)) = parts.peek() {
+        if let Some(frame) = image.source().cached_page(offset) {
+            return Ok(ResidentPage { frame, copy_on_write: true });
+        }
+    }
+
+    let frame = alloc_page()?;
+    let page = frame.ppn.get_bytes_array();
+    for (start, offset, len) in parts {
+        if image.source().read_at(offset, &mut page[start..start + len]) != len {
+            return Err(PageFault::Invalid);
+        }
+    }
+    Ok(ResidentPage { frame, copy_on_write: false })
 }
 
 fn alloc_page() -> Result<Arc<FrameTracker>, PageFault> {
@@ -206,6 +232,14 @@ impl VmaSpace {
             .next_back()
             .map(|(_, area)| area.end)
             .filter(|&end| range.start < end)
+    }
+
+    pub(super) fn overlaps_executable(&self, range: &Range<VirtPageNum>) -> bool {
+        self.areas
+            .range(..range.end)
+            .rev()
+            .take_while(|(_, area)| range.start < area.end)
+            .any(|(_, area)| matches!(area.backing, VmaBacking::Executable { .. }))
     }
 
     fn split(&mut self, vpn: VirtPageNum) {

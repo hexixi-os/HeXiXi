@@ -3,7 +3,8 @@ use super::manager::insert_into_pid2process;
 use super::TaskControlBlock;
 use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
-use crate::fs::{DirectoryLocation, File, Stdin, Stdout};
+use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
+use crate::fs::{DirectoryLocation, Executable, File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
@@ -100,9 +101,8 @@ impl ProcessControlBlock {
         self.inner.try_exclusive_access()
     }
 
-    pub fn new(elf_data: &[u8]) -> Arc<Self> {
-        // memory_set with elf program headers/trampoline/trap context/user stack
-        let (mut memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+    pub fn new(source: Executable) -> Arc<Self> {
+        let (memory_set, elf) = MemorySet::from_elf(source).expect("invalid initial executable");
         // allocate a pid
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
@@ -145,7 +145,7 @@ impl ProcessControlBlock {
         // create a main thread, we should allocate ustack and trap_cx here
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&process),
-            ustack_base,
+            elf.stack_base,
             true,
         ));
         // prepare trap_cx of main thread
@@ -155,7 +155,7 @@ impl ProcessControlBlock {
         let kstack_top = task.kstack.get_top();
         drop(task_inner);
         *trap_cx = TrapContext::app_init_context(
-            entry_point,
+            elf.entry,
             ustack_top,
             KERNEL_SPACE.exclusive_access().token(),
             kstack_top,
@@ -172,13 +172,36 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>) {
-        assert_eq!(self.inner_exclusive_access().thread_count(), 1);
-        // memory_set with elf program headers/trampoline/trap context/user stack
-        let (mut memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+    pub fn exec(self: &Arc<Self>, source: Executable, args: Vec<String>) -> Result<(), isize> {
+        const AUXV_ENTRIES: usize = 15;
+        if self.inner_exclusive_access().thread_count() != 1 {
+            return Err(-16); // EBUSY
+        }
+        let (mut memory_set, elf) = MemorySet::from_elf(source)?;
         let new_token = memory_set.token();
-        // 堆放在独立地址段，避免与用户栈/程序段重叠
-        let heap_base: usize = 0x2000_0000;
+        let heap_base = 0x2000_0000.max(elf.stack_base + USER_STACK_SIZE + PAGE_SIZE);
+        // 环境变量：只给 lmbench 注入 ENOUGH。
+        //   为什么：lmbench 的计时目标默认按“1 秒”校准，每个子进程要跑 1s 的校准/测量；
+        //   lat_fs 还会按 1 秒预算创建上万个 10KB 文件（overlay 数据在内核堆里），
+        //   1G 机器上会堆爆/超时。ENOUGH 是 lmbench 官方支持的调参环境变量
+        //   （lib_timing.c: getenv("ENOUGH")），设成 10000 即 10ms 目标，
+        //   不影响测量含义，还能让整组在几分钟内跑完。
+        let prog_name = args.first().map(|s| s.as_str()).unwrap_or("");
+        let envs: Vec<String> = if prog_name.ends_with("lmbench_all") || prog_name.ends_with("lmbench") {
+            vec![String::from("ENOUGH=10000")]
+        } else {
+            Vec::new()
+        };
+
+        let string_bytes = args.iter().chain(&envs).try_fold(0usize, |total, s| {
+            total.checked_add(s.len() + 1)
+        }).ok_or(-7isize)?;
+        let stack_words = 3 + args.len() + envs.len() + AUXV_ENTRIES * 2;
+        // Leave room for AT_RANDOM and the two alignment adjustments.
+        let fixed_bytes = elf.programs.len() + stack_words * core::mem::size_of::<usize>() + 16 + 7 + 15;
+        if fixed_bytes > USER_STACK_SIZE || string_bytes > USER_STACK_SIZE - fixed_bytes {
+            return Err(-7); // E2BIG
+        }
         // 信号投递用的用户页：可执行 stub + 保存的 trap context
         crate::syscall::signal::setup_signal_pages(&mut memory_set);
         // substitute memory_set
@@ -187,7 +210,7 @@ impl ProcessControlBlock {
         // since memory_set has been changed
         let task = self.inner_exclusive_access().get_task(0);
         let mut task_inner = task.inner_exclusive_access();
-        task_inner.res.as_mut().unwrap().ustack_base = ustack_base;
+        task_inner.res.as_mut().unwrap().ustack_base = elf.stack_base;
         task_inner.res.as_mut().unwrap().alloc_user_res();
         task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
         {
@@ -201,18 +224,6 @@ impl ProcessControlBlock {
         let mut sp = task_inner.res.as_mut().unwrap().ustack_top();
         let argc = args.len();
 
-        // 0. 环境变量：只给 lmbench 注入 ENOUGH。
-        //   为什么：lmbench 的计时目标默认按“1 秒”校准，每个子进程要跑 1s 的校准/测量；
-        //   lat_fs 还会按 1 秒预算创建上万个 10KB 文件（overlay 数据在内核堆里），
-        //   1G 机器上会堆爆/超时。ENOUGH 是 lmbench 官方支持的调参环境变量
-        //   （lib_timing.c: getenv("ENOUGH")），设成 10000 即 10ms 目标，
-        //   不影响测量含义，还能让整组在几分钟内跑完。
-        let prog_name = args.first().map(|s| s.as_str()).unwrap_or("");
-        let envs: Vec<String> = if prog_name.ends_with("lmbench_all") || prog_name.ends_with("lmbench") {
-            vec![String::from("ENOUGH=10000")]
-        } else {
-            Vec::new()
-        };
         // 环境变量字符串（和参数字符串一样放高地址）
         let mut env_ptrs: Vec<usize> = Vec::with_capacity(envs.len());
         for env in envs.iter().rev() {
@@ -242,16 +253,11 @@ impl ProcessControlBlock {
         arg_ptrs.reverse();
 
         // 2. 程序头表副本（AT_PHDR 指向它）
-        let e_entry = u64::from_le_bytes(elf_data[0x18..0x20].try_into().unwrap()) as usize;
-        let e_phoff = u64::from_le_bytes(elf_data[0x20..0x28].try_into().unwrap()) as usize;
-        let e_phentsize = u16::from_le_bytes(elf_data[0x36..0x38].try_into().unwrap()) as usize;
-        let e_phnum = u16::from_le_bytes(elf_data[0x38..0x3a].try_into().unwrap()) as usize;
-        let phdr_len = e_phnum * e_phentsize;
-        sp -= phdr_len;
+        sp -= elf.programs.len();
         sp -= sp % 8;
         let phdr_addr = sp;
-        for i in 0..phdr_len {
-            *translated_refmut(new_token, (phdr_addr + i) as *mut u8) = elf_data[e_phoff + i];
+        for (i, &byte) in elf.programs.iter().enumerate() {
+            *translated_refmut(new_token, (phdr_addr + i) as *mut u8) = byte;
         }
 
         // 3. AT_RANDOM 的 16 字节
@@ -263,12 +269,12 @@ impl ProcessControlBlock {
         }
 
         // 4. 数组区：argc / argv / envp / auxv 必须连续
-        let auxv: [(usize, usize); 15] = [
+        let auxv: [(usize, usize); AUXV_ENTRIES] = [
             (3, phdr_addr),
-            (4, e_phentsize),
-            (5, e_phnum),
+            (4, elf.program_entry_size()),
+            (5, elf.program_count()),
             (6, 4096),
-            (9, e_entry),
+            (9, elf.entry),
             (11, 0),
             (12, 0),
             (13, 0),
@@ -280,8 +286,7 @@ impl ProcessControlBlock {
             (16, 0),
             (0, 0),
         ];
-        let words = 1 + argc + 1 + env_ptrs.len() + 1 + auxv.len() * 2;
-        sp -= words * core::mem::size_of::<usize>();
+        sp -= stack_words * core::mem::size_of::<usize>();
         sp -= sp % 16;
         let base = sp;
         let sz = core::mem::size_of::<usize>();
@@ -302,7 +307,7 @@ impl ProcessControlBlock {
         let user_sp = base;
         // initialize trap_cx
         let mut trap_cx = TrapContext::app_init_context(
-            entry_point,
+            elf.entry,
             user_sp,
             KERNEL_SPACE.exclusive_access().token(),
             task.kstack.get_top(),
@@ -311,6 +316,7 @@ impl ProcessControlBlock {
         trap_cx.x[10] = args.len();
         trap_cx.x[11] = user_sp + core::mem::size_of::<usize>();
         *task_inner.get_trap_cx() = trap_cx;
+        Ok(())
     }
 
     /// Only support processes with a single thread.

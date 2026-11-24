@@ -343,6 +343,21 @@ impl Ext4File {
             offset: unsafe { UPSafeCell::new(0) },
         }
     }
+
+    pub(super) fn len(&self) -> usize {
+        self.inode.size as usize
+    }
+
+    pub(super) fn read_at(&self, offset: usize, buffer: &mut [u8]) -> usize {
+        self.fs.read_cached_at(&self.inode, offset as u64, buffer)
+    }
+
+    pub(super) fn cached_page(&self, offset: usize) -> Option<Arc<FrameTracker>> {
+        if !self.inode.is_file() || offset >= self.len() || offset % PAGE_SIZE != 0 {
+            return None;
+        }
+        self.fs.file_page(&self.inode, (offset / PAGE_SIZE) as u64)
+    }
 }
 
 impl File for Ext4File {
@@ -357,7 +372,7 @@ impl File for Ext4File {
         let mut total = 0;
         for buffer in buf.buffers {
             let chunk = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), buffer.len()) };
-            let read = self.fs.read_cached_at(&self.inode, *off as u64, chunk);
+            let read = self.read_at(*off, chunk);
             *off += read;
             total += read;
             if read < chunk.len() {
@@ -367,16 +382,13 @@ impl File for Ext4File {
         total
     }
     fn size(&self) -> usize {
-        self.inode.size as usize
+        self.len()
     }
     fn mapping_size(&self) -> Option<usize> {
         self.inode.is_file().then(|| self.size())
     }
     fn mapping_page(&self, offset: usize) -> Option<Arc<FrameTracker>> {
-        if offset >= self.mapping_size()? || offset % PAGE_SIZE != 0 {
-            return None;
-        }
-        self.fs.file_page(&self.inode, (offset / PAGE_SIZE) as u64)
+        self.cached_page(offset)
     }
     fn seek_to(&self, pos: isize) -> isize {
         if pos < 0 {

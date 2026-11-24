@@ -1,4 +1,5 @@
 mod directory;
+mod executable;
 pub mod ext4;
 mod inode;
 mod overlay;
@@ -9,6 +10,7 @@ mod stdio;
 use crate::mm::{FrameTracker, UserBuffer};
 use directory::DirectoryIdentity;
 pub use directory::{DirectoryFile, DirectoryLocation};
+pub use executable::{open_executable, Executable};
 use overlay::{
     overlay_children, overlay_create, overlay_get, overlay_mkdir, overlay_rename, overlay_unlink,
     OverlayData, OverlayEntry, OverlayFile,

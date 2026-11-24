@@ -190,12 +190,9 @@ lazy_static! {
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
         #[cfg(feature = "oscomp_runner")]
         if crate::fs::has_ext4() && crate::fs::exists("musl/basic_testcode.sh") {
-            // ELF 解析器直接读取对齐的 64 位头字段。
-            #[repr(C, align(8))]
-            struct AlignedElf<const N: usize>([u8; N]);
-            static RUNNER: AlignedElf<{ include_bytes!(env!("OSCOMP_RUNNER_ELF")).len() }> =
-                AlignedElf(*include_bytes!(env!("OSCOMP_RUNNER_ELF")));
-            return ProcessControlBlock::new(&RUNNER.0);
+            return ProcessControlBlock::new(crate::fs::Executable::Embedded(
+                include_bytes!(env!("OSCOMP_RUNNER_ELF")),
+            ));
         }
         // 测试盘上有 run_tests 标记时，改为启动自动跑测的 autorun
         // 盘里有 oscomp_runner 就交给它去跑 *_testcode.sh
@@ -206,8 +203,7 @@ lazy_static! {
         } else {
             "initproc"
         };
-        let v = crate::fs::read_file_all(name).unwrap();
-        ProcessControlBlock::new(v.as_slice())
+        ProcessControlBlock::new(crate::fs::open_executable(name).expect("missing init executable"))
     };
 }
 

@@ -1,9 +1,11 @@
+use super::elf::{ElfHeaders, ElfImage};
 use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use super::vma::{PageFault, VmaBacking, VmaSpace, USER_END};
 use crate::config::{MMIO, PAGE_SIZE, TRAMPOLINE};
+use crate::fs::Executable;
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -106,7 +108,7 @@ impl MemorySet {
 
     pub fn munmap(&mut self, range: Range<VirtPageNum>) -> Result<(), isize> {
         // ELF segments and task resources follow their existing allocation lifecycle.
-        if self.framed_overlap_end(&range).is_some() {
+        if self.framed_overlap_end(&range).is_some() || self.vmas.overlaps_executable(&range) {
             return Err(-22);
         }
         let mut tables = Vec::new();
@@ -174,12 +176,6 @@ impl MemorySet {
         self.areas.push(map_area);
     }
 
-    /// 与 push 相同，但允许数据从段内偏移处开始（ELF 的 p_vaddr % PAGE_SIZE）
-    fn push_at(&mut self, mut map_area: MapArea, data: &[u8], offset: usize) {
-        map_area.map(&mut self.page_table);
-        map_area.copy_data(&mut self.page_table, data, offset);
-        self.areas.push(map_area);
-    }
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
         self.page_table.map(
@@ -265,53 +261,20 @@ impl MemorySet {
         }
         memory_set
     }
-    /// Include sections in elf and trampoline,
-    /// also returns user_sp_base and entry point.
-    pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize) {
+    pub fn from_elf(source: Executable) -> Result<(Self, ElfHeaders), isize> {
+        let (image, headers) = ElfImage::parse(source)?;
+        let image = Arc::new(image);
         let mut memory_set = Self::new_bare();
-        // map trampoline
         memory_set.map_trampoline();
-        // map program headers of elf, with U flag
-        let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
-        let elf_header = elf.header;
-        let magic = elf_header.pt1.magic;
-        assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
-        let ph_count = elf_header.pt2.ph_count();
-        let mut max_end_vpn = VirtPageNum(0);
-        for i in 0..ph_count {
-            let ph = elf.program_header(i).unwrap();
-            if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
-                let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
-                let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
-                let mut map_perm = MapPermission::U;
-                let ph_flags = ph.flags();
-                if ph_flags.is_read() {
-                    map_perm |= MapPermission::R;
-                }
-                if ph_flags.is_write() {
-                    map_perm |= MapPermission::W;
-                }
-                if ph_flags.is_execute() {
-                    map_perm |= MapPermission::X;
-                }
-                let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
-                max_end_vpn = map_area.vpn_range.get_end();
-                let seg_off = (ph.virtual_addr() as usize) % PAGE_SIZE;
-                memory_set.push_at(
-                    map_area,
-                    &elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize],
-                    seg_off,
-                );
-            }
+        for (range, permissions) in image.areas() {
+            let address = range.start.0 * PAGE_SIZE;
+            memory_set.insert_vma(
+                range,
+                permissions,
+                VmaBacking::Executable { image: Arc::clone(&image), address },
+            );
         }
-        let max_end_va: VirtAddr = max_end_vpn.into();
-        let mut user_stack_base: usize = max_end_va.into();
-        user_stack_base += PAGE_SIZE;
-        (
-            memory_set,
-            user_stack_base,
-            elf.header.pt2.entry_point() as usize,
-        )
+        Ok((memory_set, headers))
     }
     pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
         let mut memory_set = Self::new_bare();

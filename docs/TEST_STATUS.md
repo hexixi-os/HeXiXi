@@ -1,5 +1,39 @@
 # 测试状态
 
+## 2026-11-24 PR-08 ELF 按需加载
+
+EXT4 上的 `exec` 按区间读取 ELF 头和程序头，登记 `PT_LOAD` 的 VMA。缺页时，完整文件页与普通 `read/readv`、文件 `mmap` 共用页缓存。私有写入触发 COW，部分页和 BSS 按需分配并补零。内嵌程序直接使用内核内的字节，easy-fs 与 Overlay 继续以文件快照为输入。
+
+`tools/oscomp/test_elf_demand.sh` 覆盖非页对齐的段、同页相邻段、BSS、文件页写隔离、`mprotect` 后的缺页、内核向未驻留 BSS 写入，以及无效 ELF 和 `argv`。官方盘的 basic-musl ELF 含 `PT_INTERP`，保留直接进入 `e_entry` 的兼容路径。通用动态链接仍待适配。
+
+2025 年初赛 RISC-V64 官方原盘 `basic-musl` 为 **102/102**，32 个用例全部满分并正常关机。basic ABI、文件 mmap/VMA、EXT4 页缓存和 easy-fs 文件读写回归通过。
+
+### 冷启动对比
+
+QEMU 8.2.2、单核、256 MiB RAM。合成 ELF 含一个 8 MiB 的冷文件段，其内存范围为 32 MiB，程序只执行首个代码页。两版各从冷盘启动五次，表中取中位数。计数从记录 exec 路径后开始，截止新程序发起第一次系统调用，包含首次缺页。帧分配统计成功分配次数，扇区读取计入 EXT4 数据和元数据。计数器为单核测试中的全局计数，耗时为客体墙钟时间。
+
+| 截止第一次用户系统调用 | PR-07 装载器 `0eb2d7f1`（已加同一套计数器） | PR-08 按需装载 |
+|---|---:|---:|
+| 物理帧分配次数 | 8,475 | 268 |
+| 512 字节扇区读取 | 16,412 | 28 |
+| 耗时 | 2,124.110 ms | 3.326 ms |
+
+在 PR-08 工作区用相同的测试脚本跑两版。日志中只取 `path=elf-startup` 的记录。
+
+```bash
+experiment=$(mktemp -d)
+git worktree add --detach "$experiment/eager-src" 0eb2d7f1
+make -C "$experiment/eager-src" all ELF_STARTUP_STATS=1 KERNEL_OUT="$experiment/eager"
+make all ELF_STARTUP_STATS=1 KERNEL_OUT="$experiment/demand"
+for trial in 1 2 3 4 5; do
+    for mode in eager demand; do
+        log="$experiment/$mode-$trial.log"
+        ELF_STARTUP_ONLY=1 KERNEL="$experiment/$mode" tools/oscomp/test_elf_demand.sh "$log"
+        grep -a '^\[elf-startup\] path=elf-startup ' "$log"
+    done
+done
+```
+
 ## 2026-11-23 PR-07 文件系统与进程 ABI
 
 2025 年初赛 RISC-V64 官方原盘的 `basic-musl` 在 QEMU 8.2.2、单核和 1 GiB 内存下达到 **102/102**，32 个用例全部满分并正常关机。`clone` 采用调用者指定的子栈，`mkdir` 可以创建并打开目录，`unlink` 按当前工作目录或目录 fd 解析路径。
