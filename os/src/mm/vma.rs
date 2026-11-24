@@ -1,8 +1,9 @@
 use super::elf::ElfImage;
-use super::{frame_alloc, FrameTracker, MapPermission, PTEFlags, PageTable, VirtPageNum};
+use super::resident::{alloc_page, ResidentPage};
+use super::{FrameTracker, MapPermission, PageTable, VirtPageNum};
 use crate::{config::PAGE_SIZE, fs::File, sync::UPSafeCell};
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
-use core::{arch::asm, ops::Range};
+use core::ops::Range;
 
 pub const USER_END: usize = 1 << 38;
 
@@ -110,10 +111,7 @@ impl VmaBacking {
             }
             Self::Executable { image, address } => return load_elf_page(image, address + bytes),
         };
-        Ok(ResidentPage {
-            frame,
-            copy_on_write,
-        })
+        Ok(ResidentPage::new(frame, copy_on_write))
     }
 }
 
@@ -122,7 +120,7 @@ fn load_elf_page(image: &ElfImage, address: usize) -> Result<ResidentPage, PageF
     // A complete file page can be shared. Leave its writable mappings protected until a store.
     if let Some(&(0, offset, PAGE_SIZE)) = parts.peek() {
         if let Some(frame) = image.source().cached_page(offset) {
-            return Ok(ResidentPage { frame, copy_on_write: true });
+            return Ok(ResidentPage::new(frame, true));
         }
     }
 
@@ -133,40 +131,7 @@ fn load_elf_page(image: &ElfImage, address: usize) -> Result<ResidentPage, PageF
             return Err(PageFault::Invalid);
         }
     }
-    Ok(ResidentPage { frame, copy_on_write: false })
-}
-
-fn alloc_page() -> Result<Arc<FrameTracker>, PageFault> {
-    frame_alloc().map(Arc::new).ok_or(PageFault::Invalid)
-}
-
-#[derive(Clone)]
-struct ResidentPage {
-    frame: Arc<FrameTracker>,
-    copy_on_write: bool,
-}
-
-impl ResidentPage {
-    fn flags(&self, mut permissions: MapPermission) -> PTEFlags {
-        if self.copy_on_write {
-            permissions.remove(MapPermission::W);
-        }
-        PTEFlags::from_bits(permissions.bits()).unwrap()
-    }
-
-    fn private_copy(&self) -> Result<Self, PageFault> {
-        let frame = alloc_page()?;
-        frame
-            .ppn
-            .get_bytes_array()
-            .copy_from_slice(self.frame.ppn.get_bytes_array());
-        #[cfg(feature = "elf_startup_stats")]
-        crate::fork_stats::on_frame_copy();
-        Ok(Self {
-            frame,
-            copy_on_write: false,
-        })
-    }
+    Ok(ResidentPage::new(frame, false))
 }
 
 #[derive(Clone)]
@@ -308,30 +273,16 @@ impl VmaSpace {
         };
         let permissions = area.permissions;
         if let Some(page) = self.pages.get_mut(&vpn) {
-            if !page.copy_on_write || access != MapPermission::W {
-                return PageFault::Invalid;
-            }
-            let new = match page.private_copy() {
-                Ok(page) => page,
-                Err(fault) => return fault,
-            };
-            table.remap(vpn, new.frame.ppn, new.flags(permissions));
-            let old = core::mem::replace(page, new);
-            unsafe {
-                asm!("sfence.vma");
-            }
-            drop(old);
-            return PageFault::Resolved;
+            return page.write_fault(table, vpn, permissions, access);
         }
         let mut page = match area.backing.load((vpn.0 - start.0) * PAGE_SIZE) {
             Ok(page) => page,
             Err(fault) => return fault,
         };
-        if page.copy_on_write && access == MapPermission::W {
-            page = match page.private_copy() {
-                Ok(page) => page,
-                Err(fault) => return fault,
-            };
+        if access == MapPermission::W {
+            if let Err(fault) = page.make_writable() {
+                return fault;
+            }
         }
         if !table.try_map(vpn, page.frame.ppn, page.flags(permissions)) {
             return PageFault::Invalid;
@@ -340,24 +291,32 @@ impl VmaSpace {
         PageFault::Resolved
     }
 
-    pub(super) fn fork(&self, table: &mut PageTable) -> Self {
+    pub(super) fn fork_child(&self, table: &mut PageTable) -> Option<Self> {
         let mut child = Self {
             areas: self.areas.clone(),
             pages: BTreeMap::new(),
         };
         for (&vpn, page) in &self.pages {
             let (_, area) = Self::covering(&self.areas, vpn).unwrap();
-            let new_page = if area.backing.is_shared() || page.copy_on_write {
+            let page = if area.backing.is_shared() {
                 page.clone()
             } else {
-                match page.private_copy() {
-                    Ok(page) => page,
-                    Err(_) => panic!("out of frames copying a resident page during fork"),
-                }
+                page.share_private()
             };
-            table.map(vpn, new_page.frame.ppn, new_page.flags(area.permissions));
-            child.pages.insert(vpn, new_page);
+            if !table.try_map(vpn, page.frame.ppn, page.flags(area.permissions)) {
+                return None;
+            }
+            child.pages.insert(vpn, page);
         }
-        child
+        Some(child)
+    }
+
+    pub(super) fn write_protect_private(&mut self, table: &mut PageTable) {
+        for (&vpn, page) in &mut self.pages {
+            let (_, area) = Self::covering(&self.areas, vpn).unwrap();
+            if !area.backing.is_shared() {
+                page.write_protect(table, vpn, area.permissions);
+            }
+        }
     }
 }

@@ -1,7 +1,7 @@
 use crate::mm::{MapPermission, MemorySet, VirtAddr};
-use crate::task::{current_process, current_user_token};
+use crate::task::{current_add_signal, current_process, current_user_token, SignalFlags};
 use crate::trap::TrapContext;
-use crate::mm::{translated_ref, translated_refmut};
+use crate::mm::{translated_ref, try_translated_refmut};
 
 /// 可执行的信号返回 stub 页（li a7,139; ecall; j .）
 pub const SIGSTUB_VA: usize = 0x00FF_E000;
@@ -127,15 +127,15 @@ pub fn deliver_signal() {
     };
     let handler = handlers[signo];
     let token = current_user_token();
-    let cx = crate::task::current_trap_cx();
-    // 保存当前上下文
-    let saved = *cx;
-    let bytes = unsafe {
-        core::slice::from_raw_parts(&saved as *const TrapContext as *const u8, core::mem::size_of::<TrapContext>())
+    let saved = match try_translated_refmut(token, SIGCTX_VA as *mut TrapContext) {
+        Some(saved) => saved,
+        None => {
+            current_add_signal(SignalFlags::SIGSEGV);
+            return;
+        }
     };
-    for (i, b) in bytes.iter().enumerate() {
-        *translated_refmut(token, (SIGCTX_VA + i) as *mut u8) = *b;
-    }
+    let cx = crate::task::current_trap_cx();
+    *saved = *cx;
     // 构造调用 handler 的上下文
     cx.sepc = handler;
     cx.x[1] = SIGSTUB_VA;

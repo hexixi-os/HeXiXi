@@ -84,7 +84,7 @@ pub fn sys_waittid(tid: usize) -> i32 {
 pub fn sys_clone_thread(flags: usize, stack: usize, ptid: usize, tls: usize, ctid: usize) -> isize {
     const CLONE_VM: usize = 0x100;
     if flags & CLONE_VM == 0 {
-        return crate::task::current_process().fork(stack).getpid() as isize;
+        return super::process::fork_with_stack(stack);
     }
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();

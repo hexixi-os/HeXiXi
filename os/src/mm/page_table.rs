@@ -63,12 +63,12 @@ pub struct PageTable {
 
 /// Assume that it won't oom when creating/mapping.
 impl PageTable {
-    pub fn new() -> Self {
-        let frame = frame_alloc().unwrap();
-        PageTable {
+    pub(super) fn try_new() -> Option<Self> {
+        let frame = frame_alloc()?;
+        Some(Self {
             root_ppn: frame.ppn,
             frames: vec![frame],
-        }
+        })
     }
     /// Temporarily used to get arguments from user space.
     pub fn from_token(satp: usize) -> Self {
@@ -80,21 +80,32 @@ impl PageTable {
     fn find_pte_create(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
         let idxs = vpn.indexes();
         let mut ppn = self.root_ppn;
-        let mut result: Option<&mut PageTableEntry> = None;
+        let mut created = [(ppn, 0); 2];
+        let mut created_count = 0;
         for (i, idx) in idxs.iter().enumerate() {
             let pte = &mut ppn.get_pte_array()[*idx];
             if i == 2 {
-                result = Some(pte);
-                break;
+                return Some(pte);
             }
             if !pte.is_valid() {
-                let frame = frame_alloc()?;
+                let frame = match frame_alloc() {
+                    Some(frame) => frame,
+                    None => {
+                        for &(parent, slot) in created[..created_count].iter().rev() {
+                            parent.get_pte_array()[slot] = PageTableEntry::empty();
+                            self.frames.pop();
+                        }
+                        return None;
+                    }
+                };
+                created[created_count] = (ppn, *idx);
+                created_count += 1;
                 *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
                 self.frames.push(frame);
             }
             ppn = pte.ppn();
         }
-        result
+        None
     }
     fn find_pte(&self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
         let idxs = vpn.indexes();
@@ -112,10 +123,6 @@ impl PageTable {
             ppn = pte.ppn();
         }
         result
-    }
-    #[allow(unused)]
-    pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
-        assert!(self.try_map(vpn, ppn, flags), "out of page-table frames");
     }
     pub fn try_map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
         let pte = match self.find_pte_create(vpn) {
@@ -233,7 +240,7 @@ fn ensure_user_page_mapped(table: &PageTable, va: usize, access: MapPermission) 
         if access != MapPermission::W || !entry.flags().contains(PTEFlags::U) {
             return false;
         }
-        // A kernel write into a MAP_PRIVATE buffer may need the same COW fault as a user store.
+        // Kernel copyout may need the same COW fault as a user store.
     }
     if let Some(task) = crate::task::current_task() {
         if let Some(process) = task.process.upgrade() {
@@ -272,7 +279,7 @@ pub fn translated_byte_buffer(
         }
         let first = va.page_offset();
         let count = (end - start).min(PAGE_SIZE - first);
-        pin_vma_page(token, va.floor());
+        pin_user_page(token, va.floor());
         buffers.push(UserSlice {
             ptr: (pa + first) as *mut u8,
             len: count,
@@ -346,22 +353,23 @@ pub fn translated_ref<T>(token: usize, ptr: *const T) -> &'static T {
     }
 }
 
-pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
-    match typed_user_addr::<T>(token, ptr as usize, MapPermission::W) {
-        Some(pa) => pa.get_mut(),
-        None => unsafe { &mut *(dummy_user_page() as *mut T) },
-    }
+pub(crate) fn try_translated_refmut<T>(token: usize, ptr: *mut T) -> Option<&'static mut T> {
+    typed_user_addr::<T>(token, ptr as usize, MapPermission::W).map(|pa| pa.get_mut())
 }
 
-// VMA pages can be unmapped while a blocking syscall sleeps. Hold the frame in
+pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
+    try_translated_refmut(token, ptr).unwrap_or_else(|| unsafe { &mut *(dummy_user_page() as *mut T) })
+}
+
+// User pages can be unmapped while a blocking syscall sleeps. Hold the frame in
 // the TCB rather than on the kernel stack, which is not unwound on task exit.
-fn pin_vma_page(token: usize, vpn: VirtPageNum) {
+fn pin_user_page(token: usize, vpn: VirtPageNum) {
     if let Some(task) = crate::task::current_task() {
         if let Some(process) = task.process.upgrade() {
             let page = {
                 let inner = process.inner_exclusive_access();
                 if inner.memory_set.token() == token {
-                    inner.memory_set.pin_vma_page(vpn)
+                    inner.memory_set.pin_user_page(vpn)
                 } else {
                     None
                 }

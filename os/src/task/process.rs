@@ -1,4 +1,4 @@
-use super::id::RecycleAllocator;
+use super::id::{try_kstack_alloc, RecycleAllocator};
 use super::manager::insert_into_pid2process;
 use super::TaskControlBlock;
 use super::{add_task, SignalFlags};
@@ -83,7 +83,7 @@ impl ProcessControlBlockInner {
     }
 
     pub fn thread_count(&self) -> usize {
-        self.tasks.len()
+        self.tasks.iter().filter(|task| task.is_some()).count()
     }
 
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
@@ -320,13 +320,15 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn fork(self: &Arc<Self>, stack: usize) -> Arc<Self> {
+    pub fn fork(self: &Arc<Self>, stack: usize) -> Result<usize, isize> {
         #[cfg(feature = "elf_startup_stats")]
         crate::fork_stats::begin();
         let mut parent = self.inner_exclusive_access();
-        assert_eq!(parent.thread_count(), 1);
-        // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
-        let memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        if parent.thread_count() != 1 {
+            return Err(-11); // EAGAIN
+        }
+        let kstack = try_kstack_alloc().ok_or(-12isize)?;
+        let memory_set = parent.memory_set.fork()?;
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table
@@ -380,7 +382,7 @@ impl ProcessControlBlock {
         // add child
         parent.children.push(Arc::clone(&child));
         // create main thread of child process
-        let task = Arc::new(TaskControlBlock::new(
+        let task = Arc::new(TaskControlBlock::for_fork(
             Arc::clone(&child),
             parent
                 .get_task(0)
@@ -389,9 +391,7 @@ impl ProcessControlBlock {
                 .as_ref()
                 .unwrap()
                 .ustack_base(),
-            // here we do not allocate trap_cx or ustack again
-            // but mention that we allocate a new kstack here
-            false,
+            kstack,
         ));
         // attach task to child process
         let mut child_inner = child.inner_exclusive_access();
@@ -411,7 +411,7 @@ impl ProcessControlBlock {
         add_task(task);
         #[cfg(feature = "elf_startup_stats")]
         crate::fork_stats::prepared(child.getpid());
-        child
+        Ok(child.getpid())
     }
 
     pub fn getpid(&self) -> usize {

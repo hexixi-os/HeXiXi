@@ -2,7 +2,10 @@ use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::mm::{MapPermission, VirtPageNum, VmaBacking, USER_END};
 use core::ops::Range;
 use crate::fs::{open_executable, Executable};
-use crate::mm::{translated_byte_buffer, translated_path, translated_ref, translated_refmut, UserBuffer};
+use crate::mm::{
+    translated_byte_buffer, translated_path, translated_ref, translated_refmut,
+    try_translated_refmut, UserBuffer,
+};
 use crate::task::{
     current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
     suspend_current_and_run_next, SignalFlags,
@@ -30,7 +33,11 @@ pub fn sys_getpid() -> isize {
 }
 
 pub fn sys_fork() -> isize {
-    current_process().fork(0).getpid() as isize
+    fork_with_stack(0)
+}
+
+pub(super) fn fork_with_stack(stack: usize) -> isize {
+    current_process().fork(stack).map(|pid| pid as isize).unwrap_or_else(|errno| errno)
 }
 
 pub fn sys_exec(path: *const u8, args: *const usize) -> isize {
@@ -143,7 +150,7 @@ fn script_interpreter(
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     let process = current_process();
     loop {
-        let mut inner = process.inner_exclusive_access();
+        let inner = process.inner_exclusive_access();
         if !inner
             .children
             .iter()
@@ -154,15 +161,18 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
         let pair = inner.children.iter().enumerate().find(|(_, p)| {
             p.inner_exclusive_access().is_zombie && (pid == -1 || pid as usize == p.getpid())
         });
-        if let Some((idx, _)) = pair {
-            let child = inner.children.remove(idx);
+        if let Some((idx, child)) = pair {
             let found_pid = child.getpid();
             let status = child.inner_exclusive_access().wait_status;
             let token = inner.memory_set.token();
             drop(inner);
             if !exit_code_ptr.is_null() {
-                *translated_refmut(token, exit_code_ptr) = status;
+                match try_translated_refmut(token, exit_code_ptr) {
+                    Some(out) => *out = status,
+                    None => return -14, // EFAULT
+                }
             }
+            process.inner_exclusive_access().children.remove(idx);
             return found_pid as isize;
         }
         drop(inner);

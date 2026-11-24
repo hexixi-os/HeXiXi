@@ -73,14 +73,23 @@ pub fn kernel_stack_position(kstack_id: usize) -> (usize, usize) {
 pub struct KernelStack(pub usize);
 
 pub fn kstack_alloc() -> KernelStack {
+    try_kstack_alloc().expect("out of kernel stack frames")
+}
+
+pub(super) fn try_kstack_alloc() -> Option<KernelStack> {
     let kstack_id = KSTACK_ALLOCATOR.exclusive_access().alloc();
     let (kstack_bottom, kstack_top) = kernel_stack_position(kstack_id);
-    KERNEL_SPACE.exclusive_access().insert_framed_area(
+    let mapped = KERNEL_SPACE.exclusive_access().try_insert_framed_area(
         kstack_bottom.into(),
         kstack_top.into(),
         MapPermission::R | MapPermission::W,
     );
-    KernelStack(kstack_id)
+    if mapped {
+        Some(KernelStack(kstack_id))
+    } else {
+        KSTACK_ALLOCATOR.exclusive_access().dealloc(kstack_id);
+        None
+    }
 }
 
 impl Drop for KernelStack {
@@ -90,6 +99,7 @@ impl Drop for KernelStack {
         KERNEL_SPACE
             .exclusive_access()
             .remove_area_with_start_vpn(kernel_stack_bottom_va.into());
+        KSTACK_ALLOCATOR.exclusive_access().dealloc(self.0);
     }
 }
 

@@ -1,5 +1,40 @@
 # 测试状态
 
+## 2026-11-24 PR-09 fork 写时复制
+
+`fork` 共享已驻留的私有用户页，覆盖用户栈、信号页、ELF 和匿名映射。父子任一侧写入时都会检查原映射权限。仍有其他引用的帧会复制，只剩当前映射引用的帧直接恢复可写。共享映射继续保持共享。子进程单独分配内核栈并复制 trap context。当前支持只有一个存活线程的进程执行 `fork`。
+
+`tools/oscomp/test_fork_cow.sh` 覆盖父子隔离、`mprotect`、内核写回与信号帧、`MAP_SHARED`、子进程回收和内存不足回滚。在 128 MiB QEMU 中，父进程驻留 40 MiB 后可完成 `fork→exec`。PR-08 在同一压力样本上复制页时耗尽物理帧。
+
+2025 年初赛 RISC-V64 官方原盘 `basic-musl` 为 **102/102**，32 个用例全部满分并正常关机。basic ABI、ELF 按需加载、文件 mmap/VMA、EXT4 页缓存和 easy-fs 文件读写回归通过。
+
+### fork→exec 对比
+
+用 QEMU 8.2.2、单核和 256 MiB，父进程预先写入 40 MiB 私有页，子进程立即执行另一份 ELF。两版各跑五轮，取中位数。延迟从 `fork` 入口计至新程序的第一次系统调用。峰值为这个区间内相对 `fork` 前新增的最多物理帧，包含页表、内核栈和地址空间所用帧。
+
+| 指标 | PR-08 `9f623f51`（已加同一套计数器） | PR-09 |
+|---|---:|---:|
+| 复制物理页 | 10,504 | 1 |
+| 额外峰值物理帧 | 10,540（41.17 MiB） | 277（1.08 MiB） |
+| `fork` 耗时 | 51.006 ms | 6.770 ms |
+| `fork→exec` 后首次系统调用 | 152.999 ms | 12.157 ms |
+
+在 PR-09 工作区用相同的测试脚本跑两版。日志中只取 `path=fork-cow-leaf` 的记录。
+
+```bash
+experiment=$(mktemp -d)
+git worktree add --detach "$experiment/eager-src" 9f623f51
+make -C "$experiment/eager-src" all ELF_STARTUP_STATS=1 KERNEL_OUT="$experiment/eager"
+make all ELF_STARTUP_STATS=1 KERNEL_OUT="$experiment/cow"
+for trial in 1 2 3 4 5; do
+    for mode in eager cow; do
+        log="$experiment/$mode-$trial.log"
+        FORK_BENCH_ONLY=1 QEMU_MEM=256M KERNEL="$experiment/$mode" tools/oscomp/test_fork_cow.sh "$log"
+        grep -a '^\[fork-cow\] path=fork-cow-leaf ' "$log"
+    done
+done
+```
+
 ## 2026-11-24 PR-08 ELF 按需加载
 
 EXT4 上的 `exec` 按区间读取 ELF 头和程序头，登记 `PT_LOAD` 的 VMA。缺页时，完整文件页与普通 `read/readv`、文件 `mmap` 共用页缓存。私有写入触发 COW，部分页和 BSS 按需分配并补零。内嵌程序直接使用内核内的字节，easy-fs 与 Overlay 继续以文件快照为输入。

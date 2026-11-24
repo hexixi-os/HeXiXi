@@ -58,8 +58,31 @@ impl TaskControlBlock {
         alloc_user_res: bool,
     ) -> Self {
         let res = TaskUserRes::new(Arc::clone(&process), ustack_base, alloc_user_res);
+        Self::with_resources(process, res, kstack_alloc())
+    }
+
+    pub(super) fn for_fork(
+        process: Arc<ProcessControlBlock>,
+        ustack_base: usize,
+        kstack: KernelStack,
+    ) -> Self {
+        let res = TaskUserRes::new(Arc::clone(&process), ustack_base, false);
+        Self::with_resources(process, res, kstack)
+    }
+
+    /// clone 线程专用：只分配 trap_cx，用户栈由调用者（musl）提供
+    pub fn new_thread(process: Arc<ProcessControlBlock>, ustack_base: usize) -> Self {
+        let res = TaskUserRes::new(Arc::clone(&process), ustack_base, false);
+        res.alloc_trap_cx_only();
+        Self::with_resources(process, res, kstack_alloc())
+    }
+
+    fn with_resources(
+        process: Arc<ProcessControlBlock>,
+        res: TaskUserRes,
+        kstack: KernelStack,
+    ) -> Self {
         let trap_cx_ppn = res.trap_cx_ppn();
-        let kstack = kstack_alloc();
         let kstack_top = kstack.get_top();
         Self {
             process: Arc::downgrade(&process),
@@ -78,29 +101,6 @@ impl TaskControlBlock {
         }
     }
 
-    /// clone 线程专用：只分配 trap_cx，用户栈由调用者（musl）提供
-    pub fn new_thread(process: Arc<ProcessControlBlock>, ustack_base: usize) -> Self {
-        let res = TaskUserRes::new(Arc::clone(&process), ustack_base, false);
-        res.alloc_trap_cx_only();
-        let trap_cx_ppn = res.trap_cx_ppn();
-        let kstack = kstack_alloc();
-        let kstack_top = kstack.get_top();
-        Self {
-            process: Arc::downgrade(&process),
-            kstack,
-            inner: unsafe {
-                UPSafeCell::new(TaskControlBlockInner {
-                    res: Some(res),
-                    trap_cx_ppn,
-                    task_cx: TaskContext::goto_trap_return(kstack_top),
-                    task_status: TaskStatus::Ready,
-                    exit_code: None,
-                    clear_child_tid: 0,
-                    user_io_frames: Vec::new(),
-                })
-            },
-        }
-    }
 }
 
 #[derive(Copy, Clone, PartialEq)]
