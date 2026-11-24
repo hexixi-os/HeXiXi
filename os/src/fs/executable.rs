@@ -39,6 +39,26 @@ impl Executable {
     }
 }
 
+/// 找可执行文件：先按名字直接找，找不到再依次试 `busybox`、`musl/busybox`。
+/// 官方评测盘里 busybox 在 `/musl/` 下，而内核环境变量是空的（没有 PATH），
+/// 所以 `execve("busybox")` / shebang 解析到 `/bin/sh` 时都得靠这个回退链。
+pub fn open_executable_with_fallback(name: &str) -> Result<Executable, isize> {
+    if let Ok(source) = open_executable(name) {
+        return Ok(source);
+    }
+    let base = name.rsplit('/').next().unwrap_or(name);
+    if base == "busybox" || base == "sh" {
+        for candidate in ["busybox", "musl/busybox"] {
+            if candidate != name {
+                if let Ok(source) = open_executable(candidate) {
+                    return Ok(source);
+                }
+            }
+        }
+    }
+    Err(-2)
+}
+
 pub fn open_executable(name: &str) -> Result<Executable, isize> {
     match overlay_get(name) {
         Some(OverlayEntry::File(data)) => {

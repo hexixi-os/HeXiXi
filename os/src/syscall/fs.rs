@@ -262,6 +262,8 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, _flags: u32) -> isize {
 
 /// chdir(49)：切换到解析后的目录。
 pub fn sys_chdir(path: *const u8) -> isize {
+    // 官方盘里 `cd ./basic` 要接在当前目录（musl）之后；
+    // pagecache 分支的 resolve_at 已经处理相对路径与 `.`/`..`，这里直接复用。
     let directory = match translated_path(current_user_token(), path)
         .and_then(|raw| resolve_at(AT_FDCWD, &raw))
         .and_then(|path| fs::working_directory(&path))

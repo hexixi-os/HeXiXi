@@ -9,7 +9,7 @@
 - 文件系统：只读 EXT4（评测盘）。写入的文件只存在内存里，重启就没了。
 - 单核，没有网卡驱动和网络协议栈，不支持动态链接。
 - 评测方式：QEMU 内核内嵌 runner，在官方布局盘上进入 `/musl` 执行原版 `basic_testcode.sh`，跑完关机。
-- **基线**：2025 官方发布的 RISC-V64 原盘已在本地 QEMU 上跑通 `basic-musl`。分数和失败用例见 [测试状态](docs/TEST_STATUS.md)。
+- **基线**：2025 官方发布的 RISC-V64 原盘已在本地 QEMU 上跑通 `basic-musl`（页缓存/CoW 分支）以及平铺布局盘（官方盘适配分支）。分数与失败用例见 [测试状态](docs/TEST_STATUS.md)。
 
 评测适配基于 `oscomp-adaptation`，`main` 为原版教学内核基线。
 

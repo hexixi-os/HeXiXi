@@ -19,9 +19,9 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m <mem> -nographic -smp <sm
 
 | 步骤 | 实现 |
 |---|---|
-| 读 EXT4 | `os/src/fs/ext4.rs` 按块组查找 inode，稀疏洞和未写入 extent 读为零 |
-| 选第一个进程 | `make all` 的 QEMU 评测构建先编译并内嵌 runner。`INITPROC` 识别官方布局后启动内嵌 runner |
-| 执行脚本 | runner 进入 `/musl`，调用盘里的 `busybox sh basic_testcode.sh`，保留原版 `basic-musl` 组标记和用例输出 |
+| 读 EXT4 | `os/src/fs/ext4.rs` 按块组查找 inode，稀疏洞和未写入 extent 读为零；文件页走页缓存 |
+| 选第一个进程 | `make all` 的 QEMU 评测构建先编译并内嵌 runner。`INITPROC`：盘里有 `oscomp_runner` 就启动它；都没有（官方盘就是这样）则用编进内核的 runner，并把工作目录设为 `musl/` |
+| 执行脚本 | `user/src/bin/oscomp_runner.rs` 优先用盘里的 `busybox sh` 逐个执行 `*_testcode.sh`，保留原版组标记和用例输出 |
 | 写文件 | EXT4 是只读的，写入走内存 overlay（`os/src/fs/mod.rs`），重启就没了 |
 | 关机 | 第一个进程以 0 退出，内核调用 `exit_success` |
 

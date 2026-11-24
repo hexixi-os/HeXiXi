@@ -93,6 +93,7 @@ endif
 
 kernel:
 	@echo Platform: $(BOARD)
+	@$(MAKE) -C ../user elf
 	@cp src/linker-$(BOARD).ld src/linker.ld
 	@cargo build --release --features "$(FEATURES)"
 	@rm src/linker.ld

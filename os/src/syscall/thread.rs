@@ -131,8 +131,11 @@ pub fn sys_clone_thread(flags: usize, stack: usize, ptid: usize, tls: usize, cti
     *new_cx = parent_cx;
     // 关键：内核栈必须是新线程自己的，否则切换过去会踩父线程的栈
     new_cx.kernel_sp = new_task.kstack.get_top();
-    // 子线程从 ecall 之后继续，返回 0；栈/线程指针由调用者给出
-    new_cx.x[2] = stack;
+    // 子线程从 ecall 之后继续，返回 0；栈/线程指针由调用者给出。
+    // oscomp 的 test_clone 传的是 `&stack[1024]`（数组末尾，即栈顶），
+    // RISC-V 的 sp 必须 16 字节对齐，且栈向下生长 —— 这里对齐到 16，
+    // 避免第一次 push 越过映射边界触发 StorePageFault。
+    new_cx.x[2] = stack & !0xf;
     new_cx.x[4] = tls;
     new_cx.x[10] = 0;
     new_tid as isize

@@ -1,7 +1,8 @@
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::mm::{MapPermission, VirtPageNum, VmaBacking, USER_END};
 use core::ops::Range;
-use crate::fs::{open_executable, Executable};
+use crate::fs::executable::{open_executable, open_executable_with_fallback};
+use crate::fs::Executable;
 use crate::mm::{
     translated_byte_buffer, translated_path, translated_ref, translated_refmut,
     try_translated_refmut, UserBuffer,
@@ -40,7 +41,21 @@ pub(super) fn fork_with_stack(stack: usize) -> isize {
     current_process().fork(stack).map(|pid| pid as isize).unwrap_or_else(|errno| errno)
 }
 
-pub fn sys_exec(path: *const u8, args: *const usize) -> isize {
+/// 找 busybox 的位置：当前目录 -> 根目录 -> musl/（官方评测盘里它在 /musl/ 下）。
+/// 脚本里常 cd 进子目录（如 musl/basic）再执行 `#!/bin/sh` 脚本，所以不能只看当前目录。
+fn find_busybox() -> Option<String> {
+    let resolved = crate::fs::resolve_path("busybox").ok();
+    let candidates: Vec<String> = resolved
+        .into_iter()
+        .chain([
+            String::from("busybox"),
+            String::from("musl/busybox"),
+        ])
+        .collect();
+    candidates.into_iter().find(|p| crate::fs::exists(p.as_str()))
+}
+
+pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
     let token = current_user_token();
     let raw_path = match translated_path(token, path) {
         Ok(path) => path,
@@ -63,6 +78,8 @@ pub fn sys_exec(path: *const u8, args: *const usize) -> isize {
     let prefix_len = source.read_at(0, &mut prefix);
     let prefix = &prefix[..prefix_len];
     let (source, args) = if prefix.starts_with(b"#!") {
+        // 官方脚本里常写 `busybox mkdir ...`（不带 ./），busybox sh 靠 PATH 去找，
+        // 而内核环境变量是空的；脚本解释器统一走 script_interpreter() 的多处查找。
         match script_interpreter(prefix, prefix_len < source.len(), raw_path, args) {
             Ok(interpreter) => interpreter,
             Err(errno) => return errno,
@@ -123,16 +140,10 @@ fn script_interpreter(
     let (program, argument, source) = match open_executable(name) {
         Ok(source) => (name, argument, source),
         Err(_) => {
-            let (program, source) = open_executable("busybox")
-                .map(|source| ("busybox", source))
-                .or_else(|errno| {
-                    if interpreter == "/bin/sh" {
-                        open_executable("musl/busybox").map(|source| ("/musl/busybox", source))
-                    } else {
-                        Err(errno)
-                    }
-                })?;
-            (program, argument.or(Some("sh")), source)
+            // 官方盘：解释器在 /musl/busybox（也可能在 /busybox），逐个回退找
+            let found = open_executable_with_fallback(name)
+                .or_else(|_| open_executable_with_fallback("busybox"))?;
+            ("busybox", argument.or(Some("sh")), found)
         }
     };
     let mut new_args = Vec::with_capacity(args.len() + 3);

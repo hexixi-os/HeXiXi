@@ -146,6 +146,8 @@ tools/oscomp/score_basic.sh ~/oscomp-work/local/basic.log
 
 原盘回归使用 `tools/oscomp/run_official_basic.sh` 生成串口、判分和运行元数据。下载与复跑步骤见 [官方盘回归](oscomp-evaluation.md#官方盘回归)，实测结果见 [测试状态](TEST_STATUS.md)。
 
+真实官方盘上：盘里没有 `oscomp_runner` 时使用编进内核的那份，工作目录设为 `musl/`；glibc 部分没跑（需要动态链接）。跑完整一轮要二十多分钟，超时请给 2400 秒以上。
+
 ### 从旧版 Docker 环境生成评测布局（历史记录）
 
 需要 Docker Desktop（在 Windows 里运行，WSL 里没有装 docker）。构建产物约 1 GB 压缩、4 GB 解压，耗时十几分钟，注意 D 盘空间。官方套件 `~/testsuits` 要先用 `setup.sh` 准备好。
