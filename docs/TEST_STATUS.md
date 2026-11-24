@@ -254,3 +254,26 @@ Martyr 的内核基于 `3bf874f` 加未提交的稀疏文件修复，以下分�
 ## wonder-world 文档里提到、仍未验证的限制
 
 信号返回上下文被破坏会让 lmbench 的 `lat_ctx` 等子进程崩溃；单核调度下 cyclictest 压力阶段超时；没有动态链接；没有网卡和 TCP/IP 栈。
+
+## 2026-11-24 合并分支实测（feat/official-disk + page-cache）
+
+`feat/integrated` 分支（合并提交 `e24ac4b0`）把官方盘适配与页缓存/CoW/mmap 两条线合到一起。
+以下是合并后内核在本地官方布局 basic 盘上的实测（官方 `test_runner.py` 判分）：
+
+| 组 | 结果 | 说明 |
+|---|---|---|
+| basic | **94/102**（29/32 用例满分） | 剩余：`test_openat` 2/4、`test_clone` 1/4、`test_open` 0/3 |
+| lua | 9/9 | |
+| busybox | 51/55 | 失败：`which ls`、`hwclock`、`mv`、`rmdir` |
+| libctest | 94 用例 / 88 Pass | 与各分支单独版本一致，无回归 |
+| cyclictest | 4/4 success | 无回归 |
+| iozone / libcbench | 跑完 + 自动关机 | libcbench 27 个 benchmark |
+| unixbench | 17 结果行 + 自动关机 | DHRY2 63.7M lps、SYSCALL 246K lps、EXEC 4.0K lps |
+| lmbench | 13 项数字 + 自动关机 | fork+execve 1346 µs、write 带宽 290 MB/s |
+| ltp | 162 用例 / TPASS 4 | 与内核无关：本分支把 LTP 临时目录落到 `/dev/shm`，而内核没有 tmpfs |
+
+合并后的性能明显好于两条分支单独版本（fork+execve 3846→1346 µs，写带宽 66→290 MB/s），
+主要来自 EXT4 页缓存、ELF 按需加载和 fork 写时复制。
+
+剩余待修：`test_open` 输出正确但判分 0/3、`test_openat` 的 `openat(fd, ...)` 返回 ENOTDIR、
+`test_clone` 在 `stval=0xffffffffffffffe8` 处 StorePageFault。
