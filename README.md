@@ -19,7 +19,7 @@
 
 ### 官方盘
 
-使用 2025 初赛原盘及同一版本的测试套件，完整步骤见 [官方盘回归](docs/oscomp-evaluation.md#官方盘回归)。
+使用 2025 初赛原盘及同一版本的测试套件。下载步骤见 [官方盘回归](docs/oscomp-evaluation.md#官方盘回归)，全部 24 项的复跑方法见 [完整评测矩阵](docs/oscomp-evaluation.md#完整评测矩阵)。
 
 ```bash
 SUITE=~/testsuits-pre-20250615 tools/oscomp/run_official_basic.sh ~/sdcard-rv.img ~/oscomp-work/official-basic

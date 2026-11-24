@@ -144,7 +144,7 @@ tools/oscomp/score_basic.sh ~/oscomp-work/local/basic.log
 
 官方的运行命令见 [oscomp-evaluation.md](oscomp-evaluation.md)。
 
-原盘回归使用 `tools/oscomp/run_official_basic.sh` 生成串口、判分和运行元数据。下载与复跑步骤见 [官方盘回归](oscomp-evaluation.md#官方盘回归)，实测结果见 [测试状态](TEST_STATUS.md)。
+原盘 basic-musl 回归使用 `tools/oscomp/run_official_basic.sh`。全部 24 项由 `tools/oscomp/run_official_matrix.py` 独立启动并记录串口、判分和运行元数据。下载与复跑步骤见 [官方盘回归](oscomp-evaluation.md#官方盘回归)和[完整评测矩阵](oscomp-evaluation.md#完整评测矩阵)，实测结果见 [测试状态](TEST_STATUS.md)。
 
 ### 从旧版 Docker 环境生成评测布局（历史记录）
 
