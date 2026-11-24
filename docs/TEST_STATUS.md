@@ -1,5 +1,23 @@
 # 测试状态
 
+## 2026-11-24 PR-14 可写 Overlay
+
+在 QEMU 8.2.2 单核、768 MiB 内存和只读 EXT4 测试盘上运行 `tools/oscomp/test_overlay_fs.sh`。PR-13 在写到 1 MiB 时复现 `EFBIG`。PR-14 顺序写入 100 MiB 并读回文件末页，随后在 2 GiB 以上的偏移写入并读回稀疏文件。测试盘在退出前后的 SHA-256 一致。
+
+- 数据页预算为探测到的 RAM 四分之一，最多 128 MiB。硬上限覆盖所有上层文件、映射页及 Overlay ELF 快照，写满时返回短写或 `ENOSPC`。目录项和存活 inode 各限 16,384，命名路径总长限 2 MiB。专项覆盖预算耗尽、解除映射或删除目录项后的恢复。
+- 普通读写、追加和 `MAP_SHARED` 使用同一份上层数据。`truncate`、`ftruncate` 和 `O_TRUNC` 更新长度，清零截断尾部并移除各进程超出新 EOF 的驻留页。越界访问触发 `SIGBUS`，扩长后原映射可重新缺页。文件页预算耗尽时，共享缺页同样触发 `SIGBUS`。
+- 覆盖相对 dirfd 的重命名、覆盖已有文件、`RENAME_NOREPLACE`、上层目录移动后的旧 dirfd 与 cwd、unlink 后的打开描述符和映射、`O_TMPFILE` 回收，以及下层正规文件按需复制与旧路径遮蔽。大稀疏 Overlay ELF 快照只复制驻留数据页，上层 `#!` 脚本也能通过同一解释器启动。
+
+EXT4 下层以只读方式使用，上层数据随关机丢失。复制发生前打开的只读 fd 继续读取下层。同一映射的共享页在首次访问时计入数据预算。`msync` 校验地址区间和参数，内存内的共享写入即时可见。下层目录移动返回 `EXDEV`，无名临时文件当前只能通过 fd 或映射访问。
+
+| 回归 | 结果 |
+| --- | --- |
+| Overlay、basic ABI、mmap/VMA、fork COW、ELF 按需加载、页缓存 | 通过 |
+| musl/glibc 动态 ELF、pthread、glibc 动态 BusyBox | 通过 |
+| easy-fs `usertests` | 29 项成功用例、8 项预期失败，1,000 轮管道测试完成 |
+| 官方原盘 basic-musl / basic-glibc | 最新一次均为 102/102。glibc 外层脚本仍退出 139。重复运行中，`test_pipe` 的父子输出可能交错，PR-13 和 PR-14 均复现了这一判分波动。 |
+| 官方原盘 iozone-musl / iozone-glibc | 各 20 个判分项均为 0 分。两个 ELF 的 `PT_INTERP` 指向原盘缺失的 `/lib` 路径。glibc 脚本也出现低地址取指异常并退出 139。 |
+
 ## 2026-11-24 PR-13 Linux 线程与进程 ABI
 
 QEMU 8.2.2 单核下，动态链接的 musl 1.2.0 和 glibc 2.31 各通过 16 轮、每轮 8 个并发线程的回归。每个线程执行 256 次互斥计数操作，条件变量同步启动，逐个检查 `pthread_join` 返回值、独立 TLS、TID 和共享 pipe 描述符。glibc 版动态 BusyBox 也通过 `sh -c` 启动并执行外部 `true`。
@@ -144,7 +162,7 @@ done
 
 ## 2026-11-24 PR-08 ELF 按需加载
 
-EXT4 上的 `exec` 按区间读取 ELF 头和程序头，登记 `PT_LOAD` 的 VMA。缺页时，完整文件页与普通 `read/readv`、文件 `mmap` 共用页缓存。私有写入触发 COW，部分页和 BSS 按需分配并补零。内嵌程序直接使用内核内的字节，easy-fs 与 Overlay 继续以文件快照为输入。
+EXT4 上的 `exec` 按区间读取 ELF 头和程序头，登记 `PT_LOAD` 的 VMA。缺页时，完整文件页与普通 `read/readv`、文件 `mmap` 共用页缓存。私有写入触发 COW，部分页和 BSS 按需分配并补零。内嵌程序直接使用内核内的字节，easy-fs 与 Overlay 使用文件快照。PR-14 之后，Overlay 快照按页保存稀疏内容。
 
 `tools/oscomp/test_elf_demand.sh` 覆盖非页对齐的段、同页相邻段、BSS、文件页写隔离、`mprotect` 后的缺页、内核向未驻留 BSS 写入，以及无效 ELF 和 `argv`。官方盘的 basic-musl ELF 含 `PT_INTERP`，保留直接进入 `e_entry` 的兼容路径。通用动态链接仍待适配。
 
@@ -180,7 +198,7 @@ done
 
 2025 年初赛 RISC-V64 官方原盘的 `basic-musl` 在 QEMU 8.2.2、单核和 1 GiB 内存下达到 **102/102**，32 个用例全部满分并正常关机。`clone` 采用调用者指定的子栈，`mkdir` 可以创建并打开目录，`unlink` 按当前工作目录或目录 fd 解析路径。
 
-`tools/oscomp/test_basic_abi.sh` 用独立 EXT4 镜像验证 `write/writev` 跨 1 MiB 上限短写、上限后的 `EFBIG`、目录创建和枚举、删除后继续使用已打开的文件、只读 EXT4 目录项遮蔽、异常路径和目录删除后重建。进程 `clone` 的子栈用独立用例校验。
+`tools/oscomp/test_basic_abi.sh` 用独立 EXT4 镜像验证 `write/writev` 跨越 1 MiB 偏移的读写一致性、目录创建和枚举、删除后继续使用已打开的文件、只读 EXT4 目录项遮蔽、异常路径和目录删除后重建。进程 `clone` 的子栈用独立用例校验。
 
 ## 2026-11-23 PR-06 统一文件页缓存
 
@@ -205,7 +223,7 @@ QEMU 8.2.2 上用最终内核连续运行两次官方 RISC-V64 `basic-musl`，�
 
 在 Linux 或 WSL2 上用 `tools/oscomp/test_mmap_vma.sh` 可构建并启动专用 EXT4 测试盘。它覆盖六参数 `mmap`、非零文件偏移、关闭 fd 后访问、私有隔离、共享 overlay 与普通 I/O 一致、局部 `munmap`、局部 `mprotect`、固定地址替换，以及文件末页补零和跨 EOF 整页的 `SIGBUS`。测试同时检查 `waitpid` 的信号状态和共享缓冲区重叠时的文件读写。 [mmap(2)](https://man7.org/linux/man-pages/man2/mmap.2.html) · [mprotect(2)](https://man7.org/linux/man-pages/man2/mprotect.2.html)
 
-当前可写文件共享映射支持内存 overlay。私有页在缺页时读取到独立帧。overlay 存在活动映射时，缩短文件或以 `O_TRUNC` 打开返回 `EBUSY`。`munmap` 和 `MAP_FIXED` 操作动态 VMA，ELF 装载段和任务资源由各自的生命周期管理。
+可写文件共享映射由内存 Overlay 提供。私有映射使用写时复制。PR-14 之后，缩短文件会撤销超出新 EOF 的整页映射，之后触发访问的进程收到 `SIGBUS`。`munmap` 和 `MAP_FIXED` 操作动态 VMA，ELF 装载段和任务资源由各自的生命周期管理。
 
 ## 2026-11-23 PR-04 EXT4 区间读取
 

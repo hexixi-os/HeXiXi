@@ -412,7 +412,7 @@ impl File for Ext4File {
     fn mapping_size(&self) -> Option<usize> {
         self.inode.is_file().then(|| self.size())
     }
-    fn mapping_page(&self, offset: usize) -> Option<Arc<FrameTracker>> {
+    fn mapping_page(&self, offset: usize, _shared: bool) -> Option<Arc<FrameTracker>> {
         self.cached_page(offset)
     }
     fn seek_to(&self, pos: isize) -> isize {

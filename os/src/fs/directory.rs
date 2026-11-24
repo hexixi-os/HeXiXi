@@ -1,14 +1,17 @@
-use super::File;
+use super::{
+    overlay::{directory_identity, OverlayDirectory},
+    File,
+};
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
-use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::{borrow::Cow, string::String};
 
 #[derive(Clone)]
 pub(super) enum DirectoryIdentity {
     Permanent,
     Lower,
-    Upper(Arc<()>),
+    Upper(Arc<OverlayDirectory>),
 }
 
 #[derive(Clone)]
@@ -24,13 +27,20 @@ impl DirectoryLocation {
 
     pub(super) fn new(path: &str, identity: DirectoryIdentity) -> Self {
         Self {
-            path: String::from(path),
+            path: if matches!(identity, DirectoryIdentity::Upper(_)) {
+                String::new()
+            } else {
+                String::from(path)
+            },
             identity,
         }
     }
 
-    pub fn path(&self) -> &str {
-        &self.path
+    pub fn path(&self) -> Cow<'_, str> {
+        match &self.identity {
+            DirectoryIdentity::Upper(dir) => Cow::Owned(dir.path.exclusive_access().clone()),
+            _ => Cow::Borrowed(&self.path),
+        }
     }
 }
 
@@ -80,6 +90,17 @@ impl File for DirectoryFile {
 
     fn directory(&self) -> Option<&DirectoryFile> {
         Some(self)
+    }
+
+    fn stat_identity(&self) -> Option<(u64, u64)> {
+        match &self.location.identity {
+            DirectoryIdentity::Upper(dir) => Some(directory_identity(dir)),
+            _ => None,
+        }
+    }
+
+    fn link_count(&self) -> u32 {
+        u32::from(super::directory_is_live(&self.location))
     }
 
     fn size(&self) -> usize {

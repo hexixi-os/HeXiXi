@@ -407,6 +407,25 @@ pub fn sys_munmap(addr: usize, len: usize) -> isize {
     result.err().unwrap_or(0)
 }
 
+pub fn sys_msync(addr: usize, len: usize, flags: usize) -> isize {
+    const MS_ASYNC: usize = 1;
+    const MS_INVALIDATE: usize = 2;
+    const MS_SYNC: usize = 4;
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+        || flags & (MS_ASYNC | MS_SYNC) == (MS_ASYNC | MS_SYNC)
+    {
+        return -22;
+    }
+    let size = if len == 0 { Some(0) } else { round_mapping_size(len) };
+    let range = match size.and_then(|size| page_range(addr, size)) {
+        Some(range) => range,
+        None => return -22,
+    };
+    // Shared file mappings and ordinary I/O already access the same volatile data pages.
+    current_process().inner_exclusive_access().memory_set
+        .check_user_range(&range, MapPermission::empty()).err().unwrap_or(0)
+}
+
 /// sched_getparam(123)：写一个 4 字节的 sched_priority
 pub fn sys_sched_getparam(param: *mut u8) -> isize {
     if param.is_null() {

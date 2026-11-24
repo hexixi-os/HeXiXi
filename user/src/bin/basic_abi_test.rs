@@ -15,7 +15,7 @@ const O_CREAT: usize = 0o100;
 const O_EXCL: usize = 0o200;
 const O_TRUNC: usize = 0o1000;
 const O_RDWR: usize = 2;
-const OVERLAY_LIMIT: usize = 1024 * 1024;
+const CROSS_PAGE: usize = 1024 * 1024;
 
 fn syscall(number: usize, args: [usize; 4]) -> isize {
     let result;
@@ -39,7 +39,7 @@ fn unlinkat(dir: isize, path: &str, flags: usize) -> isize {
     syscall(35, [dir as usize, path.as_ptr() as usize, flags, 0])
 }
 
-fn write_cap(vectored: bool) {
+fn write_across_pages(vectored: bool) {
     let path = if vectored {
         "writev-probe\0"
     } else {
@@ -48,10 +48,10 @@ fn write_cap(vectored: bool) {
     let fd = openat(AT_FDCWD, path, O_CREAT | O_RDWR);
     assert!(fd >= 0);
     let fd = fd as usize;
-    assert_eq!(syscall(46, [fd, OVERLAY_LIMIT - 8, 0, 0]), 0);
+    assert_eq!(syscall(46, [fd, CROSS_PAGE - 8, 0, 0]), 0);
     assert_eq!(
-        syscall(62, [fd, OVERLAY_LIMIT - 8, 0, 0]),
-        (OVERLAY_LIMIT - 8) as isize
+        syscall(62, [fd, CROSS_PAGE - 8, 0, 0]),
+        (CROSS_PAGE - 8) as isize
     );
     let bytes = *b"0123456789ABCDEF";
     let iov = [
@@ -65,17 +65,16 @@ fn write_cap(vectored: bool) {
             write(fd, &bytes)
         }
     };
-    assert_eq!(put(), 8, "write crossing the overlay file limit");
-    assert_eq!(put(), -27, "nonempty write at the overlay file limit");
+    assert_eq!(put(), 16, "write across the former 1 MiB limit");
     assert_eq!(write(fd, &[]), 0);
     assert_eq!(syscall(66, [fd, iov.as_ptr() as usize, 0, 0]), 0);
     assert_eq!(
-        syscall(62, [fd, OVERLAY_LIMIT - 8, 0, 0]),
-        (OVERLAY_LIMIT - 8) as isize
+        syscall(62, [fd, CROSS_PAGE - 8, 0, 0]),
+        (CROSS_PAGE - 8) as isize
     );
     let mut actual = [0; 16];
-    assert_eq!(read(fd, &mut actual), 8);
-    assert_eq!(&actual[..8], &bytes[..8]);
+    assert_eq!(read(fd, &mut actual), 16);
+    assert_eq!(actual, bytes);
     assert_eq!(close(fd), 0);
 }
 
@@ -266,8 +265,8 @@ fn check(name: &str, test: impl FnOnce()) -> bool {
 
 #[no_mangle]
 fn main() -> i32 {
-    let write = check("write", || write_cap(false));
-    let writev = check("writev", || write_cap(true));
+    let write = check("write", || write_across_pages(false));
+    let writev = check("writev", || write_across_pages(true));
     let mkdir = check("mkdirat", directories);
     let unlink = check("unlinkat", unlink_files);
     let clone = check("clone", clone_stack);

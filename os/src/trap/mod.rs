@@ -110,7 +110,7 @@ pub fn trap_handler() -> ! {
                     unsafe { asm!("sfence.vma"); }
                     trap_return();
                 }
-                PageFault::BeyondEof => handle_user_fault(scause.cause(), stval, SignalFlags::SIGBUS),
+                PageFault::FileUnavailable => handle_user_fault(scause.cause(), stval, SignalFlags::SIGBUS),
                 PageFault::Invalid => handle_user_fault(scause.cause(), stval, SignalFlags::SIGSEGV),
             }
         }

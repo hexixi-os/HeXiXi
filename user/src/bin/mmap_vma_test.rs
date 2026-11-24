@@ -215,11 +215,6 @@ fn main() -> i32 {
     }
     assert_eq!(load(mirror), b'B');
 
-    assert_eq!(syscall(46, [fd as usize, 1, 0, 0, 0, 0]), -16);
-    assert_eq!(
-        open("mmap-shared.bin\0", OpenFlags::RDWR | OpenFlags::TRUNC),
-        -16
-    );
     store(shared + 3, b'Y');
     assert_eq!(syscall(64, [fd as usize, shared + 3, 1, 0, 0, 0]), 1);
     assert_eq!(load(shared + 3), b'Y');
@@ -231,8 +226,13 @@ fn main() -> i32 {
     assert_eq!(syscall(62, [fd as usize, 0, 0, 0, 0, 0]), 0);
     assert_eq!(syscall(64, [fd as usize, shared + 1, 2, 0, 0, 0]), 2);
     assert_eq!((load(shared), load(shared + 1)), (b'a', b'X'));
+    assert_eq!(syscall(46, [fd as usize, 1, 0, 0, 0, 0]), 0);
+    assert_eq!((load(shared), load(shared + 1)), (b'a', 0));
+    let truncated = open("mmap-shared.bin\0", OpenFlags::RDWR | OpenFlags::TRUNC);
+    assert!(truncated >= 0);
+    expect_signal(shared, false, 7);
+    assert_eq!(close(truncated as usize), 0);
     assert_eq!(munmap(shared, PAGE), 0);
-    assert_eq!(syscall(46, [fd as usize, 0, 0, 0, 0, 0]), 0);
 
     let three = mmap(0, 3 * PAGE, READ | WRITE, PRIVATE | ANONYMOUS, -1, 0);
     assert!(three > 0);

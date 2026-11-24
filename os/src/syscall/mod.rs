@@ -27,6 +27,7 @@ const SYSCALL_GET_ROBUST_LIST: usize = 100;
 const SYSCALL_SIGALTSTACK: usize = 132;
 const SYSCALL_GETRUSAGE: usize = 165;
 const SYSCALL_MPROTECT: usize = 226;
+const SYSCALL_MSYNC: usize = 227;
 const SYSCALL_MADVISE: usize = 233;
 const SYSCALL_GETRANDOM: usize = 278;
 const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
@@ -161,11 +162,13 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     match syscall_id {
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1], args[2]),
         SYSCALL_UTIMENSAT => sys_utimensat(args[1] as *const u8),
-        SYSCALL_RENAMEAT => sys_renameat(args[1] as *const u8, args[3] as *const u8),
-        SYSCALL_RENAMEAT2 => sys_renameat(args[1] as *const u8, args[3] as *const u8),
+        SYSCALL_RENAMEAT | SYSCALL_RENAMEAT2 => sys_renameat(
+            args[0] as isize, args[1] as *const u8, args[2] as isize, args[3] as *const u8,
+            if syscall_id == SYSCALL_RENAMEAT2 { args[4] } else { 0 },
+        ),
         SYSCALL_STATFS | SYSCALL_FSTATFS => sys_statfs(args[1] as *mut u8),
-        SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1]),
-        SYSCALL_TRUNCATE => sys_truncate(),
+        SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as isize),
+        SYSCALL_TRUNCATE => sys_truncate(args[0] as *const u8, args[1] as isize),
         SYSCALL_IOCTL => sys_ioctl(),
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_FUTEX => futex::sys_futex(args),
@@ -184,6 +187,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_GETRUSAGE => sys_getrusage(args[1] as *mut u8),
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1]),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
+        SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2]),
         SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
             args[0] as *const u8,
             args[1] as *mut u8,

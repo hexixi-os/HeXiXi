@@ -9,6 +9,7 @@ mod vma;
 
 use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+pub(crate) use frame_allocator::frame_alloc_charged;
 pub use frame_allocator::{frame_alloc, frame_dealloc, free_pages, ram_end, set_ram_end, FrameTracker};
 pub use memory_set::handle_user_page_fault;
 pub use memory_set::remap_test;

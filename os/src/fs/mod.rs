@@ -14,7 +14,7 @@ pub use directory::{DirectoryFile, DirectoryLocation};
 pub use executable::{open_executable, Executable};
 use overlay::{
     overlay_children, overlay_create, overlay_get, overlay_mkdir, overlay_rename, overlay_unlink,
-    OverlayData, OverlayEntry, OverlayFile,
+    new_file as overlay_new_file, resize as overlay_resize, OverlayData, OverlayEntry, OverlayFile,
 };
 
 pub trait File: Send + Sync {
@@ -31,13 +31,13 @@ pub trait File: Send + Sync {
     fn mapping_size(&self) -> Option<usize> {
         None
     }
-    fn mapping_lease(&self) -> Option<Arc<()>> {
-        None
+    fn link_count(&self) -> u32 {
+        1
     }
     fn supports_mapped_writes(&self) -> bool {
         false
     }
-    fn mapping_page(&self, _offset: usize) -> Option<Arc<FrameTracker>> {
+    fn mapping_page(&self, _offset: usize, _shared: bool) -> Option<Arc<FrameTracker>> {
         None
     }
     /// 文件大小（fstat/mmap 需要）
@@ -54,7 +54,7 @@ pub trait File: Send + Sync {
     }
     /// 修改文件长度（truncate/ftruncate），返回 0 成功
     fn set_len(&self, _len: usize) -> isize {
-        0
+        -22
     }
     /// 非阻塞探测：是否有数据可读（select/pselect 用；普通文件恒为 true）
     fn poll_readable(&self) -> bool {
@@ -134,28 +134,6 @@ impl File for ZeroFile {
     }
 }
 
-/// 读出整个文件（内核内部用，例如 exec 加载 ELF）
-pub fn read_file_all(name: &str) -> Option<Vec<u8>> {
-    read_file_all_inner(name)
-}
-
-fn read_file_all_inner(name: &str) -> Option<Vec<u8>> {
-    if let Some(v) = virtual_file(name) {
-        return Some(v);
-    }
-    match overlay_get(name) {
-        Some(OverlayEntry::File(data)) => return Some(data.exclusive_access().read_all()),
-        Some(_) => return None,
-        None => {}
-    }
-    if let Some(fs) = EXT4.as_ref() {
-        let inode = lower_inode(name)?;
-        (!inode.is_dir()).then(|| fs.read_file(&inode))
-    } else {
-        open_file(name, OpenFlags::RDONLY).map(|i| i.read_all())
-    }
-}
-
 /// An upper-layer directory has its own children. A whiteout or regular file
 /// at an ancestor likewise makes the corresponding lower subtree unreachable.
 fn lower_inode(name: &str) -> Option<ext4::Inode> {
@@ -219,8 +197,8 @@ pub fn directory_is_live(directory: &DirectoryLocation) -> bool {
     let path = directory.path();
     match &directory.identity {
         DirectoryIdentity::Permanent => true,
-        DirectoryIdentity::Lower => overlay_get(path).is_none() && !lower_ancestor_is_hidden(path),
-        DirectoryIdentity::Upper(opened) => match overlay_get(path) {
+        DirectoryIdentity::Lower => overlay_get(&path).is_none() && !lower_ancestor_is_hidden(&path),
+        DirectoryIdentity::Upper(opened) => match overlay_get(&path) {
             Some(OverlayEntry::Directory(current)) => Arc::ptr_eq(opened, &current),
             _ => false,
         },
@@ -242,8 +220,8 @@ pub fn working_directory(name: &str) -> Result<DirectoryLocation, isize> {
 }
 
 fn open_overlay(data: OverlayData, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sync>, isize> {
-    if flags.contains(OpenFlags::TRUNC) && !data.exclusive_access().resize(0) {
-        return Err(-16);
+    if flags.contains(OpenFlags::TRUNC) {
+        overlay_resize(&data, 0);
     }
     Ok(Arc::new(OverlayFile::new(data, flags)))
 }
@@ -268,6 +246,17 @@ pub fn open_dyn(name: &str, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sy
     let exclusive = flags.contains(OpenFlags::CREATE | OpenFlags::EXCL);
     let directory = flags.contains(OpenFlags::DIRECTORY);
 
+    if flags.contains(OpenFlags::TMPFILE) {
+        if !flags.intersects(OpenFlags::WRONLY | OpenFlags::RDWR) || create {
+            return Err(-22);
+        }
+        require_directory(name)?;
+        if !has_ext4() || is_virtual_namespace(name) {
+            return Err(-95);
+        }
+        return open_overlay(overlay_new_file(None, false)?, flags);
+    }
+
     if is_root_path(name) || matches!(name, "proc" | "dev") {
         return open_directory(name, flags, DirectoryIdentity::Permanent);
     }
@@ -285,26 +274,17 @@ pub fn open_dyn(name: &str, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sy
         if exclusive || directory {
             return Err(if exclusive { -17 } else { -20 });
         }
-        if name == PAGE_CACHE_PATH {
-            if flags.intersects(OpenFlags::WRONLY | OpenFlags::RDWR | OpenFlags::TRUNC) {
-                return Err(-30); // EROFS
-            }
-            return Ok(Arc::new(ProcSnapshot {
-                bytes: v,
-                offset: unsafe { UPSafeCell::new(0) },
-            }));
+        if flags.intersects(OpenFlags::WRONLY | OpenFlags::RDWR | OpenFlags::TRUNC) {
+            return Err(-30);
         }
-        let data = overlay_create(name);
-        {
-            let mut data = data.exclusive_access();
-            if !data.resize(v.len()) {
-                return Err(-16);
-            }
-            if data.write_at(0, &v) != v.len() {
-                return Err(-12);
-            }
-        }
-        return Ok(Arc::new(OverlayFile::new(data, flags)));
+        return Ok(Arc::new(ProcSnapshot {
+            bytes: v,
+            offset: unsafe { UPSafeCell::new(0) },
+        }));
+    }
+
+    if is_virtual_namespace(name) {
+        return Err(if create { -30 } else { -2 });
     }
 
     let upper = overlay_get(name);
@@ -333,18 +313,21 @@ pub fn open_dyn(name: &str, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sy
             if directory {
                 return Err(-20);
             }
-            if !create {
-                if flags.intersects(OpenFlags::WRONLY | OpenFlags::RDWR | OpenFlags::TRUNC) {
-                    return Err(-30);
-                }
+            if !flags.intersects(OpenFlags::WRONLY | OpenFlags::RDWR | OpenFlags::TRUNC) {
                 return Ok(Arc::new(ext4::Ext4File::new(Arc::clone(fs), inode)));
             }
+            if !inode.is_file() {
+                return Err(-30);
+            }
+            let lower = (!flags.contains(OpenFlags::TRUNC))
+                .then(|| ext4::Ext4File::new(Arc::clone(fs), inode));
+            return open_overlay(overlay_create(name, lower)?, flags);
         }
         require_parent_directories(name)?;
         if !create || directory {
             return Err(-2);
         }
-        open_overlay(overlay_create(name), flags)
+        open_overlay(overlay_create(name, None)?, flags)
     } else {
         let exists = || open_file(name, OpenFlags::RDONLY).is_some();
         if directory {
@@ -377,12 +360,19 @@ pub fn resolve_from(name: &str, base: &str) -> Result<String, isize> {
                 unchecked = false;
             }
             _ => {
+                if part.len() > 255 {
+                    return Err(-36);
+                }
                 parts.push(part);
                 unchecked = true;
             }
         }
     }
-    Ok(parts.join("/"))
+    let path = parts.join("/");
+    if path.len() >= 4096 {
+        return Err(-36);
+    }
+    Ok(path)
 }
 
 pub fn resolve_path(name: &str) -> Result<String, isize> {
@@ -393,14 +383,21 @@ pub fn resolve_path(name: &str) -> Result<String, isize> {
     if !directory_is_live(&cwd) {
         return Err(-2);
     }
-    resolve_from(name, cwd.path())
+    resolve_from(name, &cwd.path())
 }
 
 pub fn exists(name: &str) -> bool {
     path_is_directory(name).is_ok() || virtual_file(name).is_some()
 }
 
+fn is_virtual_namespace(path: &str) -> bool {
+    matches!(path.split('/').next(), Some("proc" | "dev"))
+}
+
 pub fn mkdir(name: &str) -> Result<(), isize> {
+    if is_virtual_namespace(name) {
+        return Err(if matches!(name, "proc" | "dev") { -17 } else { -30 });
+    }
     if EXT4.is_none() {
         // easy-fs 本身只有扁平目录，保留模拟实现。
         return open_file(name, OpenFlags::CREATE | OpenFlags::RDONLY).map(|_| ()).ok_or(-1);
@@ -409,13 +406,14 @@ pub fn mkdir(name: &str) -> Result<(), isize> {
     if exists(name) {
         return Err(-17); // EEXIST
     }
-    overlay_mkdir(name);
-    Ok(())
+    overlay_mkdir(name)
 }
 
 pub fn unlink(name: &str, remove_directory: bool) -> Result<(), isize> {
-    if name == PAGE_CACHE_PATH {
-        return Err(if remove_directory { -20 } else { -30 }); // ENOTDIR or EROFS
+    if is_virtual_namespace(name) {
+        return Err(if matches!(name, "proc" | "dev") {
+            if remove_directory { -16 } else { -21 }
+        } else if remove_directory { -20 } else { -30 });
     }
     if EXT4.is_none() {
         if remove_directory {
@@ -443,26 +441,52 @@ pub fn unlink(name: &str, remove_directory: bool) -> Result<(), isize> {
         }
         (false, false) => {}
     }
-    overlay_unlink(name, lower_inode(name).is_some());
-    Ok(())
+    overlay_unlink(name, lower_inode(name).is_some(), is_directory)
 }
 
-pub fn rename_overlay_file(old: &str, new: &str) -> Result<(), isize> {
-    if old == PAGE_CACHE_PATH || new == PAGE_CACHE_PATH {
-        return Err(-30); // EROFS
+pub fn rename_overlay(old: &str, new: &str, no_replace: bool) -> Result<(), isize> {
+    let fs = EXT4.as_ref().ok_or(-18isize)?;
+    if [old, new].iter().any(|path| is_root_path(path) || matches!(*path, "proc" | "dev")) {
+        return Err(-16);
     }
-    if EXT4.is_some() {
-        require_parent_directories(old)?;
-        require_parent_directories(new)?;
+    if is_virtual_namespace(old) || is_virtual_namespace(new) {
+        return Err(-30);
     }
-    if path_is_directory(new) == Ok(true) {
+    require_parent_directories(old)?;
+    require_parent_directories(new)?;
+    let is_directory = path_is_directory(old)?;
+    let destination = path_is_directory(new).ok();
+    if no_replace && destination.is_some() {
+        return Err(-17);
+    }
+    if old == new {
+        return Ok(());
+    }
+    let hide_lower = lower_inode(old).is_some();
+    let source = match overlay_get(old) {
+        Some(entry) => entry,
+        None if is_directory => return Err(-18),
+        None => {
+            let inode = lower_inode(old).filter(ext4::Inode::is_file).ok_or(-30isize)?;
+            OverlayEntry::File(overlay_new_file(Some(ext4::Ext4File::new(fs.clone(), inode)), true)?)
+        }
+    };
+    if is_directory {
+        if new.strip_prefix(old).map_or(false, |suffix| suffix.starts_with('/')) {
+            return Err(-22);
+        }
+        if destination == Some(false) {
+            return Err(-20);
+        }
+        if destination == Some(true)
+            && list_dir_path(new).iter().any(|(child, _, _)| child != "." && child != "..")
+        {
+            return Err(-39);
+        }
+    } else if destination == Some(true) {
         return Err(-21);
     }
-    if overlay_rename(old, new, lower_inode(old).is_some()) {
-        Ok(())
-    } else {
-        Err(-2)
-    }
+    overlay_rename(old, new, source, hide_lower)
 }
 
 /// 根目录下的名字列表
@@ -488,7 +512,7 @@ impl File for ProcSnapshot {
 
     fn read(&self, buffer: UserBuffer) -> usize {
         let mut offset = self.offset.exclusive_access();
-        let remaining = &self.bytes[*offset..];
+        let remaining = self.bytes.get(*offset..).unwrap_or(&[]);
         let count = remaining.len().min(buffer.len());
         for (dst, &byte) in buffer.into_iter().zip(&remaining[..count]) {
             unsafe { dst.write(byte) };
@@ -503,6 +527,19 @@ impl File for ProcSnapshot {
 
     fn size(&self) -> usize {
         self.bytes.len()
+    }
+
+    fn seek_to(&self, position: isize) -> isize {
+        if position < 0 {
+            return -22;
+        }
+        *self.offset.exclusive_access() = position as usize;
+        position
+    }
+
+    fn seek(&self, delta: isize) -> isize {
+        let offset = *self.offset.exclusive_access() as isize;
+        offset.checked_add(delta).map_or(-75, |position| self.seek_to(position))
     }
 
     fn set_len(&self, _len: usize) -> isize {
@@ -617,9 +654,10 @@ pub fn list_dir_path(name: &str) -> Vec<(String, u32, u8)> {
             },
         };
         let mut children = overlay_children(name);
-        entries.retain_mut(|(child, _, file_type)| match children.remove(child) {
-            Some(entry) => match entry.dirent_type() {
-                Some(kind) => {
+        entries.retain_mut(|(child, ino, file_type)| match children.remove(child) {
+            Some(entry) => match entry.dirent() {
+                Some((id, kind)) => {
+                    *ino = id;
                     *file_type = kind;
                     true
                 }
@@ -628,7 +666,7 @@ pub fn list_dir_path(name: &str) -> Vec<(String, u32, u8)> {
             None => true,
         });
         entries.extend(children.into_iter().filter_map(|(child, entry)| {
-            entry.dirent_type().map(|file_type| (child, 1, file_type))
+            entry.dirent().map(|(ino, file_type)| (child, ino, file_type))
         }));
         return entries;
     }

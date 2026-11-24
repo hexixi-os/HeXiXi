@@ -11,7 +11,7 @@ pub const USER_END: usize = 1 << 38;
 pub enum PageFault {
     Resolved,
     Invalid,
-    BeyondEof,
+    FileUnavailable,
 }
 
 #[derive(Clone)]
@@ -25,7 +25,6 @@ pub enum VmaBacking {
         file: Arc<dyn File + Send + Sync>,
         offset: usize,
         shared: bool,
-        _lease: Option<Arc<()>>,
     },
     Executable {
         image: Arc<ElfImage>,
@@ -46,12 +45,10 @@ impl VmaBacking {
     }
 
     pub fn file(file: Arc<dyn File + Send + Sync>, offset: usize, shared: bool) -> Self {
-        let lease = file.mapping_lease();
         Self::File {
             file,
             offset,
             shared,
-            _lease: lease,
         }
     }
 
@@ -104,9 +101,9 @@ impl VmaBacking {
             } => {
                 let offset = offset + bytes;
                 if offset >= file.mapping_size().ok_or(PageFault::Invalid)? {
-                    return Err(PageFault::BeyondEof);
+                    return Err(PageFault::FileUnavailable);
                 }
-                let page = file.mapping_page(offset).ok_or(PageFault::Invalid)?;
+                let page = file.mapping_page(offset, *shared).ok_or(PageFault::FileUnavailable)?;
                 (page, !shared)
             }
             Self::Executable { image, address } => return load_elf_page(image, address + bytes),
@@ -253,6 +250,33 @@ impl VmaSpace {
             self.areas.remove(&start);
         }
         let vpns: Vec<_> = self.pages.range(range).map(|(&vpn, _)| vpn).collect();
+        let mut retired = Vec::with_capacity(vpns.len());
+        for vpn in vpns {
+            table.unmap_and_reclaim(vpn, tables);
+            retired.push(self.pages.remove(&vpn).unwrap().frame);
+        }
+        retired
+    }
+
+    pub(super) fn invalidate_file_pages(
+        &mut self,
+        table: &mut PageTable,
+        identity: (u64, u64),
+        first_invalid: usize,
+        tables: &mut Vec<FrameTracker>,
+    ) -> Vec<Arc<FrameTracker>> {
+        let mut vpns = Vec::new();
+        for (&start, area) in &self.areas {
+            if let VmaBacking::File { file, offset, .. } = &area.backing {
+                if file.stat_identity() == Some(identity) {
+                    let skip = first_invalid.saturating_sub(*offset) / PAGE_SIZE;
+                    let first = VirtPageNum(start.0 + skip);
+                    if first < area.end {
+                        vpns.extend(self.pages.range(first..area.end).map(|(&vpn, _)| vpn));
+                    }
+                }
+            }
+        }
         let mut retired = Vec::with_capacity(vpns.len());
         for vpn in vpns {
             table.unmap_and_reclaim(vpn, tables);

@@ -67,6 +67,8 @@ bitflags! {
         const TRUNC = 1 << 10;
         const EXCL = 1 << 11;
         const DIRECTORY = 1 << 12;
+        const APPEND = 1 << 13;
+        const TMPFILE = 1 << 14;
     }
 }
 
@@ -138,6 +140,10 @@ impl File for OSInode {
     fn writable(&self) -> bool {
         self.writable
     }
+    fn size(&self) -> usize {
+        self.inner.exclusive_access().inode.size()
+    }
+
     fn read(&self, buf: UserBuffer) -> usize {
         let mut inner = self.inner.exclusive_access();
         let mut total_read_size = 0usize;

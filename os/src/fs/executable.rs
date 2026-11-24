@@ -1,4 +1,7 @@
-use super::{ext4::Ext4File, lower_inode, open_file, overlay_get, OpenFlags, OverlayEntry, EXT4};
+use super::{
+    ext4::Ext4File, lower_inode, open_file, overlay::FileData, overlay_get, OpenFlags,
+    OverlayEntry, EXT4,
+};
 use crate::mm::FrameTracker;
 use alloc::{sync::Arc, vec::Vec};
 
@@ -6,6 +9,7 @@ use alloc::{sync::Arc, vec::Vec};
 pub enum Executable {
     Embedded(&'static [u8]),
     Snapshot(Vec<u8>),
+    Overlay(FileData),
     Disk(Ext4File),
 }
 
@@ -14,6 +18,7 @@ impl Executable {
         match self {
             Self::Embedded(data) => data.len(),
             Self::Snapshot(data) => data.len(),
+            Self::Overlay(data) => data.len,
             Self::Disk(file) => file.len(),
         }
     }
@@ -22,6 +27,7 @@ impl Executable {
         let data = match self {
             Self::Embedded(data) => *data,
             Self::Snapshot(data) => data.as_slice(),
+            Self::Overlay(data) => return data.read_at(offset, buffer),
             Self::Disk(file) => return file.read_at(offset, buffer),
         };
         let count = data.len().saturating_sub(offset).min(buffer.len());
@@ -42,7 +48,7 @@ impl Executable {
 pub fn open_executable(name: &str) -> Result<Executable, isize> {
     match overlay_get(name) {
         Some(OverlayEntry::File(data)) => {
-            return Ok(Executable::Snapshot(data.exclusive_access().read_all()));
+            return data.exclusive_access().snapshot().map(Executable::Overlay);
         }
         Some(OverlayEntry::Directory(_)) => return Err(-13),
         Some(OverlayEntry::Whiteout) => return Err(-2),

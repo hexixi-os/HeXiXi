@@ -19,6 +19,7 @@ use lazy_static::*;
 
 pub struct FrameTracker {
     pub ppn: PhysPageNum,
+    charge: Option<&'static AtomicUsize>,
 }
 
 impl FrameTracker {
@@ -28,7 +29,7 @@ impl FrameTracker {
         for i in bytes_array {
             *i = 0;
         }
-        Self { ppn }
+        Self { ppn, charge: None }
     }
 }
 
@@ -41,6 +42,9 @@ impl Debug for FrameTracker {
 impl Drop for FrameTracker {
     fn drop(&mut self) {
         frame_dealloc(self.ppn);
+        if let Some(charge) = self.charge {
+            charge.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -133,6 +137,22 @@ pub fn frame_alloc() -> Option<FrameTracker> {
         }
         FrameTracker::new(ppn)
     })
+}
+
+pub(crate) fn frame_alloc_charged(used: &'static AtomicUsize, limit: usize) -> Option<FrameTracker> {
+    used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        (count < limit).then(|| count + 1)
+    }).ok()?;
+    match frame_alloc() {
+        Some(mut frame) => {
+            frame.charge = Some(used);
+            Some(frame)
+        }
+        None => {
+            used.fetch_sub(1, Ordering::Relaxed);
+            None
+        }
+    }
 }
 
 pub fn frame_dealloc(ppn: PhysPageNum) {

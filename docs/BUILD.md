@@ -103,6 +103,14 @@ qemu-system-riscv64 -machine virt -m 256M -nographic -bios default \
 完整执行包含 1,000 次管道测试，结束时会输出 `Usertests passed!` 并自动关机。测试结果见 [测试状态](TEST_STATUS.md)。
 不带 `TEST=1` 时 `initproc` 会启动 `user_shell`，这条路径 Martyr 没有实测。
 
+## 在只读 EXT4 盘上验证可写 Overlay
+
+从仓库根目录执行以下命令。脚本使用 `mkfs.ext4`、`sha256sum` 和 QEMU，构建独立测试盘并启动 768 MiB 单核虚拟机。串口日志可用于核对大文件、稀疏页、共享映射和临时文件生命周期。
+
+```bash
+bash tools/oscomp/test_overlay_fs.sh /tmp/hexixi-overlay-fs.log
+```
+
 ## 常见问题
 
 | 现象 | 原因 | 处理 |

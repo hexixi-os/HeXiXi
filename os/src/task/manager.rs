@@ -73,3 +73,10 @@ pub fn remove_from_pid2process(pid: usize) {
         panic!("cannot find pid {} in pid2task!", pid);
     }
 }
+
+/// Truncate runs without a process or file borrow on the single hart.
+pub(crate) fn invalidate_file_pages(identity: (u64, u64), first_invalid: usize) {
+    for process in PID2PCB.exclusive_access().values() {
+        process.inner_exclusive_access().memory_set.invalidate_file_pages(identity, first_invalid);
+    }
+}

@@ -147,8 +147,22 @@ impl MemorySet {
         Ok(())
     }
 
-    pub fn mprotect(&mut self, range: Range<VirtPageNum>, permissions: MapPermission) -> Result<(), isize> {
-        // Check the entire interval before changing any resident translation or VMA.
+    pub(crate) fn invalidate_file_pages(&mut self, identity: (u64, u64), first_invalid: usize) {
+        let mut tables = Vec::new();
+        let retired = self.vmas.invalidate_file_pages(
+            &mut self.page_table, identity, first_invalid, &mut tables,
+        );
+        if !retired.is_empty() {
+            unsafe { asm!("sfence.vma"); }
+        }
+        drop((retired, tables));
+    }
+
+    pub(crate) fn check_user_range(
+        &self,
+        range: &Range<VirtPageNum>,
+        permissions: MapPermission,
+    ) -> Result<(), isize> {
         let mut cursor = range.start;
         while cursor < range.end {
             cursor = if let Some(end) = self.vmas.covered_until(cursor, permissions) {
@@ -161,6 +175,11 @@ impl MemorySet {
                 }).map(|area| area.vpn_range.get_end()).ok_or(-12isize)?
             };
         }
+        Ok(())
+    }
+
+    pub fn mprotect(&mut self, range: Range<VirtPageNum>, permissions: MapPermission) -> Result<(), isize> {
+        self.check_user_range(&range, permissions)?;
         self.vmas.protect(&mut self.page_table, range.clone(), permissions);
         for area in &mut self.areas {
             for (&vpn, page) in area.data_frames.range_mut(range.clone()) {
