@@ -47,10 +47,12 @@ fn store(addr: usize, value: u8) {
 }
 
 fn clone_with_clear_tid(addr: usize) -> isize {
-    const CLONE_FLAGS: usize = 0x0021_0900; // VM | SIGHAND | THREAD | CHILD_CLEARTID
+    const CLONE_FLAGS: usize = 0x0021_0f00; // VM | FS | FILES | SIGHAND | THREAD | CHILD_CLEARTID
+    let mut stack = [0u8; 1024];
+    let stack_top = (stack.as_mut_ptr() as usize + stack.len()) & !15;
     let tid;
     unsafe {
-        // The child uses no stack and exits straight from assembly.
+        // The child exits from assembly without accessing its supplied stack.
         asm!(
             "ecall",
             "bnez a0, 2f",
@@ -59,7 +61,7 @@ fn clone_with_clear_tid(addr: usize) -> isize {
             "unimp",
             "2:",
             inlateout("a0") CLONE_FLAGS => tid,
-            in("a1") 0usize, in("a2") 0usize, in("a3") 0usize, in("a4") addr,
+            in("a1") stack_top, in("a2") 0usize, in("a3") 0usize, in("a4") addr,
             inlateout("a7") 220usize => _,
         );
     }
@@ -269,7 +271,6 @@ fn main() -> i32 {
     assert_eq!(load(anon_shared), 0);
     assert_eq!(load(anon_shared + 2 * PAGE), b'R');
 
-    // Run this after the fork cases because the thread leaves an unused task slot.
     assert_eq!(load(clear_tid_copy), b'B');
     assert!(clone_with_clear_tid(clear_tid_copy) > 0);
     yield_();

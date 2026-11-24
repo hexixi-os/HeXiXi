@@ -164,7 +164,7 @@ extern "C" fn signal_handler(_signal: usize) {
     exit(73);
 }
 
-fn verify_signal_copyout() {
+fn verify_signal_context_isolation() {
     const SIGCTX: usize = 0x00ff_f000;
     const SIGUSR1: usize = 10;
     put(SIGCTX, 81);
@@ -183,7 +183,9 @@ fn verify_signal_copyout() {
             assert_eq!(syscall(129, [0, SIGUSR1, 0, 0, 0, 0]), 0);
             exit(99);
         }
-        assert_eq!(child_status(pid), if protected { -11 } else { 73 });
+        // Saved registers belong to the task. Protecting the old user context
+        // page must no longer affect signal delivery.
+        assert_eq!(child_status(pid), 73);
         assert_eq!(
             get(SIGCTX),
             81,
@@ -209,13 +211,15 @@ fn verify_wait_copyout() {
 fn verify_fork_after_thread_exit() {
     let mut clear_tid = 1i32;
     let address = &mut clear_tid as *mut i32;
+    let mut child_stack = [0u8; 1024];
+    let stack_top = (child_stack.as_mut_ptr() as usize + child_stack.len()) & !15;
     let tid: isize;
     unsafe {
-        // A CLONE_VM | CLONE_THREAD child exits without using a user stack.
+        // The pthread-style clone shares the process state and clears its TID on exit.
         asm!(
             "ecall", "bnez a0, 2f", "li a7, 93", "ecall", "unimp", "2:",
-            inlateout("a0") 0x0021_0900usize => tid,
-            in("a1") 0usize, in("a2") 0usize, in("a3") 0usize, in("a4") address,
+            inlateout("a0") 0x0021_0f00usize => tid,
+            in("a1") stack_top, in("a2") 0usize, in("a3") 0usize, in("a4") address,
             inlateout("a7") 220usize => _,
         );
     }
@@ -292,7 +296,7 @@ fn main(_argc: usize, args: &[&str]) -> i32 {
         close(marker as usize);
     } else {
         verify_isolation();
-        verify_signal_copyout();
+        verify_signal_context_isolation();
         verify_wait_copyout();
         verify_fork_after_thread_exit();
         println!("fork-cow-isolation-ok");

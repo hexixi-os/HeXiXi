@@ -1,7 +1,7 @@
+use crate::mm::{translated_ref, try_translated_ref, try_translated_refmut};
 use crate::mm::{MapPermission, MemorySet, VirtAddr};
-use crate::task::{current_add_signal, current_process, current_user_token, SignalFlags};
-use crate::trap::TrapContext;
-use crate::mm::{translated_ref, try_translated_refmut};
+use crate::task::{current_process, current_task, current_user_token, pid2process};
+use alloc::sync::Arc;
 
 /// 可执行的信号返回 stub 页（li a7,139; ecall; j .）
 pub const SIGSTUB_VA: usize = 0x00FF_E000;
@@ -14,11 +14,27 @@ pub const SIGCHLD: usize = 17;
 /// 信号编号：SIGSEGV（非法访问）
 pub const SIGSEGV: usize = 11;
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SignalAction {
+    pub handler: usize,
+    flags: usize,
+    mask: u64,
+}
+
+fn signal_bit(signo: usize) -> u64 {
+    1u64 << (signo - 1)
+}
+
+const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
+
 /// 在用户地址空间建立信号所需的两页（exec 时调用）
 pub fn setup_signal_pages(memory_set: &mut MemorySet) {
     if memory_set.translate(SIGSTUB_VA.into()).is_none() {
         // addi a7, x0, 139 ; ecall ; j .
-        let code: [u8; 12] = [0x93, 0x08, 0xB0, 0x08, 0x73, 0x00, 0x00, 0x00, 0x6F, 0x00, 0x00, 0x00];
+        let code: [u8; 12] = [
+            0x93, 0x08, 0xB0, 0x08, 0x73, 0x00, 0x00, 0x00, 0x6F, 0x00, 0x00, 0x00,
+        ];
         memory_set.insert_data_page(
             VirtAddr::from(SIGSTUB_VA),
             MapPermission::U | MapPermission::R | MapPermission::X,
@@ -53,31 +69,138 @@ pub fn sys_setitimer(which: usize, new: *const u8, _old: *mut u8) -> isize {
     0
 }
 
-/// rt_sigaction(134)：记录任意信号号的用户 handler（0=SIG_DFL, 1=SIG_IGN）。
-/// 我们不做信号屏蔽/flag 语义，只保存 handler 地址并在投递时调用。
-pub fn sys_rt_sigaction(signo: usize, act: *const u8, _old: *mut u8) -> isize {
-    if act.is_null() || signo >= 32 {
-        return 0;
+pub fn sys_rt_sigaction(signo: usize, act: usize, old: usize, size: usize) -> isize {
+    if !(1..=64).contains(&signo) || size != 8 || (act != 0 && matches!(signo, 9 | 19)) {
+        return -22;
     }
     let token = current_user_token();
-    // struct sigaction 第一个字段就是 handler 地址
-    let handler = *translated_ref(token, act as *const usize);
-    current_process().inner_exclusive_access().signal_handlers[signo] = handler;
+    let action = if act == 0 {
+        None
+    } else {
+        match try_translated_ref(token, act as *const SignalAction) {
+            Some(action) => Some(*action),
+            None => return -14,
+        }
+    };
+    let process = current_process();
+    let previous = process.inner_exclusive_access().signal_actions[signo - 1];
+    if old != 0 {
+        match try_translated_refmut(token, old as *mut SignalAction) {
+            Some(output) => *output = previous,
+            None => return -14,
+        }
+    }
+    if let Some(action) = action {
+        process.inner_exclusive_access().signal_actions[signo - 1] = action;
+    }
     0
 }
 
-/// rt_sigreturn(139)：恢复被打断的上下文
-pub fn sys_rt_sigreturn() -> isize {
-    let token = current_user_token();
-    let cx = crate::task::current_trap_cx();
-    let dst = cx as *mut TrapContext as *mut u8;
-    for i in 0..core::mem::size_of::<TrapContext>() {
-        let b = *translated_ref(token, (SIGCTX_VA + i) as *const u8);
-        unsafe { *dst.add(i) = b; }
+pub fn sys_rt_sigprocmask(how: usize, set: usize, old: usize, size: usize) -> isize {
+    if size != 8 || (set != 0 && how > 2) {
+        return -22;
     }
-    let process = current_process();
-    process.inner_exclusive_access().in_sigalrm = false;
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    let previous = task.inner_exclusive_access().signal_mask;
+    let requested = if set == 0 {
+        previous
+    } else {
+        match try_translated_ref(token, set as *const u64) {
+            Some(mask) => match how {
+                0 => previous | mask,
+                1 => previous & !mask,
+                _ => *mask,
+            },
+            None => return -14,
+        }
+    };
+    if old != 0 {
+        match try_translated_refmut(token, old as *mut u64) {
+            Some(output) => *output = previous,
+            None => return -14,
+        }
+    }
+    task.inner_exclusive_access().signal_mask = requested & !UNBLOCKABLE;
     0
+}
+
+pub fn sys_rt_sigreturn() -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let (context, mask) = match inner.signal_context.take() {
+        Some(saved) => saved,
+        None => return -22,
+    };
+    *inner.get_trap_cx() = context;
+    inner.signal_mask = mask;
+    0
+}
+
+pub fn sys_thread_kill(tgid: Option<usize>, tid: usize, signo: usize) -> isize {
+    if tid == 0 || tgid == Some(0) || signo > 64 {
+        return -22;
+    }
+    let task = match tgid {
+        Some(pid) => pid2process(pid).and_then(|process| {
+            process
+                .inner_exclusive_access()
+                .tasks
+                .iter()
+                .flatten()
+                .find(|task| task.linux_tid() == tid)
+                .cloned()
+        }),
+        None => crate::task::tid2task(tid),
+    };
+    if let Some(task) = task {
+        let mut inner = task.inner_exclusive_access();
+        if inner.exit_code.is_none() {
+            if signo != 0 {
+                inner.pending_signals |= signal_bit(signo);
+            }
+            return 0;
+        }
+    }
+    -3
+}
+
+pub fn kill_process(pid: usize, signo: usize) -> isize {
+    if signo > 64 {
+        return -22;
+    }
+    let process = if pid == 0 {
+        Some(current_process())
+    } else {
+        pid2process(pid)
+    };
+    if let Some(process) = process {
+        if signo != 0 {
+            process.inner_exclusive_access().signal_pending |= signal_bit(signo);
+        }
+    }
+    // Keep the existing success result for a PID that has already exited.
+    0
+}
+
+pub(super) fn take_pending(set: u64) -> Option<usize> {
+    check_alarm();
+    let process = current_process();
+    let task = current_task().unwrap();
+    let mut process_inner = process.inner_exclusive_access();
+    let mut thread = task.inner_exclusive_access();
+    let pending = (thread.pending_signals | process_inner.signal_pending) & set;
+    if pending == 0 {
+        return None;
+    }
+    let index = pending.trailing_zeros() as usize;
+    let bit = 1u64 << index;
+    if thread.pending_signals & bit != 0 {
+        thread.pending_signals &= !bit;
+    } else {
+        process_inner.signal_pending &= !bit;
+    }
+    Some(index + 1)
 }
 
 /// 定时器中断里调用：到期则标记 SIGALRM 待投递
@@ -86,7 +209,7 @@ pub fn check_alarm() {
     let mut inner = process.inner_exclusive_access();
     if inner.alarm_deadline != 0 && crate::timer::get_time_ms() >= inner.alarm_deadline {
         inner.alarm_deadline = 0;
-        inner.signal_pending |= 1u32 << SIGALRM;
+        inner.signal_pending |= signal_bit(SIGALRM);
     }
 }
 
@@ -94,54 +217,113 @@ pub fn check_alarm() {
 /// 调用者应立刻返回 -EINTR，这样回到用户态后 deliver_signal 才能执行超时 handler。
 pub fn alarm_interrupts() -> bool {
     check_alarm();
-    current_process().inner_exclusive_access().signal_pending & (1u32 << SIGALRM) != 0
+    let task = current_task().unwrap();
+    let mask = task.inner_exclusive_access().signal_mask;
+    current_process().inner_exclusive_access().signal_pending & !mask & signal_bit(SIGALRM) != 0
 }
 
-/// 返回用户态前调用：把待投递、且注册了用户 handler 的信号变成“跳到 handler”。
-/// 一次只投一个（不嵌套）；handler 里的 rt_sigreturn 恢复现场后，下一次 trap 再投剩下的。
-pub fn deliver_signal() {
-    let process = current_process();
-    let (pending, handlers, in_handler) = {
-        let inner = process.inner_exclusive_access();
-        (inner.signal_pending, inner.signal_handlers, inner.in_sigalrm)
+pub(crate) fn queue_current(signo: usize) {
+    current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .pending_signals |= signal_bit(signo);
+}
+
+pub(crate) fn interrupts_wait(task: &Arc<crate::task::TaskControlBlock>, now_ms: usize) -> bool {
+    let process = match task.process.upgrade() {
+        Some(process) => process,
+        None => return true,
     };
-    if in_handler || pending == 0 {
+    let process_inner = process.inner_exclusive_access();
+    if process_inner.signals.check_error().is_some() {
+        return true;
+    }
+    let inner = task.inner_exclusive_access();
+    let alarm_due = process_inner.alarm_deadline != 0 && process_inner.alarm_deadline <= now_ms;
+    let pending = inner.pending_signals
+        | process_inner.signal_pending
+        | if alarm_due { signal_bit(SIGALRM) } else { 0 };
+    let mut ready = pending & !inner.signal_mask;
+    while ready != 0 {
+        let bit = ready.trailing_zeros() as usize;
+        ready &= ready - 1;
+        let action = process_inner.signal_actions[bit];
+        if action.handler > 1 || (action.handler == 0 && terminating_default(bit + 1)) {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn check_fatal_current() {
+    let process = current_process();
+    let task = current_task().unwrap();
+    let fatal = {
+        let inner = process.inner_exclusive_access();
+        let thread = task.inner_exclusive_access();
+        let mut pending = (thread.pending_signals | inner.signal_pending) & !thread.signal_mask;
+        let mut fatal = None;
+        while pending != 0 {
+            let index = pending.trailing_zeros() as usize;
+            pending &= pending - 1;
+            if inner.signal_actions[index].handler == 0 && terminating_default(index + 1) {
+                fatal = Some(index + 1);
+                break;
+            }
+        }
+        fatal
+    };
+    if let Some(signo) = fatal {
+        drop(task);
+        drop(process);
+        crate::task::exit_current_by_signal(signo as i32);
+    }
+}
+
+fn terminating_default(signo: usize) -> bool {
+    !matches!(signo, 17..=23 | 28)
+}
+
+pub fn deliver_signal() {
+    const SA_NODEFER: usize = 0x40000000;
+    const SA_RESETHAND: usize = 0x80000000;
+    check_fatal_current();
+    let process = current_process();
+    let task = current_task().unwrap();
+    let mut process_inner = process.inner_exclusive_access();
+    let mut thread = task.inner_exclusive_access();
+    if thread.signal_context.is_some() {
         return;
     }
-    // 选一个“有用户 handler”的最低 pending 信号；没有 handler 的直接清掉
-    let mut mask = pending;
-    let mut deliver: Option<usize> = None;
-    while mask != 0 {
-        let signo = mask.trailing_zeros() as usize;
-        mask &= mask - 1;
-        if handlers[signo] > 1 {
-            deliver = Some(signo);
-            break;
+    let mut pending = (thread.pending_signals | process_inner.signal_pending) & !thread.signal_mask;
+    while pending != 0 {
+        let index = pending.trailing_zeros() as usize;
+        let bit = 1u64 << index;
+        pending &= !bit;
+        if thread.pending_signals & bit != 0 {
+            thread.pending_signals &= !bit;
         } else {
-            process.inner_exclusive_access().signal_pending &= !(1u32 << signo);
+            process_inner.signal_pending &= !bit;
         }
+        let action = process_inner.signal_actions[index];
+        let signo = index + 1;
+        if action.handler <= 1 {
+            continue;
+        }
+        let cx = thread.get_trap_cx();
+        thread.signal_context = Some((*cx, thread.signal_mask));
+        thread.signal_mask |= action.mask;
+        if action.flags & SA_NODEFER == 0 {
+            thread.signal_mask |= bit;
+        }
+        thread.signal_mask &= !UNBLOCKABLE;
+        if action.flags & SA_RESETHAND != 0 {
+            process_inner.signal_actions[index] = SignalAction::default();
+        }
+        cx.sepc = action.handler;
+        cx.x[1] = SIGSTUB_VA;
+        cx.x[10] = signo;
+        cx.x[2] = cx.x[2].saturating_sub(512) & !0xf;
+        return;
     }
-    let signo = match deliver {
-        Some(s) => s,
-        None => return,
-    };
-    let handler = handlers[signo];
-    let token = current_user_token();
-    let saved = match try_translated_refmut(token, SIGCTX_VA as *mut TrapContext) {
-        Some(saved) => saved,
-        None => {
-            current_add_signal(SignalFlags::SIGSEGV);
-            return;
-        }
-    };
-    let cx = crate::task::current_trap_cx();
-    *saved = *cx;
-    // 构造调用 handler 的上下文
-    cx.sepc = handler;
-    cx.x[1] = SIGSTUB_VA;
-    cx.x[10] = signo;
-    cx.x[2] = cx.x[2].saturating_sub(512) & !0xf;
-    let mut inner = process.inner_exclusive_access();
-    inner.signal_pending &= !(1u32 << signo);
-    inner.in_sigalrm = true;
 }

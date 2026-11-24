@@ -83,14 +83,15 @@ pub fn trap_handler() -> ! {
                 id,
                 [cx.x[10], cx.x[11], cx.x[12], cx.x[13], cx.x[14], cx.x[15]],
             );
-            crate::task::current_task()
-                .unwrap()
-                .inner_exclusive_access()
-                .user_io_frames
-                .clear();
+            {
+                let task = crate::task::current_task().unwrap();
+                let mut inner = task.inner_exclusive_access();
+                inner.user_io_frames.clear();
+                inner.user_io_file = None;
+            }
             // cx is changed during sys_exec, so we have to call it again
             cx = current_trap_cx();
-            if id != 139 {
+            if id != 139 || result < 0 {
                 // 139 = rt_sigreturn，已恢复完整上下文，不能覆盖 a0
                 cx.x[10] = result as usize;
             }
@@ -152,6 +153,14 @@ pub fn trap_return() -> ! {
     set_user_trap_entry();
     let trap_cx_user_va = current_trap_cx_user_va();
     let user_satp = current_user_token();
+    let task = crate::task::current_task().unwrap();
+    let child_tid = task.inner_exclusive_access().set_child_tid.take();
+    if let Some(address) = child_tid {
+        if let Some(word) = crate::mm::try_translated_refmut(user_satp, address as *mut i32) {
+            *word = task.linux_tid() as i32;
+        }
+    }
+    drop(task);
     extern "C" {
         fn __alltraps();
         fn __restore();

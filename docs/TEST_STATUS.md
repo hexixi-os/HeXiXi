@@ -1,5 +1,17 @@
 # 测试状态
 
+## 2026-11-24 PR-13 Linux 线程与进程 ABI
+
+QEMU 8.2.2 单核下，动态链接的 musl 1.2.0 和 glibc 2.31 各通过 16 轮、每轮 8 个并发线程的回归。每个线程执行 256 次互斥计数操作，条件变量同步启动，逐个检查 `pthread_join` 返回值、独立 TLS、TID 和共享 pipe 描述符。glibc 版动态 BusyBox 也通过 `sh -c` 启动并执行外部 `true`。
+
+ABI 回归还覆盖了 futex 值不匹配、唤醒计数和超时、线程信号屏蔽与定向投递、处理函数执行中收到 SIGKILL、在 handler 内 fork 后正常返回、工作线程调用 `exit_group`、线程组退出时仍在管道 I/O 的同伴，以及 fork 后 exec 对普通描述符和 `FD_CLOEXEC` 的区别处理。
+
+PR-12 内核在 easy-fs `usertests` 的 `race_adder_arg` 可复现内核 panic。教学线程的固定步长栈跨到保留信号页附近，创建返回 `-ENOMEM`，测试把负错误码转成无符号索引后触发越界。PR-13 在空闲地址区找栈并在 `waittid` 校验索引。完成的教学线程保留退出值，Linux 线程由内核回收资源，等待由 libc 配合 `clear_child_tid` 完成。
+
+easy-fs `usertests` 跑完 29 项正常与 8 项预期失败用例，包含 1,000 次 fork/exec 管道回归。套件中的 `until_timeout` 和 `huge_write_mt` 按原用例配置以缺少参数触发预期失败。官方原盘 `basic-musl`、`basic-glibc` 均为 **102/102**。musl 正常关机，glibc 原盘的静态 BusyBox 仍在结束标记后退出 139。
+
+复跑说明见[线程与进程 ABI](thread-support.md)，教学盘见 [usertests](BUILD.md#在本地镜像上跑-usertests)。
+
 ## 2026-11-24 PR-12 动态 ELF
 
 在 QEMU 8.2.2 上以 `execve` 启动 musl 1.2.0 PIE、glibc 2.31 PIE 和高地址 glibc 2.31 非 PIE。三个程序均经各自的加载器链接 libc，读取参数和环境变量，输出 Hello World 并以 0 退出。两个 glibc 程序同时验证堆能扩展和收缩。主程序和解释器的 `PT_LOAD` 复用 ELF 缺页与文件页缓存。解释器缺失、路径未终止、解释器格式错误及映射冲突均纳入 ELF 回归。
@@ -255,12 +267,12 @@ Martyr 的内核基于 `3bf874f` 加未提交的稀疏文件修复，以下分�
 
 **结果不稳定**：同一张盘、同一个内核，连续 3 次运行中 2 次是 96/102，1 次是 92/102（`test_pipe` 得 0/4，断言 `[2, 3] (>=)` 失败）。`test_pipe` 存在偶发失败，原因未查，所以 96/102 只是典型值，不是确定值。
 
-## 其他已知问题（Martyr 发现）
+## 历史测试记录（Martyr 发现）
 
-- **usertests 会让内核 panic**：在本地 easy-fs 镜像上跑 `usertests`，跑到 `race_adder_arg` 时内核 panic：
+- **旧版 usertests 内核 panic**：在本地 easy-fs 镜像上跑 `usertests`，跑到 `race_adder_arg` 时曾发生内核 panic：
   `src/mm/page_table.rs:115 vpn 0xffe is mapped before mapping`。
-  `0xffe000` 是信号 stub 页，疑似多线程场景下重复映射，没有进一步确认。此前的用例（`filetest_simple`、`cat`、`matrix`、`pipetest` 等）都正常退出。
+  `0xffe000` 是信号 stub 页。现版本的复现与修复见[PR-13](#2026-11-24-pr-13-linux-线程与进程-abi)。
 
 ## wonder-world 文档里提到的、仍未解决的限制
 
-以下来自 wonder-world 记录，未重新验证：信号返回上下文被破坏会让 lmbench 的 `lat_ctx` 等子进程崩溃，单核调度下 cyclictest 压力阶段超时。内核仍缺少动态链接以及网卡驱动和 TCP/IP 栈。
+以下来自 wonder-world 记录，待在当前版本复测。信号返回上下文可能影响 lmbench 的 `lat_ctx`，单核调度下 cyclictest 压力阶段可能超时。网卡驱动和 TCP/IP 栈仍待实现。

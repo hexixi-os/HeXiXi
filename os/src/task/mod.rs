@@ -8,7 +8,7 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
-pub(crate) use self::id::TaskUserRes;
+use self::id::TaskUserRes;
 use crate::fs::{open_file, OpenFlags};
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
@@ -19,7 +19,7 @@ use crate::timer::remove_timer;
 
 pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
-pub use manager::{add_task, remove_task, pid2process, remove_from_pid2process};
+pub use manager::{add_task, remove_task, pid2process, remove_from_pid2process, tid2task};
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
     current_user_token, run_tasks, schedule, take_current_task,
@@ -51,43 +51,58 @@ pub fn block_current_and_run_next() {
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
     task_inner.task_status = TaskStatus::Blocking;
     drop(task_inner);
+    drop(task); // The process and the wait queue hold the task while it is blocked.
     schedule(task_cx_ptr);
 }
 #[cfg(feature = "board_qemu")]
 use crate::board::QEMUExit;
 
 pub fn exit_current_and_run_next(exit_code: i32) {
-    exit_current_with_status(exit_code, exit_code << 8);
+    exit_current_with_status(exit_code, exit_code << 8, false);
+}
+
+pub fn exit_current_group(exit_code: i32) {
+    exit_current_with_status(exit_code, exit_code << 8, true);
 }
 
 pub fn exit_current_by_signal(signal: i32) {
-    exit_current_with_status(-signal, signal);
+    exit_current_with_status(-signal, signal, true);
 }
 
-fn exit_current_with_status(exit_code: i32, wait_status: i32) {
+fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
     let (tid, clear_child_tid) = {
         let inner = task.inner_exclusive_access();
         (inner.res.as_ref().unwrap().tid, inner.clear_child_tid)
     };
+    let (legacy_exit, last_thread) = {
+        let inner = process.inner_exclusive_access();
+        (inner.legacy_thread_exit, inner.thread_count() == 1)
+    };
     // A private file mapping may need a COW fault while the task is still current.
-    if tid != 0 && clear_child_tid != 0 {
+    if clear_child_tid != 0 && !last_thread {
         let token = process.inner_exclusive_access().memory_set.token();
-        *crate::mm::translated_refmut(token, clear_child_tid as *mut i32) = 0;
+        if let Some(word) = crate::mm::try_translated_refmut(token, clear_child_tid as *mut i32) {
+            *word = 0;
+            crate::syscall::futex::wake_one(token, clear_child_tid);
+        }
     }
+    let linux_thread = task.linux_thread;
     drop(take_current_task());
     let mut task_inner = task.inner_exclusive_access();
     // record exit code
     task_inner.exit_code = Some(exit_code);
-    task_inner.res = None;
-    // here we do not remove the thread since we are still using the kstack
-    // it will be deallocated when sys_waittid is called
+    if let Some(res) = task_inner.res.as_mut() {
+        res.release_mappings();
+    }
+    task_inner.user_io_frames.clear();
+    task_inner.user_io_file = None;
     drop(task_inner);
     drop(task);
     // however, if this is the main thread of current process
     // the process should terminate at once
-    if tid == 0 {
+    if group || last_thread || (tid == 0 && legacy_exit) {
         let pid = process.getpid();
         #[cfg(feature = "board_qemu")]
         if pid == IDLE_PID {
@@ -114,10 +129,7 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32) {
         // 不投递的话每次测试都要空等 5s 超时。
         if let Some(parent) = process_inner.parent.as_ref().and_then(|p| p.upgrade()) {
             let mut pin = parent.inner_exclusive_access();
-            pin.signals |= SignalFlags::SIGCHLD;
-            // 除了给 sigtimedwait 留 pending 位，还要能真正跳进用户的 SIGCHLD handler
-            // （lmbench 的 benchmp 依赖 SIGCHLD handler 感知子进程死亡）
-            pin.signal_pending |= 1u32 << 17; // SIGCHLD
+            pin.signal_pending |= 1 << (17 - 1); // SIGCHLD
         }
 
         {
@@ -143,6 +155,8 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32) {
             // removed when the PCB is deallocated.
             remove_inactive_task(Arc::clone(&task));
             let mut task_inner = task.inner_exclusive_access();
+            task_inner.user_io_frames.clear();
+            task_inner.user_io_file = None;
             if let Some(res) = task_inner.res.take() {
                 recycle_res.push(res);
             }
@@ -158,7 +172,7 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32) {
         // 主线程此刻还在自己的内核栈上跑：如果随 tasks.clear() 一起 drop，
         // KernelStack::drop 会把当前内核栈从内核页表 unmap，接着的栈访问就缺页
         //（libcbench/ltp 的 kernel StorePageFault 就是这个原因：TLB 没失效时侥幸不炸）。
-        let main_task = process_inner.tasks.get_mut(0).and_then(|t| t.take());
+        let exiting_task = process_inner.tasks.get_mut(tid).and_then(|t| t.take());
         // deallocate other data in user space i.e. program code/data section
         process_inner.memory_set.recycle_data_pages();
         // drop file descriptors
@@ -167,12 +181,11 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32) {
         process_inner.tasks.clear();
         drop(process_inner);
         // 交给延迟回收队列，下次在别的内核栈上再真正析构
-        if let Some(t) = main_task {
+        if let Some(t) = exiting_task {
             recycle_task(t);
         }
-    } else {
+    } else if linux_thread {
         // 从进程线程表摘除，TCB 交给延迟回收队列
-        let process = process.clone();
         let mut process_inner = process.inner_exclusive_access();
         if tid < process_inner.tasks.len() {
             if let Some(task_arc) = process_inner.tasks[tid].take() {
@@ -222,37 +235,22 @@ pub fn add_initproc(oscomp_group: Option<&str>) {
 /// 进程被 kill(SIGKILL) 后，在内核里的轮询/等待循环中尽快退出。
 /// （用户态循环靠时钟中断里的信号检查退出；内核态等待循环必须主动检查）
 pub fn check_kill_current() {
-    let process = current_process();
-    let (kill, term) = {
-        let inner = process.inner_exclusive_access();
-        (
-            inner.signals.contains(SignalFlags::SIGKILL),
-            inner.signals.contains(SignalFlags::SIGTERM),
-        )
-    };
-    if kill {
-        exit_current_by_signal(9);
-    }
-    if term {
-        exit_current_by_signal(15);
-    }
+    crate::syscall::signal::check_fatal_current();
 }
 
 /// 当前进程是否给 signo 注册了真的用户 handler（不是 SIG_DFL/SIG_IGN）
 pub fn current_has_handler(signo: usize) -> bool {
     current_process()
         .inner_exclusive_access()
-        .signal_handlers
-        .get(signo)
-        .copied()
-        .unwrap_or(0)
-        > 1
+        .signal_actions
+        .get(signo.wrapping_sub(1))
+        .map_or(false, |action| action.handler > 1)
 }
 
 /// 给当前进程置“待投递信号”位（用于 SIGSEGV handler 投递）
 pub fn current_set_pending(signo: usize) -> bool {
-    if signo < 32 {
-        current_process().inner_exclusive_access().signal_pending |= 1u32 << signo;
+    if (1..=64).contains(&signo) {
+        crate::syscall::signal::queue_current(signo);
         true
     } else {
         false
@@ -272,6 +270,7 @@ pub fn current_add_signal(signal: SignalFlags) {
 }
 
 pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
+    crate::syscall::futex::remove_task(&task);
     remove_task(Arc::clone(&task));
     remove_timer(Arc::clone(&task));
 }

@@ -55,6 +55,14 @@ pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
     map.get(&pid).map(Arc::clone)
 }
 
+pub fn tid2task(tid: usize) -> Option<Arc<TaskControlBlock>> {
+    PID2PCB.exclusive_access().values().find_map(|process| {
+        process.inner_exclusive_access().tasks.iter().flatten()
+            .find(|task| task.linux_tid() == tid)
+            .cloned()
+    })
+}
+
 pub fn insert_into_pid2process(pid: usize, process: Arc<ProcessControlBlock>) {
     PID2PCB.exclusive_access().insert(pid, process);
 }

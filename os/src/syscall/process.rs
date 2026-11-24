@@ -7,8 +7,8 @@ use crate::mm::{
     try_translated_refmut, UserBuffer,
 };
 use crate::task::{
-    current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
-    suspend_current_and_run_next, SignalFlags,
+    current_process, current_task, current_user_token, exit_current_and_run_next,
+    suspend_current_and_run_next,
 };
 use crate::timer::get_time_ms;
 use alloc::vec::Vec;
@@ -36,7 +36,16 @@ pub fn sys_fork() -> isize {
 }
 
 pub(super) fn fork_with_stack(stack: usize) -> isize {
-    current_process().fork(stack).map(|pid| pid as isize).unwrap_or_else(|errno| errno)
+    fork_with_child_tid(stack, None, None)
+}
+
+pub(super) fn fork_with_child_tid(
+    stack: usize,
+    set_child_tid: Option<usize>,
+    clear_child_tid: Option<usize>,
+) -> isize {
+    current_process().fork(stack, set_child_tid, clear_child_tid)
+        .map(|pid| pid as isize).unwrap_or_else(|errno| errno)
 }
 
 pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isize {
@@ -150,9 +159,9 @@ fn script_interpreter(
 
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
-pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    let process = current_process();
+pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize {
     loop {
+        let process = current_process();
         let inner = process.inner_exclusive_access();
         if !inner
             .children
@@ -179,6 +188,10 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
             return found_pid as isize;
         }
         drop(inner);
+        drop(process);
+        if options & 1 != 0 { // WNOHANG
+            return 0;
+        }
         // 父进程在内核里忙等，时钟中断不会到来，
         // 必须主动轮询定时器，否则子进程的 sleep 永远醒不了。
         crate::timer::check_timer();
@@ -229,74 +242,19 @@ pub fn sys_times(buf: *mut u8) -> isize {
     (crate::timer::get_time_ms() / 10) as isize
 }
 
-/// kill(2)。注意：**目标不存在（已退出/僵尸进程）时绝不能把信号投给自己**。
-/// 之前这里有一个“找不到 pid 就投给当前进程”的兜底（本来是为 pthread_kill 写的），
-/// 结果 busybox 脚本 `kill -9 $stale_pid`、lmbench 的 `kill(benchmp_sigalrm_pid, SIGTERM)`
-/// 会把调用者自己杀掉 —— 表现为 shell 半路消失 / benchmp 自己收到 SIGTERM。
-/// tkill/tgkill 走 sys_thread_kill。
 pub fn sys_kill(pid: usize, signal: u32) -> isize {
-    // 实时信号/线程取消信号（>=32）用 bitflags 表示不了，直接按成功放过
-    if signal >= 32 {
-        return 0;
-    }
-    if signal == 0 {
-        return 0;
-    }
-    let flag = match SignalFlags::from_bits(1u32 << signal) {
-        Some(f) => f,
-        None => return -22,
-    };
-    if pid == 0 {
-        // kill(0) 语义上是发给自己所在进程组（这里就是自己）
-        let this = current_process();
-        let mut inner = this.inner_exclusive_access();
-        inner.signals |= flag;
-        if signal != 2 && signal != 9 && signal != 15 {
-            inner.signal_pending |= 1u32 << signal;
-        }
-        return 0;
-    }
-    if let Some(process) = pid2process(pid) {
-        let mut inner = process.inner_exclusive_access();
-        inner.signals |= flag;
-        // SIGKILL/SIGTERM/SIGINT 走 check_error 直接杀进程；其它信号置 pending 交给 handler
-        if signal != 2 && signal != 9 && signal != 15 {
-            inner.signal_pending |= 1u32 << signal;
-        }
-    }
-    // 目标不存在：按成功返回（测试脚本常见“kill 一个已退出的后台进程”）
-    0
-}
-
-/// tkill / tgkill / rt_tgsigqueueinfo：参数是 tid，不是 pid。
-/// 本内核的线程信号统一投递给整个进程（pthread_cancel 依赖这条路径）。
-pub fn sys_thread_kill(signal: u32) -> isize {
-    if signal >= 32 {
-        return 0;
-    }
-    if signal == 0 {
-        return 0;
-    }
-    let flag = match SignalFlags::from_bits(1u32 << signal) {
-        Some(f) => f,
-        None => return -22,
-    };
-    let this = current_process();
-    let mut inner = this.inner_exclusive_access();
-    inner.signals |= flag;
-    if signal != 2 && signal != 9 && signal != 15 {
-        inner.signal_pending |= 1u32 << signal;
-    }
-    0
+    super::signal::kill_process(pid, signal as usize)
 }
 
 pub fn sys_exit_group(exit_code: i32) -> ! {
-    sys_exit(exit_code)
+    crate::task::exit_current_group(exit_code);
+    unreachable!("exited thread resumed")
 }
 
-/// 单线程进程，tid 用 pid 代替
-pub fn sys_set_tid_address(_tidptr: usize) -> isize {
-    current_process().getpid() as isize
+pub fn sys_set_tid_address(tidptr: usize) -> isize {
+    let task = current_task().unwrap();
+    task.inner_exclusive_access().clear_child_tid = tidptr;
+    task.linux_tid() as isize
 }
 
 /// gettimeofday(169)：填 struct timeval { long sec; long usec; }，返回 0
@@ -579,6 +537,8 @@ pub fn sys_pselect6(
             }
             return nready as isize;
         }
+        drop(files);
+        drop((out_r, out_w, out_e));
         match deadline {
             None => {
                 crate::syscall::sync::sys_sleep(5);
@@ -625,8 +585,10 @@ pub fn sys_rt_sigtimedwait(set: *const u8, info: *mut u8, timeout: *const u8) ->
         return -14;
     }
     let token = current_user_token();
-    // 内核 sigset_t：bit(n-1) 表示信号 n；SignalFlags：bit(n) 表示信号 n → 左移 1 对齐
-    let setbits = (unsafe { *translated_ref(token, set as *const usize) } as u32) << 1;
+    let setbits = match crate::mm::try_translated_ref(token, set as *const u64) {
+        Some(set) => *set,
+        None => return -14,
+    };
     let deadline = if timeout.is_null() {
         usize::MAX
     } else {
@@ -635,24 +597,12 @@ pub fn sys_rt_sigtimedwait(set: *const u8, info: *mut u8, timeout: *const u8) ->
         crate::timer::get_time_ms() + sec * 1000 + (nsec + 999_999) / 1_000_000
     };
     loop {
-        let process = current_process();
-        let signo = {
-            let mut inner = process.inner_exclusive_access();
-            let pending = inner.signals.bits() & setbits;
-            if pending != 0 {
-                let signo = pending.trailing_zeros() as usize;
-                inner.signals =
-                    SignalFlags::from_bits_truncate(inner.signals.bits() & !(1u32 << signo));
-                Some(signo)
-            } else {
-                None
-            }
-        };
-        if let Some(signo) = signo {
+        if let Some(signo) = super::signal::take_pending(setbits) {
             if !info.is_null() {
                 for i in 0..128usize {
                     *translated_refmut(token, (info as usize + i) as *mut u8) = 0;
                 }
+                *translated_refmut(token, info.cast::<i32>()) = signo as i32;
             }
             return signo as isize;
         }

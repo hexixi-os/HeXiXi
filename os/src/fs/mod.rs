@@ -25,6 +25,9 @@ pub trait File: Send + Sync {
     fn directory(&self) -> Option<&DirectoryFile> {
         None
     }
+    fn stat_identity(&self) -> Option<(u64, u64)> {
+        None
+    }
     fn mapping_size(&self) -> Option<usize> {
         None
     }

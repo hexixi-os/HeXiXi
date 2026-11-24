@@ -66,7 +66,7 @@ def check_program():
     check(0x22008, 73)  # end of the file-backed bytes
     check(0x2200C, 0)   # BSS in that same page
     # pipe copies its result into an untouched BSS page.
-    instructions.extend([lui(10, 0x23000), addi(10, 10, 8), addi(17, 0, 59), 0x73])
+    instructions.extend([lui(10, 0x23000), addi(10, 10, 8), addi(11, 0, 0), addi(17, 0, 59), 0x73])
     expect_equal(10, 0)
     check(0x23000, 0)
     address(0x21000)

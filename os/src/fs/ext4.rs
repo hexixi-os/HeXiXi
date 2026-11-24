@@ -378,6 +378,10 @@ impl Ext4File {
 }
 
 impl File for Ext4File {
+    fn stat_identity(&self) -> Option<(u64, u64)> {
+        Some((self.fs.id as u64, self.inode.ino as u64))
+    }
+
     fn readable(&self) -> bool {
         true
     }

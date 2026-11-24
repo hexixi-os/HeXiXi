@@ -83,6 +83,7 @@ pub fn remove_timer(task: Arc<TaskControlBlock>) {
 }
 
 pub fn check_timer() {
+    crate::syscall::futex::check_waiters();
     let current_ms = get_time_ms();
     let mut timers = TIMERS.exclusive_access();
     while let Some(timer) = timers.peek() {

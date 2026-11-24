@@ -79,32 +79,28 @@ make -C os clean
 内核启动第一个进程时，盘里只要有 `oscomp_runner` 就先启动它（见 `os/src/task/mod.rs` 的 `INITPROC`），
 而 `user/src/bin/` 下的程序会全部打进 `fs.img`，所以它总在。它找不到评测脚本就直接退出，内核随即关机，看起来就是「没有任何输出」。
 
-想在本地镜像上跑 usertests，临时把它挪走：
+可以用独立的 easy-fs 镜像启动 usertests。从仓库根目录运行，镜像会把 usertests 作为 `initproc` 安装。
 
 ```bash
-cd ~/HeXiXi
-mv user/src/bin/oscomp_runner.rs /tmp/
-make -C os build TEST=1          # TEST=1 把 usertests 复制成 initproc
-cd os
+work=$(mktemp -d)
+mkdir -p "$work/names" "$work/root"
+(cd user && cargo build --release --bins)
+user_bins=user/target/riscv64gc-unknown-none-elf/release
+for app in $(sed -n 's/^    ("\([a-z_0-9]*\)\\0".*/\1/p' user/src/bin/usertests.rs | sort -u); do
+    touch "$work/names/$app"
+    cp "$user_bins/$app" "$work/root/$app"
+done
+touch "$work/names/initproc"
+cp "$user_bins/usertests" "$work/root/initproc"
+(cd easy-fs-fuse && cargo +stable run --release -- -s "$work/names/" -t "$work/root/")
+make all KERNEL_OUT="$work/kernel-rv"
 qemu-system-riscv64 -machine virt -m 256M -nographic -bios default \
-  -kernel target/riscv64gc-unknown-none-elf/release/os.bin \
-  -drive file=../user/target/riscv64gc-unknown-none-elf/release/fs.img,if=none,format=raw,id=x0 \
+  -kernel "$work/kernel-rv" -snapshot -no-reboot \
+  -drive "file=$work/root/fs.img,if=none,format=raw,id=x0" \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 ```
 
-退出 QEMU：先按 `Ctrl+A`，松开后按 `X`。
-
-跑完务必还原，否则评测盘会缺 runner：
-
-```bash
-cd ~/HeXiXi
-mv /tmp/oscomp_runner.rs user/src/bin/
-rm -f user/target/riscv64gc-unknown-none-elf/release/initproc*
-touch user/src/bin/initproc.rs
-make -C os build
-```
-
-已实测：usertests 能启动并跑一大批用例，但跑到 `race_adder_arg` 时内核会 panic，详见 [测试状态](TEST_STATUS.md)。
+完整执行包含 1,000 次管道测试，结束时会输出 `Usertests passed!` 并自动关机。测试结果见 [测试状态](TEST_STATUS.md)。
 不带 `TEST=1` 时 `initproc` 会启动 `user_shell`，这条路径 Martyr 没有实测。
 
 ## 常见问题

@@ -11,6 +11,7 @@ use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
+use alloc::collections::BTreeSet;
 use core::cell::RefMut;
 
 pub struct ProcessControlBlock {
@@ -27,6 +28,7 @@ pub struct ProcessControlBlockInner {
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub wait_status: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
+    pub close_on_exec: BTreeSet<usize>,
     pub signals: SignalFlags,
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
@@ -44,11 +46,10 @@ pub struct ProcessControlBlockInner {
     /// SIGALRM 到期时间（ms，0 表示未设置）
     pub alarm_deadline: usize,
     /// 每个信号号的用户 handler（0 = SIG_DFL，1 = SIG_IGN）
-    pub signal_handlers: [usize; 32],
+    pub signal_actions: [crate::syscall::signal::SignalAction; 64],
     /// 待投递信号位图（bit = signo）
-    pub signal_pending: u32,
-    /// 正在执行 SIGALRM handler（避免重入）
-    pub in_sigalrm: bool,
+    pub signal_pending: u64,
+    pub legacy_thread_exit: bool,
     /// RLIMIT_NOFILE 的当前上限（fd 表硬上限；setrlimit/prlimit64 会改）
     pub nofile_limit: usize,
     #[cfg(feature = "elf_startup_stats")]
@@ -56,6 +57,14 @@ pub struct ProcessControlBlockInner {
 }
 
 impl ProcessControlBlockInner {
+    pub fn set_close_on_exec(&mut self, fd: usize, close: bool) {
+        if close {
+            self.close_on_exec.insert(fd);
+        } else {
+            self.close_on_exec.remove(&fd);
+        }
+    }
+
     #[allow(unused)]
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
@@ -82,7 +91,11 @@ impl ProcessControlBlockInner {
     }
 
     pub fn thread_count(&self) -> usize {
-        self.tasks.iter().filter(|task| task.is_some()).count()
+        self.tasks
+            .iter()
+            .flatten()
+            .filter(|task| task.inner_exclusive_access().exit_code.is_none())
+            .count()
     }
 
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
@@ -121,6 +134,7 @@ impl ProcessControlBlock {
                         // 2 -> stderr
                         Some(Arc::new(Stdout)),
                     ],
+                    close_on_exec: BTreeSet::new(),
                     signals: SignalFlags::empty(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -132,9 +146,9 @@ impl ProcessControlBlock {
                     brk: 0,
                     mmap_top: 0x1000_0000,
                     alarm_deadline: 0,
-                    signal_handlers: [0usize; 32],
+                    signal_actions: [Default::default(); 64],
                     signal_pending: 0,
-                    in_sigalrm: false,
+                    legacy_thread_exit: true,
                     nofile_limit: 1024,
                     #[cfg(feature = "elf_startup_stats")]
                     pending_exec: None,
@@ -207,7 +221,9 @@ impl ProcessControlBlock {
         envs: Vec<Vec<u8>>,
     ) -> Result<(), isize> {
         const AUXV_ENTRIES: usize = 16;
-        if self.inner_exclusive_access().thread_count() != 1 {
+        if self.inner_exclusive_access().tasks.iter().flatten().count() != 1
+            || super::current_task().unwrap().linux_tid() != self.getpid()
+        {
             return Err(-16); // EBUSY
         }
         let (mut memory_set, elf) = MemorySet::from_exec(source, path)?;
@@ -237,6 +253,8 @@ impl ProcessControlBlock {
         // since memory_set has been changed
         let task = self.inner_exclusive_access().get_task(0);
         let mut task_inner = task.inner_exclusive_access();
+        task_inner.clear_child_tid = 0;
+        task_inner.signal_context = None;
         task_inner.res.as_mut().unwrap().ustack_base = elf.stack_base;
         task_inner.res.as_mut().unwrap().alloc_user_res();
         task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
@@ -245,6 +263,15 @@ impl ProcessControlBlock {
             pinner.brk_base = heap_base;
             pinner.brk = heap_base;
             pinner.mmap_top = 0x1000_0000;
+            pinner.legacy_thread_exit = true;
+            for fd in core::mem::take(&mut pinner.close_on_exec) {
+                pinner.fd_table[fd] = None;
+            }
+            for action in &mut pinner.signal_actions {
+                if action.handler != 1 {
+                    *action = Default::default();
+                }
+            }
         }
         // ---- 构造 Linux 进程启动栈 ----
         // 低地址 -> 高地址：argc | argv[..] | NULL | envp[..] | NULL | auxv | 字符串/程序头/随机数
@@ -357,11 +384,18 @@ impl ProcessControlBlock {
     }
 
     /// Only support processes with a single thread.
-    pub fn fork(self: &Arc<Self>, stack: usize) -> Result<usize, isize> {
+    pub fn fork(
+        self: &Arc<Self>,
+        stack: usize,
+        set_child_tid: Option<usize>,
+        clear_child_tid: Option<usize>,
+    ) -> Result<usize, isize> {
         #[cfg(feature = "elf_startup_stats")]
         crate::fork_stats::begin();
         let mut parent = self.inner_exclusive_access();
-        if parent.thread_count() != 1 {
+        if parent.tasks.iter().flatten().count() != 1
+            || super::current_task().unwrap().linux_tid() != self.getpid()
+        {
             return Err(-11); // EAGAIN
         }
         let kstack = try_kstack_alloc().ok_or(-12isize)?;
@@ -388,6 +422,7 @@ impl ProcessControlBlock {
                     children: Vec::new(),
                     wait_status: 0,
                     fd_table: new_fd_table,
+                    close_on_exec: parent.close_on_exec.clone(),
                     signals: SignalFlags::empty(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
@@ -399,9 +434,9 @@ impl ProcessControlBlock {
                     brk: 0,
                     mmap_top: 0x1000_0000,
                     alarm_deadline: 0,
-                    signal_handlers: [0usize; 32],
+                    signal_actions: parent.signal_actions,
                     signal_pending: 0,
-                    in_sigalrm: false,
+                    legacy_thread_exit: parent.legacy_thread_exit,
                     nofile_limit: 1024,
                     #[cfg(feature = "elf_startup_stats")]
                     pending_exec: None,
@@ -435,7 +470,17 @@ impl ProcessControlBlock {
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
         // modify kstack_top in trap_cx of this thread
-        let task_inner = task.inner_exclusive_access();
+        let mut task_inner = task.inner_exclusive_access();
+        let parent_task = parent.get_task(0);
+        let parent_thread = parent_task.inner_exclusive_access();
+        task_inner.signal_mask = parent_thread.signal_mask;
+        task_inner.signal_context = parent_thread.signal_context.map(|(mut context, mask)| {
+            context.kernel_sp = task.kstack.get_top();
+            (context, mask)
+        });
+        drop(parent_thread);
+        task_inner.set_child_tid = set_child_tid;
+        task_inner.clear_child_tid = clear_child_tid.unwrap_or(0);
         let trap_cx = task_inner.get_trap_cx();
         trap_cx.kernel_sp = task.kstack.get_top();
         if stack != 0 {

@@ -28,9 +28,6 @@ impl RecycleAllocator {
             self.current - 1
         }
     }
-    fn next_id(&self) -> usize {
-        self.recycled.last().copied().unwrap_or(self.current)
-    }
     pub fn dealloc(&mut self, id: usize) {
         assert!(id < self.current);
         assert!(
@@ -126,27 +123,15 @@ pub struct TaskUserRes {
     pub tid: usize,
     pub ustack_base: usize,
     pub process: Weak<ProcessControlBlock>,
+    owns_stack: bool,
+    owns_trap: bool,
 }
 
 fn trap_cx_bottom_from_tid(tid: usize) -> usize {
     TRAP_CONTEXT_BASE - tid * PAGE_SIZE
 }
 
-fn ustack_bottom_from_tid(ustack_base: usize, tid: usize) -> usize {
-    ustack_base + tid * (PAGE_SIZE + USER_STACK_SIZE)
-}
-
 impl TaskUserRes {
-    pub fn next_stack_available(process: &ProcessControlBlock, ustack_base: usize) -> bool {
-        let inner = process.inner_exclusive_access();
-        let tid = inner.task_res_allocator.next_id();
-        let bottom = ustack_bottom_from_tid(ustack_base, tid);
-        let top = bottom + USER_STACK_SIZE;
-        top <= crate::mm::USER_END && inner.memory_set.vacant(&(
-            VirtAddr::from(bottom).floor()..VirtAddr::from(top).floor()
-        ))
-    }
-
     pub fn new(
         process: Arc<ProcessControlBlock>,
         ustack_base: usize,
@@ -157,6 +142,8 @@ impl TaskUserRes {
             tid,
             ustack_base,
             process: Arc::downgrade(&process),
+            owns_stack: true,
+            owns_trap: true,
         };
         if alloc_user_res {
             task_user_res.alloc_user_res();
@@ -164,24 +151,48 @@ impl TaskUserRes {
         task_user_res
     }
 
-    /// 只分配 trap_cx（clone 线程用自己的栈，不需要再分配 rCore 的用户栈）
-    pub fn alloc_trap_cx_only(&self) {
-        let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.inner_exclusive_access();
-        let trap_cx_bottom = trap_cx_bottom_from_tid(self.tid);
-        let trap_cx_top = trap_cx_bottom + PAGE_SIZE;
-        process_inner.memory_set.insert_framed_area(
-            trap_cx_bottom.into(),
-            trap_cx_top.into(),
+    pub(super) fn try_for_thread(process: &Arc<ProcessControlBlock>, stack_hint: Option<usize>) -> Option<Self> {
+        let tid = process.inner_exclusive_access().alloc_tid();
+        let mut res = Self {
+            tid,
+            ustack_base: 0,
+            process: Arc::downgrade(process),
+            owns_stack: false,
+            owns_trap: false,
+        };
+        let mut inner = process.inner_exclusive_access();
+        let trap = trap_cx_bottom_from_tid(tid);
+        res.owns_trap = inner.memory_set.try_insert_framed_area(
+            trap.into(),
+            (trap + PAGE_SIZE).into(),
             MapPermission::R | MapPermission::W,
         );
+        if !res.owns_trap {
+            return None;
+        }
+        if let Some(hint) = stack_hint {
+            // Skip existing mappings and leave space for a guard page.
+            let pages = USER_STACK_SIZE / PAGE_SIZE;
+            let range = inner.memory_set.find_vacant((hint / PAGE_SIZE).into(), pages + 2)?;
+            res.ustack_base = (range.start.0 + 1) * PAGE_SIZE;
+            res.owns_stack = inner.memory_set.try_insert_framed_area(
+                res.ustack_base.into(),
+                res.ustack_top().into(),
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            );
+            if !res.owns_stack {
+                return None;
+            }
+        }
+        drop(inner);
+        Some(res)
     }
 
     pub fn alloc_user_res(&self) {
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.inner_exclusive_access();
         // alloc user stack
-        let ustack_bottom = ustack_bottom_from_tid(self.ustack_base, self.tid);
+        let ustack_bottom = self.ustack_base;
         let ustack_top = ustack_bottom + USER_STACK_SIZE;
         process_inner.memory_set.insert_framed_area(
             ustack_bottom.into(),
@@ -198,36 +209,17 @@ impl TaskUserRes {
         );
     }
 
-    fn dealloc_user_res(&self) {
-        // dealloc tid
+    pub(super) fn release_mappings(&mut self) {
         let process = self.process.upgrade().unwrap();
         let mut process_inner = process.inner_exclusive_access();
-        // dealloc ustack manually
-        let ustack_bottom_va: VirtAddr = ustack_bottom_from_tid(self.ustack_base, self.tid).into();
-        process_inner
-            .memory_set
-            .remove_area_with_start_vpn(ustack_bottom_va.into());
-        // dealloc trap_cx manually
-        let trap_cx_bottom_va: VirtAddr = trap_cx_bottom_from_tid(self.tid).into();
-        process_inner
-            .memory_set
-            .remove_area_with_start_vpn(trap_cx_bottom_va.into());
-    }
-
-    #[allow(unused)]
-    pub fn alloc_tid(&mut self) {
-        self.tid = self
-            .process
-            .upgrade()
-            .unwrap()
-            .inner_exclusive_access()
-            .alloc_tid();
-    }
-
-    pub fn dealloc_tid(&self) {
-        let process = self.process.upgrade().unwrap();
-        let mut process_inner = process.inner_exclusive_access();
-        process_inner.dealloc_tid(self.tid);
+        if self.owns_stack {
+            process_inner.memory_set.remove_area_with_start_vpn(VirtAddr::from(self.ustack_base).into());
+            self.owns_stack = false;
+        }
+        if self.owns_trap {
+            process_inner.memory_set.remove_area_with_start_vpn(VirtAddr::from(self.trap_cx_user_va()).into());
+            self.owns_trap = false;
+        }
     }
 
     pub fn trap_cx_user_va(&self) -> usize {
@@ -249,17 +241,16 @@ impl TaskUserRes {
         self.ustack_base
     }
     pub fn ustack_top(&self) -> usize {
-        ustack_bottom_from_tid(self.ustack_base, self.tid) + USER_STACK_SIZE
+        self.ustack_base + USER_STACK_SIZE
     }
 }
 
 impl Drop for TaskUserRes {
     fn drop(&mut self) {
         // 延迟回收 TCB 时进程可能已经析构（Weak 升级失败），此时直接跳过
-        if self.process.upgrade().is_none() {
-            return;
+        if let Some(process) = self.process.upgrade() {
+            self.release_mappings();
+            process.inner_exclusive_access().dealloc_tid(self.tid);
         }
-        self.dealloc_tid();
-        self.dealloc_user_res();
     }
 }

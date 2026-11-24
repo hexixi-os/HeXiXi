@@ -45,7 +45,7 @@ const SYSCALL_SETPGID: usize = 154;
 const SYSCALL_GETPGID: usize = 155;
 const SYSCALL_GETSID: usize = 156;
 const SYSCALL_TKILL: usize = 130;
-const SYSCALL_TGKILL: usize = 234;
+const SYSCALL_TGKILL: usize = 131;
 const SYSCALL_RT_TGSIGQUEUEINFO: usize = 240;
 const SYSCALL_NEWFSTATAT: usize = 79;
 const SYSCALL_FSYNC: usize = 81;
@@ -117,6 +117,7 @@ const SYSCALL_CONDVAR_SIGNAL: usize = 1031;
 const SYSCALL_CONDVAR_WAIT: usize = 1032;
 
 mod fs;
+pub(crate) mod futex;
 mod process;
 pub mod signal;
 mod sync;
@@ -167,7 +168,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_TRUNCATE => sys_truncate(),
         SYSCALL_IOCTL => sys_ioctl(),
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as isize, args[2]),
-        SYSCALL_FUTEX => sys_futex(args[0], args[1], args[2]),
+        SYSCALL_FUTEX => futex::sys_futex(args),
         SYSCALL_CLONE => sys_clone_thread(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_READV => sys_readv(args[0], args[1] as *const u8, args[2]),
         SYSCALL_PSELECT6 => sys_pselect6(
@@ -201,10 +202,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         // LTP 的 test harness 每个用例都 setpgid(0,0)，缺了就全部 TBROK
         SYSCALL_SETPGID => 0,
         SYSCALL_GETPGID | SYSCALL_GETSID => sys_getpid(),
-        // pthread_cancel 走 tkill/tgkill 发 SIGCANCEL；按“给本进程投递信号”处理
-        SYSCALL_TKILL => sys_thread_kill(args[1] as u32),
-        SYSCALL_TGKILL => sys_thread_kill(args[2] as u32),
-        SYSCALL_RT_TGSIGQUEUEINFO => sys_thread_kill(args[2] as u32),
+        SYSCALL_TKILL => signal::sys_thread_kill(None, args[0], args[1]),
+        SYSCALL_TGKILL => signal::sys_thread_kill(Some(args[0]), args[1], args[2]),
+        SYSCALL_RT_TGSIGQUEUEINFO => -38, // Queued siginfo delivery is not supported.
         SYSCALL_SENDFILE => sys_sendfile(args[0], args[1], args[3]),
         SYSCALL_NEWFSTATAT => sys_newfstatat(
             args[0] as isize,
@@ -213,11 +213,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3],
         ),
         SYSCALL_FSYNC | SYSCALL_FDATASYNC => 0,
-        SYSCALL_SIGACTION => signal::sys_rt_sigaction(args[0], args[1] as *const u8, args[2] as *mut u8),
-        SYSCALL_SIGPROCMASK => 0,
+        SYSCALL_SIGACTION => signal::sys_rt_sigaction(args[0], args[1], args[2], args[3]),
+        SYSCALL_SIGPROCMASK => signal::sys_rt_sigprocmask(args[0], args[1], args[2], args[3]),
         SYSCALL_SETPRIORITY => 0,
         SYSCALL_GETUID | SYSCALL_GETEUID | SYSCALL_GETGID | SYSCALL_GETEGID => 0,
-        SYSCALL_GETTID_LINUX => sys_getpid(),
+        SYSCALL_GETTID_LINUX => crate::task::current_task().unwrap().linux_tid() as isize,
         SYSCALL_DUP_LEGACY => sys_dup(args[0]),
         SYSCALL_DUP => sys_dup3(args[0], args[1], args[2] as u32),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
@@ -230,7 +230,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut u8),
         SYSCALL_OPEN => sys_openat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),
         SYSCALL_CLOSE => sys_close(args[0]),
-        SYSCALL_PIPE => sys_pipe(args[0] as *mut usize),
+        SYSCALL_PIPE => sys_pipe(args[0] as *mut usize, args[1] as u32),
         SYSCALL_READ => sys_read(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITEV => sys_writev(args[0], args[1] as *const u8, args[2]),
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
@@ -272,7 +272,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             #[cfg(not(feature = "elf_startup_stats"))]
             load()
         }
-        SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32),
+        SYSCALL_WAITPID => sys_waitpid(args[0] as isize, args[1] as *mut i32, args[2]),
         SYSCALL_THREAD_CREATE => sys_thread_create(args[0], args[1]),
         SYSCALL_GETTID => sys_gettid(),
         SYSCALL_WAITTID => sys_waittid(args[0]) as isize,

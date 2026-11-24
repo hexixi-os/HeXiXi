@@ -126,7 +126,11 @@ pub fn sys_exec(path: &str, args: &[*const u8]) -> isize {
 }
 
 pub fn sys_waitpid(pid: isize, exit_code: *mut i32) -> isize {
-    syscall(SYSCALL_WAITPID, [pid as usize, exit_code as usize, 0])
+    sys_waitpid_with_options(pid, exit_code, 0)
+}
+
+pub fn sys_waitpid_with_options(pid: isize, exit_code: *mut i32, options: usize) -> isize {
+    syscall(SYSCALL_WAITPID, [pid as usize, exit_code as usize, options])
 }
 
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {

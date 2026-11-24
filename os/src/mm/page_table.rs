@@ -357,10 +357,11 @@ fn typed_user_addr<T>(token: usize, va: usize, access: MapPermission) -> Option<
 }
 
 pub fn translated_ref<T>(token: usize, ptr: *const T) -> &'static T {
-    match typed_user_addr::<T>(token, ptr as usize, MapPermission::R) {
-        Some(pa) => pa.get_ref(),
-        None => unsafe { &*(dummy_user_page() as *const T) },
-    }
+    try_translated_ref(token, ptr).unwrap_or_else(|| unsafe { &*(dummy_user_page() as *const T) })
+}
+
+pub(crate) fn try_translated_ref<T>(token: usize, ptr: *const T) -> Option<&'static T> {
+    typed_user_addr::<T>(token, ptr as usize, MapPermission::R).map(|pa| pa.get_ref())
 }
 
 pub(crate) fn try_translated_refmut<T>(token: usize, ptr: *mut T) -> Option<&'static mut T> {

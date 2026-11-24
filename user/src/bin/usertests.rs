@@ -89,8 +89,9 @@ fn run_tests(tests: &[(&str, &str, &str, &str, i32)]) -> i32 {
 
         let pid = fork();
         if pid == 0 {
-            exec(test.0, &arr[..]);
-            panic!("unreachable!");
+            let error = exec(test.0, &arr[..]);
+            println!("Usertests: exec {} failed ({})", test.0, error);
+            user_lib::exit(127);
         } else {
             let mut exit_code: i32 = Default::default();
             let wait_pid = waitpid(pid as usize, &mut exit_code);

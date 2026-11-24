@@ -15,7 +15,7 @@ pub use memory_set::remap_test;
 pub use memory_set::{kernel_token, MapPermission, MemorySet, KERNEL_SPACE};
 pub use vma::{PageFault, VmaBacking, USER_END};
 use page_table::PTEFlags;
-pub(crate) use page_table::{translated_c_bytes, try_translated_refmut};
+pub(crate) use page_table::{translated_c_bytes, try_translated_ref, try_translated_refmut};
 pub use page_table::{
     translated_byte_buffer, translated_path, translated_ref, translated_refmut, translated_str,
     PageTable,

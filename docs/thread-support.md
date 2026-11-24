@@ -1,5 +1,30 @@
 # Linux clone / pthread 支持现状
 
+PR-13 在单核 QEMU 上验证了动态 musl、glibc 的 pthread 创建与回收、TLS、mutex、条件变量及定向信号。兼容范围包含同一地址空间的 futex WAIT、WAKE、BITSET 和 REQUEUE，以及 `exit_group` 清理。跨进程共享 futex、robust futex 的 owner-death 恢复、完整的信号栈与 siginfo ABI 仍待实现。运行结果见 [测试状态](TEST_STATUS.md)。
+
+## 复跑 pthread 和动态 BusyBox
+
+沿用 [PR-12 动态 ELF](TEST_STATUS.md#2026-11-24-pr-12-动态-elf) 的工具链和 fixture。其中 `busybox` 是原盘的静态程序，由 runner 用来启动测试。glibc 2.31 额外需要与 `libc.so.6` 同一套工具链的 `libpthread.so.0`。
+
+```bash
+source_file=tools/oscomp/tests/pthread_abi.c
+"$musl_cc" -fPIE -pie -pthread -O2 "$source_file" -o "$fixture/pthread-musl"
+"$glibc_cc" -fPIE -pie -pthread -O2 "$source_file" -o "$fixture/pthread-glibc"
+for library in libpthread.so.0 libm.so.6 libresolv.so.2; do
+    install -m755 "$("$glibc_cc" -print-file-name="$library")" "$fixture/lib/$library"
+done
+busybox_src=/path/to/writable/busybox
+cp "$SUITE/config/busybox-config-riscv64" "$busybox_src/.config"
+make -C "$busybox_src" CROSS_COMPILE=riscv64-linux-gnu- oldconfig
+make -C "$busybox_src" CROSS_COMPILE=riscv64-linux-gnu- -j"$(nproc)"
+install -m755 "$busybox_src/busybox" "$fixture/busybox-dynamic"
+tools/oscomp/test_pthread_abi.sh "$fixture" "$fixture/pthread.log"
+```
+
+`busybox_src` 使用官方套件 BusyBox 源码的可写副本。`oldconfig` 可接受默认项，保持 `CONFIG_STATIC` 关闭。`readelf -l "$fixture/busybox-dynamic"` 应显示 `PT_INTERP`。
+
+## 早期调试记录
+
 > **历史记录**：这是 pthread 刚开始适配时的调试笔记，下面说的「父线程的 futex WAIT 没被唤醒」后来已经修通（见 [适配改动说明](ADAPTATION_NOTES.md)）。现状以代码和 [测试状态](TEST_STATUS.md) 为准。
 
 ## 已实现

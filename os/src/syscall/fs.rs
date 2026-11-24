@@ -8,6 +8,14 @@ use alloc::{string::String, sync::Arc};
 
 const AT_FDCWD: isize = -100;
 
+fn with_io_file<T>(file: Arc<dyn fs::File>, operation: impl FnOnce(&dyn fs::File) -> T) -> T {
+    let pointer = Arc::as_ptr(&file);
+    crate::task::current_task().unwrap().inner_exclusive_access().user_io_file = Some(file);
+    // The task pins the file through the syscall. If the thread group exits,
+    // the syscall is discarded and the task's cleanup drops the reference.
+    operation(unsafe { &*pointer })
+}
+
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
     let token = current_user_token();
     let process = current_process();
@@ -22,8 +30,9 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
         let file = file.clone();
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
+        drop(process);
         match translated_byte_buffer(token, buf, len, MapPermission::R) {
-            Some(buffers) => file.write(UserBuffer::new(buffers)),
+            Some(buffers) => with_io_file(file, |file| file.write(UserBuffer::new(buffers))),
             None => -14,
         }
     } else {
@@ -48,8 +57,9 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
         }
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
+        drop(process);
         match translated_byte_buffer(token, buf, len, MapPermission::W) {
-            Some(buffers) => file.read(UserBuffer::new(buffers)) as isize,
+            Some(buffers) => with_io_file(file, |file| file.read(UserBuffer::new(buffers)) as isize),
             None => -14,
         }
     } else {
@@ -84,10 +94,16 @@ pub fn sys_close(fd: usize) -> isize {
         return -1;
     }
     inner.fd_table[fd].take();
+    inner.set_close_on_exec(fd, false);
     0
 }
 
-pub fn sys_pipe(pipe: *mut usize) -> isize {
+const O_CLOEXEC: u32 = 0o2000000;
+
+pub fn sys_pipe(pipe: *mut usize, flags: u32) -> isize {
+    if flags & !O_CLOEXEC != 0 {
+        return -22;
+    }
     let process = current_process();
     let token = current_user_token();
     // Resolve writable pages before borrowing the process to install descriptors.
@@ -110,6 +126,10 @@ pub fn sys_pipe(pipe: *mut usize) -> isize {
         }
     };
     inner.fd_table[write_fd] = Some(pipe_write);
+    if flags & O_CLOEXEC != 0 {
+        inner.set_close_on_exec(read_fd, true);
+        inner.set_close_on_exec(write_fd, true);
+    }
     // Linux 的 pipe(int fd[2]) 使用两个 4 字节整数。
     let descriptors = (read_fd as i32)
         .to_ne_bytes()
@@ -152,6 +172,7 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         }
         let file = file.clone();
         drop(inner);
+        drop(process);
         let mut buffers = alloc::vec::Vec::new();
         for i in 0..iovcnt {
             let entry = (iov as usize + i * 16) as *const usize;
@@ -165,7 +186,7 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
                 None => return -14,
             }
         }
-        file.write(UserBuffer::new(buffers))
+        with_io_file(file, |file| file.write(UserBuffer::new(buffers)))
     } else {
         -1
     }
@@ -239,13 +260,20 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         None => return -24, // EMFILE
     };
     inner.fd_table[fd] = Some(file);
+    inner.set_close_on_exec(fd, flags & O_CLOEXEC != 0);
     fd as isize
 }
 
 /// dup3(24)：把 oldfd 复制到指定的 newfd
-pub fn sys_dup3(oldfd: usize, newfd: usize, _flags: u32) -> isize {
+pub fn sys_dup3(oldfd: usize, newfd: usize, flags: u32) -> isize {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
+    if flags & !O_CLOEXEC != 0 {
+        return -22;
+    }
+    if newfd >= inner.nofile_limit {
+        return -9;
+    }
     if oldfd >= inner.fd_table.len() || oldfd == newfd {
         return -1;
     }
@@ -257,6 +285,7 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, _flags: u32) -> isize {
         inner.fd_table.push(None);
     }
     inner.fd_table[newfd] = Some(file);
+    inner.set_close_on_exec(newfd, flags & O_CLOEXEC != 0);
     newfd as isize
 }
 
@@ -333,11 +362,12 @@ pub fn sys_fstat(fd: usize, st: *mut u8) -> isize {
     }
     let file = inner.fd_table[fd].as_ref().unwrap();
     let file_size = file.size();
+    let (device, inode) = file.stat_identity().unwrap_or((0, fd as u64));
     let mode: u32 = if file.directory().is_some() { 0o40755 } else { 0o100644 };
     drop(inner);
     let mut buf = [0u8; 128];
-    // st_ino = fd
-    buf[8..16].copy_from_slice(&(fd as u64).to_le_bytes());
+    buf[0..8].copy_from_slice(&device.to_le_bytes());
+    buf[8..16].copy_from_slice(&inode.to_le_bytes());
     buf[16..20].copy_from_slice(&mode.to_le_bytes());
     // st_nlink = 1
     buf[20..24].copy_from_slice(&1u32.to_le_bytes());
@@ -519,10 +549,20 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 }
             }
             inner.fd_table[new_fd] = Some(file);
+            inner.set_close_on_exec(new_fd, cmd == F_DUPFD_CLOEXEC);
             new_fd as isize
         }
-        F_GETFD => 0,
-        F_SETFD => 0,
+        F_GETFD | F_SETFD => {
+            if inner.fd_table.get(fd).and_then(Option::as_ref).is_none() {
+                return -9;
+            }
+            if cmd == F_GETFD {
+                inner.close_on_exec.contains(&fd) as isize
+            } else {
+                inner.set_close_on_exec(fd, arg & 1 != 0);
+                0
+            }
+        }
         _ => 0,
     }
 }
@@ -617,6 +657,7 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         }
         let file = file.clone();
         drop(inner);
+        drop(process);
         let mut buffers = alloc::vec::Vec::new();
         for i in 0..iovcnt {
             let entry = (iov as usize + i * 16) as *const usize;
@@ -630,7 +671,7 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
                 None => return -14,
             }
         }
-        file.read(UserBuffer::new(buffers)) as isize
+        with_io_file(file, |file| file.read(UserBuffer::new(buffers)) as isize)
     } else {
         -1
     }

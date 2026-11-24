@@ -151,7 +151,7 @@ pub fn waitpid(pid: usize, exit_code: &mut i32) -> isize {
 
 pub fn waitpid_nb(pid: usize, exit_code: &mut i32) -> isize {
     let mut raw: i32 = 0;
-    let ret = sys_waitpid(pid as isize, &mut raw as *mut i32);
+    let ret = sys_waitpid_with_options(pid as isize, &mut raw as *mut i32, 1);
     if ret > 0 {
         *exit_code = decode_wait_status(raw);
     }
@@ -169,7 +169,14 @@ bitflags! {
 }
 
 pub fn kill(pid: usize, signal: i32) -> isize {
-    sys_kill(pid, signal)
+    let bits = signal as u32;
+    if bits == 0 {
+        return sys_kill(pid, 0);
+    }
+    if bits.count_ones() != 1 {
+        return -22;
+    }
+    sys_kill(pid, bits.trailing_zeros() as i32)
 }
 
 pub fn sleep(sleep_ms: usize) {
