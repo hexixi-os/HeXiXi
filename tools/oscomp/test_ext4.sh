@@ -11,6 +11,8 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cd "$tmp"
 rustc +stable --edition 2021 "$tool_dir/tests/ext4_probe.rs" -o ext4_probe
+rustc +stable --edition 2021 --cfg 'feature="page_cache_adaptive"' \
+    "$tool_dir/tests/ext4_probe.rs" -o ext4_probe_adaptive
 
 truncate -s 32M fixture.img
 mkfs.ext4 -q -F -b 4096 fixture.img
@@ -44,6 +46,7 @@ PY
 debugfs -R 'dump /dense dense.reference' fixture.img
 cmp dense.expected dense.reference
 ./ext4_probe fixture.img /dense dense.reference
+./ext4_probe_adaptive fixture.img /dense dense.reference
 
 for path in sparse unwritten; do
     debugfs -R "dump /$path $path.reference" fixture.img

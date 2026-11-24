@@ -6,14 +6,9 @@ use alloc::string::String;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 static FRAMES: AtomicUsize = AtomicUsize::new(0);
-static SECTORS: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn on_frame_alloc() {
     FRAMES.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn on_ext4_sector_read() {
-    SECTORS.fetch_add(1, Ordering::Relaxed);
 }
 
 struct Counters {
@@ -26,7 +21,7 @@ impl Counters {
     fn now() -> Self {
         Self {
             frames: FRAMES.load(Ordering::Relaxed),
-            sectors: SECTORS.load(Ordering::Relaxed),
+            sectors: crate::fs::ext4::sectors_read(),
             us: get_time_us(),
         }
     }

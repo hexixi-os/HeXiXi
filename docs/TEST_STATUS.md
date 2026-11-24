@@ -1,5 +1,51 @@
 # 测试状态
 
+## 2026-11-24 PR-10 页缓存扫描识别
+
+默认策略是 `lru`，可在构建时用 `PAGE_CACHE_POLICY=none|lru|adaptive` 切换。LRU 和自适应策略都最多保留 256 个 4 KiB 文件页，保护仍被映射引用的帧。自适应策略为每个打开文件记录连续读取的页数。缓存满时，从第 8 个连续页开始，未命中且近期历史中没有记录的页直接读请求的字节区间。近期淘汰页和被旁路后再次访问的页可以重新入缓存。历史最多记录 512 次淘汰或旁路事件。两种缓存策略都让 `mmap`、ELF 缺页和普通读取共享文件页。
+
+`/proc/page_cache` 在每次打开时生成一份只读快照。`hits`、`misses` 以查找次数计，一个 `readv` 跨多个缓冲区时可能多次查找同一页。`evictions` 包含容量淘汰及内存压力回收。`bypasses` 计入关缓存、扫描旁路、没有可淘汰帧及分配失败。`refaults` 只统计近期确实被淘汰的页再次未命中，历史过期后再访问不会计入。`resident_pages` 和 `pinned_pages` 分别是当前驻留数和其中仍有缓存外引用的页数。`ext4_sectors_read` 统计已完成的 EXT4 数据和元数据扇区读取，每个扇区为 512 字节。自行比较吞吐时应固定读取对齐和缓冲区切分，未对齐的旁路区间可能重复读取同一扇区。
+
+三种策略在 2025 年初赛 RISC-V64 官方原盘 `basic-musl` 上均为 **102/102**，32 个用例全部满分并正常关机。三种策略均通过文件 `mmap`/VMA 和 ELF 按需加载回归。默认策略还通过 basic ABI、fork COW、easy-fs 和宿主 EXT4 回归。宿主 EXT4 测试也覆盖自适应策略的碎片读、分句柄扫描识别及重复命中。
+
+### 策略对比
+
+在 QEMU 8.2.2、单核、128 MiB 内存下，每组负载使用同一份 32 MiB EXT4 镜像，每种策略独立启动三次，取中位数。混合负载先读一遍热点文件，再交替执行三轮 1,024 页顺序扫描与热点乱序访问。`reuse` 从冷缓存连续读同一段 128 页三次。`revisit` 先扫过另外 256 页填充缓存，再连续读同一段 128 页三次。BusyBox 取自 2025 年初赛 RISC-V64 官方盘的 `/musl/busybox`，测量冷页缓存下第一次执行 `true` 和后续七次启动。以下扇区数只统计测量区间。
+
+| 负载 | 无缓存扇区 | LRU 扇区 | 自适应扇区 | LRU 热点未命中 | 自适应热点未命中 |
+|---|---:|---:|---:|---:|---:|
+| 32 页热点与顺序扫描 | 25,600 | 25,600 | 21,616 | 96 | 0 |
+| 128 页热点与顺序扫描 | 28,672 | 28,672 | 23,920 | 384 | 0 |
+| 单次顺序扫描 | 8,192 | 8,192 | 8,192 | — | — |
+| `reuse` | 3,072 | 1,024 | 1,024 | — | — |
+| `revisit` | 5,120 | 3,072 | 4,040 | — | — |
+| BusyBox 启动八次 | 1,192 | 239 | 239 | — | — |
+
+六组负载的三轮扇区和命中计数完全一致。两组混合负载中，自适应策略分别少读 15.6% 和 16.6% 的扇区，QEMU 客体耗时中位数由 1,760 和 2,050 ms 降至 1,386 和 1,631 ms。`revisit` 的自适应策略在第三遍已全部命中，前两遍的旁路仍使总扇区读取比 LRU 高 31.5%。BusyBox 上两种缓存策略都读 239 个扇区。考虑到满缓存后短扫描的重读成本，默认使用 LRU。本轮测量覆盖 BusyBox 启动，编译工作负载尚未测量。
+
+在 Linux 环境下，从仓库根目录复跑。把 `official_image` 指向官方原盘，`debugfs` 以只读模式取出 BusyBox。每个场景第一次生成镜像，剩余轮次以 `-snapshot` 复用它。
+
+```bash
+official_image=/path/to/sdcard-rv.img
+experiment=$(mktemp -d)
+debugfs -R "dump /musl/busybox $experiment/busybox" "$official_image"
+(cd user && cargo build --release --bin page_cache_probe --bin oscomp_runner)
+export USER_BIN_DIR="$PWD/user/target/riscv64gc-unknown-none-elf/release"
+export PAGE_CACHE_BUSYBOX="$experiment/busybox" QEMU_MEM=128M
+for policy in none lru adaptive; do
+    make all PAGE_CACHE_POLICY="$policy" KERNEL_OUT="$experiment/$policy"
+done
+for scenario in mixed32 mixed128 sequential reuse revisit busybox; do
+    for trial in 1 2 3; do
+        for policy in none lru adaptive; do
+            PAGE_CACHE_IMAGE="$experiment/$scenario.img" PAGE_CACHE_POLICY="$policy" \
+                KERNEL="$experiment/$policy" tools/oscomp/test_page_cache_policy.sh "$scenario" \
+                "$experiment/$scenario-$policy-$trial.log"
+        done
+    done
+done
+```
+
 ## 2026-11-24 PR-09 fork 写时复制
 
 `fork` 共享已驻留的私有用户页，覆盖用户栈、信号页、ELF 和匿名映射。父子任一侧写入时都会检查原映射权限。仍有其他引用的帧会复制，只剩当前映射引用的帧直接恢复可写。共享映射继续保持共享。子进程单独分配内核栈并复制 trap context。当前支持只有一个存活线程的进程执行 `fork`。

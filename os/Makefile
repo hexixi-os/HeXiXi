@@ -73,6 +73,14 @@ fs-img: $(APPS)
 $(APPS):
 
 FEATURES := board_$(BOARD)
+PAGE_CACHE_POLICY ?= lru
+ifeq ($(PAGE_CACHE_POLICY),none)
+FEATURES += page_cache_none
+else ifeq ($(PAGE_CACHE_POLICY),adaptive)
+FEATURES += page_cache_adaptive
+else ifneq ($(PAGE_CACHE_POLICY),lru)
+$(error PAGE_CACHE_POLICY must be lru, adaptive or none)
+endif
 ifeq ($(ELF_STARTUP_STATS),1)
 FEATURES += elf_startup_stats
 endif

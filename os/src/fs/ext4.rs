@@ -2,7 +2,7 @@
 //!
 //! 目前支持：超级块、连续布局的块组描述符、inode、extent 树和目录项遍历。
 
-use super::page_cache::{self, FilePageKey};
+use super::page_cache::{self, Access, FilePageKey, ReadStream};
 use crate::config::PAGE_SIZE;
 use crate::drivers::block::BLOCK_DEVICE;
 use crate::fs::File;
@@ -19,6 +19,11 @@ const EXTENT_MAGIC: u16 = 0xF30A;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 const SECTOR_SIZE: usize = 512;
 static NEXT_FS_ID: AtomicUsize = AtomicUsize::new(1);
+static SECTORS_READ: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn sectors_read() -> usize {
+    SECTORS_READ.load(Ordering::Relaxed)
+}
 
 // VirtIO 用一个 DMA 描述符传输整个扇区，对齐后缓冲区始终位于同一页内。
 #[repr(align(512))]
@@ -38,8 +43,7 @@ fn read_at(mut offset: u64, mut buf: &mut [u8]) {
         let start = (offset % SECTOR_SIZE as u64) as usize;
         let len = buf.len().min(SECTOR_SIZE - start);
         BLOCK_DEVICE.read_block((offset / SECTOR_SIZE as u64) as usize, &mut sector.0);
-        #[cfg(feature = "elf_startup_stats")]
-        crate::exec_stats::on_ext4_sector_read();
+        SECTORS_READ.fetch_add(1, Ordering::Relaxed);
         buf[..len].copy_from_slice(&sector.0[start..start + len]);
         buf = &mut buf[len..];
         offset += len as u64;
@@ -230,18 +234,24 @@ impl Ext4Fs {
         out
     }
 
-    fn file_page(&self, inode: &Inode, index: u64) -> Option<Arc<FrameTracker>> {
+    fn file_page(&self, inode: &Inode, index: u64, access: Access) -> Option<Arc<FrameTracker>> {
         let key = FilePageKey {
             fs: self.id,
             inode: inode.ino,
             index,
         };
-        page_cache::get_or_load(key, |bytes| {
+        page_cache::get_or_load(key, access, |bytes| {
             self.read_file_at(inode, index * PAGE_SIZE as u64, bytes);
         })
     }
 
-    fn read_cached_at(&self, inode: &Inode, mut offset: u64, buf: &mut [u8]) -> usize {
+    fn read_cached_at(
+        &self,
+        inode: &Inode,
+        mut offset: u64,
+        buf: &mut [u8],
+        mut stream: Option<&mut ReadStream>,
+    ) -> usize {
         if !inode.is_file() {
             return self.read_file_at(inode, offset, buf);
         }
@@ -251,7 +261,10 @@ impl Ext4Fs {
             let in_page = (offset % PAGE_SIZE as u64) as usize;
             let count = remaining.len().min(PAGE_SIZE - in_page);
             let (chunk, rest) = remaining.split_at_mut(count);
-            if let Some(frame) = self.file_page(inode, offset / PAGE_SIZE as u64) {
+            let access = stream
+                .as_deref_mut()
+                .map_or_else(Access::read, |stream| stream.access(offset, count));
+            if let Some(frame) = self.file_page(inode, offset / PAGE_SIZE as u64, access) {
                 let bytes = frame.ppn.get_bytes_array();
                 chunk.copy_from_slice(&bytes[in_page..in_page + count]);
             } else {
@@ -333,6 +346,7 @@ pub struct Ext4File {
     fs: Arc<Ext4Fs>,
     inode: Inode,
     offset: UPSafeCell<usize>,
+    stream: UPSafeCell<ReadStream>,
 }
 
 impl Ext4File {
@@ -341,6 +355,7 @@ impl Ext4File {
             fs,
             inode,
             offset: unsafe { UPSafeCell::new(0) },
+            stream: unsafe { UPSafeCell::new(ReadStream::default()) },
         }
     }
 
@@ -349,14 +364,16 @@ impl Ext4File {
     }
 
     pub(super) fn read_at(&self, offset: usize, buffer: &mut [u8]) -> usize {
-        self.fs.read_cached_at(&self.inode, offset as u64, buffer)
+        self.fs
+            .read_cached_at(&self.inode, offset as u64, buffer, None)
     }
 
     pub(super) fn cached_page(&self, offset: usize) -> Option<Arc<FrameTracker>> {
         if !self.inode.is_file() || offset >= self.len() || offset % PAGE_SIZE != 0 {
             return None;
         }
-        self.fs.file_page(&self.inode, (offset / PAGE_SIZE) as u64)
+        self.fs
+            .file_page(&self.inode, (offset / PAGE_SIZE) as u64, Access::Fault)
     }
 }
 
@@ -369,10 +386,14 @@ impl File for Ext4File {
     }
     fn read(&self, buf: UserBuffer) -> usize {
         let mut off = self.offset.exclusive_access();
+        let mut stream = self.stream.exclusive_access();
         let mut total = 0;
         for buffer in buf.buffers {
-            let chunk = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), buffer.len()) };
-            let read = self.read_at(*off, chunk);
+            let chunk =
+                unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), buffer.len()) };
+            let read = self
+                .fs
+                .read_cached_at(&self.inode, *off as u64, chunk, Some(&mut stream));
             *off += read;
             total += read;
             if read < chunk.len() {

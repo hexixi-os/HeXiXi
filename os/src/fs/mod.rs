@@ -8,6 +8,7 @@ mod pipe;
 mod stdio;
 
 use crate::mm::{FrameTracker, UserBuffer};
+use crate::sync::UPSafeCell;
 use directory::DirectoryIdentity;
 pub use directory::{DirectoryFile, DirectoryLocation};
 pub use executable::{open_executable, Executable};
@@ -69,6 +70,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use lazy_static::*;
+
+const PAGE_CACHE_PATH: &str = "proc/page_cache";
 
 lazy_static! {
     /// 启动探测到的 EXT4 根文件系统（只读）
@@ -175,6 +178,9 @@ pub fn path_is_directory(name: &str) -> Result<bool, isize> {
     if is_root_path(name) || matches!(name, "proc" | "dev") {
         return Ok(true);
     }
+    if name == PAGE_CACHE_PATH {
+        return Ok(false);
+    }
     match overlay_get(name) {
         Some(OverlayEntry::File(_)) => return Ok(false),
         Some(OverlayEntry::Directory(_)) => return Ok(true),
@@ -275,6 +281,15 @@ pub fn open_dyn(name: &str, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sy
     if let Some(v) = virtual_file(name) {
         if exclusive || directory {
             return Err(if exclusive { -17 } else { -20 });
+        }
+        if name == PAGE_CACHE_PATH {
+            if flags.intersects(OpenFlags::WRONLY | OpenFlags::RDWR | OpenFlags::TRUNC) {
+                return Err(-30); // EROFS
+            }
+            return Ok(Arc::new(ProcSnapshot {
+                bytes: v,
+                offset: unsafe { UPSafeCell::new(0) },
+            }));
         }
         let data = overlay_create(name);
         {
@@ -396,6 +411,9 @@ pub fn mkdir(name: &str) -> Result<(), isize> {
 }
 
 pub fn unlink(name: &str, remove_directory: bool) -> Result<(), isize> {
+    if name == PAGE_CACHE_PATH {
+        return Err(if remove_directory { -20 } else { -30 }); // ENOTDIR or EROFS
+    }
     if EXT4.is_none() {
         if remove_directory {
             return Err(-20);
@@ -427,6 +445,9 @@ pub fn unlink(name: &str, remove_directory: bool) -> Result<(), isize> {
 }
 
 pub fn rename_overlay_file(old: &str, new: &str) -> Result<(), isize> {
+    if old == PAGE_CACHE_PATH || new == PAGE_CACHE_PATH {
+        return Err(-30); // EROFS
+    }
     if EXT4.is_some() {
         require_parent_directories(old)?;
         require_parent_directories(new)?;
@@ -447,9 +468,72 @@ pub fn names() -> Vec<String> {
 }
 pub use stdio::{Stdin, Stdout};
 
+/// Keep one statistics snapshot per open without allocating a physical cache frame.
+struct ProcSnapshot {
+    bytes: Vec<u8>,
+    offset: UPSafeCell<usize>,
+}
+
+impl File for ProcSnapshot {
+    fn readable(&self) -> bool {
+        true
+    }
+
+    fn writable(&self) -> bool {
+        false
+    }
+
+    fn read(&self, buffer: UserBuffer) -> usize {
+        let mut offset = self.offset.exclusive_access();
+        let remaining = &self.bytes[*offset..];
+        let count = remaining.len().min(buffer.len());
+        for (dst, &byte) in buffer.into_iter().zip(&remaining[..count]) {
+            unsafe { dst.write(byte) };
+        }
+        *offset += count;
+        count
+    }
+
+    fn write(&self, _buffer: UserBuffer) -> isize {
+        -30
+    }
+
+    fn size(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn set_len(&self, _len: usize) -> isize {
+        -30
+    }
+}
+
 /// 最小 /proc 虚拟文件（供 busybox 的 df/free/uptime 等使用）
 pub fn virtual_file(name: &str) -> Option<Vec<u8>> {
     let n = name.trim_start_matches("./").trim_start_matches('/');
+    if n == PAGE_CACHE_PATH {
+        let stats = page_cache::statistics();
+        return Some(
+            alloc::format!(
+                concat!(
+                    "policy={}\ncapacity={}\nhits={}\nmisses={}\nevictions={}\n",
+                    "bypasses={}\nrefaults={}\nresident_pages={}\npinned_pages={}\n",
+                    "history_entries={}\next4_sectors_read={}\n"
+                ),
+                page_cache::policy_name(),
+                page_cache::CAPACITY,
+                stats.hits,
+                stats.misses,
+                stats.evictions,
+                stats.bypasses,
+                stats.refaults,
+                stats.resident_pages,
+                stats.pinned_pages,
+                stats.history_entries,
+                ext4::sectors_read(),
+            )
+            .into_bytes(),
+        );
+    }
     let text: &str = match n {
         "proc/meminfo" => {
             "MemTotal:         262144 kB\nMemFree:          200000 kB\nMemAvailable:     200000 kB\nBuffers:               0 kB\nCached:                0 kB\n"
@@ -494,6 +578,7 @@ pub fn virtual_file(name: &str) -> Option<Vec<u8>> {
 /// /proc 下有哪些文件
 pub const PROC_FILES: &[&str] = &[
     "meminfo", "loadavg", "uptime", "version", "stat", "cpuinfo", "filesystems", "mounts",
+    "page_cache",
 ];
 
 /// 列出某个目录下的条目（名字, inode, 类型）

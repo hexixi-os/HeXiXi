@@ -269,11 +269,15 @@ fn check_cache_bound(file: &ext4::Ext4File) {
         SECTORS_READ.load(Ordering::Relaxed) - before,
         2 * PAGE / 512
     );
+    assert!(page_cache::statistics().refaults > 0);
 
     let pinned: Vec<_> = (0..cap)
         .map(|index| file.mapping_page(index * PAGE).unwrap())
         .collect();
     assert_eq!(mm::live_frames(), cap);
+    let before_stats = page_cache::statistics();
+    assert_eq!(before_stats.resident_pages, cap);
+    assert_eq!(before_stats.pinned_pages, cap);
     assert!(!page_cache::reclaim_one());
     let before = SECTORS_READ.load(Ordering::Relaxed);
     for _ in 0..2 {
@@ -286,10 +290,104 @@ fn check_cache_bound(file: &ext4::Ext4File) {
         SECTORS_READ.load(Ordering::Relaxed) - before,
         2 * PAGE / 512
     );
+    assert_eq!(page_cache::statistics().bypasses - before_stats.bypasses, 2);
     drop(pinned);
+    assert_eq!(page_cache::statistics().pinned_pages, 0);
     assert!(page_cache::reclaim_one());
     assert_eq!(mm::live_frames(), cap - 1);
+    assert_eq!(page_cache::statistics().resident_pages, cap - 1);
+    assert_eq!(
+        page_cache::statistics().evictions - before_stats.evictions,
+        1
+    );
     println!("/dense: {cap} cached frames, LRU / pinning / bypass / reclaim passed");
+}
+
+fn check_fragmented_scan(fs: &Arc<ext4::Ext4Fs>, expected: &[u8]) {
+    const PAGE: usize = config::PAGE_SIZE;
+    const FIRST: usize = 512;
+    const COUNT: usize = 16;
+    let file = ext4::Ext4File::new(fs.clone(), fs.lookup("/dense").unwrap());
+    for index in 0..page_cache::CAPACITY {
+        assert!(file.mapping_page(index * PAGE).is_some());
+    }
+    let before = page_cache::statistics();
+    file.seek_to((FIRST * PAGE) as isize);
+    let mut data = [0; PAGE];
+    for index in FIRST..FIRST + COUNT {
+        let (first, rest) = data.split_at_mut(512);
+        assert_eq!(
+            file.read(mm::UserBuffer {
+                buffers: vec![first, rest]
+            }),
+            PAGE
+        );
+        assert_eq!(&data, &expected[index * PAGE..(index + 1) * PAGE]);
+    }
+    let after = page_cache::statistics();
+    assert_eq!(after.bypasses - before.bypasses, 2 * (COUNT - 7));
+    assert_eq!(after.resident_pages, page_cache::CAPACITY);
+
+    let revisit = ext4::Ext4File::new(fs.clone(), fs.lookup("/dense").unwrap());
+    let offset = (FIRST + COUNT - 1) * PAGE;
+    revisit.seek_to(offset as isize);
+    assert_eq!(
+        revisit.read(mm::UserBuffer {
+            buffers: vec![&mut data]
+        }),
+        PAGE
+    );
+    let sectors = SECTORS_READ.load(Ordering::Relaxed);
+    assert_eq!(
+        file.mapping_page(offset).unwrap().ppn.get_bytes_array(),
+        &data
+    );
+    assert_eq!(SECTORS_READ.load(Ordering::Relaxed), sectors);
+    assert_eq!(page_cache::statistics().refaults, after.refaults);
+    println!("/dense: fragmented scan bypasses and a new handle readmits a reused page");
+
+    const SPLIT: usize = 900;
+    let a = ext4::Ext4File::new(fs.clone(), fs.lookup("/dense").unwrap());
+    let b = ext4::Ext4File::new(fs.clone(), fs.lookup("/dense").unwrap());
+    a.seek_to((SPLIT * PAGE) as isize);
+    for _ in 0..7 {
+        assert_eq!(
+            a.read(mm::UserBuffer {
+                buffers: vec![&mut data]
+            }),
+            PAGE
+        );
+    }
+    let before = page_cache::statistics();
+    b.seek_to(((SPLIT + 7) * PAGE) as isize);
+    assert_eq!(
+        b.read(mm::UserBuffer {
+            buffers: vec![&mut data]
+        }),
+        PAGE
+    );
+    assert_eq!(page_cache::statistics().bypasses, before.bypasses);
+    assert_eq!(
+        a.read(mm::UserBuffer {
+            buffers: vec![&mut data]
+        }),
+        PAGE
+    );
+    b.seek_to(((SPLIT + 64) * PAGE) as isize);
+    assert_eq!(
+        b.read(mm::UserBuffer {
+            buffers: vec![&mut data]
+        }),
+        PAGE
+    );
+    assert_eq!(
+        a.read(mm::UserBuffer {
+            buffers: vec![&mut data]
+        }),
+        PAGE
+    );
+    assert_eq!(page_cache::statistics().bypasses - before.bypasses, 1);
+    println!("/dense: interleaved file handles keep independent scan positions");
 }
 
 fn main() {
@@ -314,6 +412,9 @@ fn main() {
         check_sequential_reads(&file, &expected);
         check_cache_sharing(&ext4, &file, &expected);
         check_cache_bound(&file);
+        if page_cache::policy_name() == "adaptive" {
+            check_fragmented_scan(&ext4, &expected);
+        }
     }
     if expected.len() >= ext4.block_size + 100 {
         check_read_ranges(&file, ext4.block_size, &expected);
