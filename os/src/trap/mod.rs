@@ -83,7 +83,7 @@ pub fn trap_handler() -> ! {
             };
             match crate::mm::handle_user_page_fault(address, access) {
                 PageFault::Resolved => {
-                    arch::local_flush_tlb();
+                    arch::local_flush_tlb_page(address);
                     trap_return();
                 }
                 PageFault::FileUnavailable => {

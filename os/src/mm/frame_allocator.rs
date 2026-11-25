@@ -13,7 +13,7 @@ pub fn ram_end() -> usize {
     RAM_END.load(Ordering::Relaxed)
 }
 use crate::sync::UPSafeCell;
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 use core::fmt::{self, Debug, Formatter};
 use lazy_static::*;
 
@@ -48,59 +48,61 @@ impl Drop for FrameTracker {
     }
 }
 
-trait FrameAllocator {
-    fn new() -> Self;
-    fn alloc(&mut self) -> Option<PhysPageNum>;
-    fn dealloc(&mut self, ppn: PhysPageNum);
-}
+const BITS_PER_WORD: usize = usize::BITS as usize;
 
-pub struct StackFrameAllocator {
-    current: usize,
+#[derive(Default)]
+struct BitmapFrameAllocator {
+    start: usize,
     end: usize,
-    recycled: Vec<usize>,
+    allocated: Vec<usize>,
+    free: Vec<PhysPageNum>,
 }
 
-impl StackFrameAllocator {
-    pub fn init(&mut self, l: PhysPageNum, r: PhysPageNum) {
-        self.current = l.0;
-        self.end = r.0;
-        println!("last {} Physical Frames.", self.end - self.current);
+impl BitmapFrameAllocator {
+    fn init(&mut self, start: PhysPageNum, end: PhysPageNum) {
+        self.start = start.0;
+        self.end = end.0;
+        let count = self.end - self.start;
+        self.allocated = vec![0; (count + BITS_PER_WORD - 1) / BITS_PER_WORD];
+        // Start with space for all frames so deallocation never grows the stack.
+        self.free = (self.start..self.end).rev().map(PhysPageNum).collect();
+        println!("last {} Physical Frames.", count);
     }
-}
-impl FrameAllocator for StackFrameAllocator {
-    fn new() -> Self {
-        Self {
-            current: 0,
-            end: 0,
-            recycled: Vec::new(),
-        }
+
+    fn allocation_bit(&mut self, ppn: PhysPageNum) -> (&mut usize, usize) {
+        let offset = ppn.0 - self.start;
+        let mask = 1 << (offset % BITS_PER_WORD);
+        (&mut self.allocated[offset / BITS_PER_WORD], mask)
     }
+
     fn alloc(&mut self) -> Option<PhysPageNum> {
-        if let Some(ppn) = self.recycled.pop() {
-            Some(ppn.into())
-        } else if self.current == self.end {
-            None
-        } else {
-            self.current += 1;
-            Some((self.current - 1).into())
-        }
+        let ppn = self.free.pop()?;
+        let (word, mask) = self.allocation_bit(ppn);
+        *word |= mask;
+        Some(ppn)
     }
+
     fn dealloc(&mut self, ppn: PhysPageNum) {
-        let ppn = ppn.0;
-        // validity check
-        if ppn >= self.current || self.recycled.iter().any(|&v| v == ppn) {
-            panic!("Frame ppn={:#x} has not been allocated!", ppn);
-        }
-        // recycle
-        self.recycled.push(ppn);
+        assert!(
+            (self.start..self.end).contains(&ppn.0),
+            "Frame ppn={:#x} is outside the managed range!",
+            ppn.0
+        );
+        let (word, mask) = self.allocation_bit(ppn);
+        assert_ne!(
+            *word & mask,
+            0,
+            "Frame ppn={:#x} has not been allocated!",
+            ppn.0
+        );
+        *word &= !mask;
+        self.free.push(ppn);
     }
 }
-
-type FrameAllocatorImpl = StackFrameAllocator;
 
 lazy_static! {
-    pub static ref FRAME_ALLOCATOR: UPSafeCell<FrameAllocatorImpl> =
-        unsafe { UPSafeCell::new(FrameAllocatorImpl::new()) };
+    static ref FRAME_ALLOCATOR: UPSafeCell<BitmapFrameAllocator> =
+        unsafe { UPSafeCell::new(BitmapFrameAllocator::default()) };
 }
 
 pub fn init_frame_allocator() {
@@ -162,6 +164,5 @@ pub fn frame_dealloc(ppn: PhysPageNum) {
 }
 
 pub(crate) fn free_frame_count() -> usize {
-    let allocator = FRAME_ALLOCATOR.exclusive_access();
-    allocator.end - allocator.current + allocator.recycled.len()
+    FRAME_ALLOCATOR.exclusive_access().free.len()
 }

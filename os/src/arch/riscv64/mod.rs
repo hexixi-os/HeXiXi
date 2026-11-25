@@ -115,6 +115,16 @@ pub fn local_flush_tlb() {
     }
 }
 
+pub fn local_flush_tlb_page(va: usize) {
+    #[cfg(feature = "smp")]
+    unsafe {
+        asm!("fence rw, rw");
+    }
+    unsafe {
+        asm!("sfence.vma {va}, zero", va = in(reg) va);
+    }
+}
+
 pub fn activate_kernel_table(token: usize) {
     satp::write(token);
     local_flush_tlb();

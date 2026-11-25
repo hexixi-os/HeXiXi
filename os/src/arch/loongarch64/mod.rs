@@ -145,6 +145,13 @@ pub fn flush_tlb() {
 
 pub use self::flush_tlb as local_flush_tlb;
 
+pub fn local_flush_tlb_page(va: usize) {
+    // User mappings are non-global and use ASID 0.
+    unsafe {
+        asm!("dbar 0", "invtlb 0x5, $zero, {va}", va = in(reg) va);
+    }
+}
+
 pub fn activate_kernel_table(token: usize) {
     unsafe {
         // 4 KiB pages and three 9-bit directory/page indexes.
