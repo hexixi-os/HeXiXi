@@ -137,6 +137,25 @@ python3 tools/oscomp/run_official_matrix.py --arch loongarch64 \
 
 LoongArch64 的 `virt` 测试使用 QEMU 直启 ELF，通过 `fw_cfg` 传入单个测试组。虚拟机配置 1 GiB，内核分配器使用低地址连续 RAM。硬件范围为单核 QEMU `virt`，用户上下文保存整数和标量浮点寄存器。成绩和已知限制见[测试状态](TEST_STATUS.md)。
 
+## 在 RISC-V QEMU 上启用双核
+
+`SMP=1` 启用 RISC-V `virt` 的多 hart 启动和调度。默认的 `make all` 仍构建单核内核。SMP 使用 OpenSBI 的 HSM 与 RFENCE，已在 QEMU 8.2.2 自带的 OpenSBI v1.3 上验证。
+
+```bash
+make all SMP=1 KERNEL_OUT=kernel-rv
+KERNEL="$PWD/kernel-rv" bash tools/oscomp/test_smp.sh /tmp/hexixi-smp.log
+```
+
+启动回归创建只读 EXT4 测试盘，默认以两个 hart 启动。测试会核对父子进程的 CPU 和调度亲和性，并运行跨核 COW 与共享文件截断。也可以让脚本自行构建 SMP 内核。
+
+```bash
+python3 tools/oscomp/run_official_matrix.py --smp 2 \
+    /path/to/sdcard-rv.img /tmp/hexixi-smp-basic basic \
+    --suite /path/to/testsuits --kernel kernel-rv
+```
+
+SMP 首版在创建进程时轮转分配 hart，同一进程的线程留在同一 hart。不同进程的用户态可以并行，内核代码由一把全局票号锁串行执行。LoongArch64 沿用单核启动路径。
+
 ## 常见问题
 
 | 现象 | 原因 | 处理 |

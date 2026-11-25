@@ -73,6 +73,10 @@ fs-img: $(APPS)
 $(APPS):
 
 FEATURES := board_$(BOARD)
+ifeq ($(SMP),1)
+FEATURES += smp
+endif
+QEMU_SMP ?= $(if $(filter 1,$(SMP)),2,1)
 PAGE_CACHE_POLICY ?= lru
 ifeq ($(PAGE_CACHE_POLICY),none)
 FEATURES += page_cache_none
@@ -114,6 +118,7 @@ run-inner: build
 ifeq ($(BOARD),qemu)
 	@qemu-system-riscv64 \
 		-machine virt \
+		-smp $(QEMU_SMP) \
 		-m 256M \
 		-nographic \
 		-bios default \

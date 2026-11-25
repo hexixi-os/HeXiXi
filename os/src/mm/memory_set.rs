@@ -144,7 +144,7 @@ impl MemorySet {
         }
         let mut tables = Vec::new();
         let retired = self.vmas.unmap(&mut self.page_table, range, &mut tables);
-        crate::arch::flush_tlb();
+        crate::arch::local_flush_tlb();
         drop((retired, tables));
         Ok(())
     }
@@ -189,7 +189,7 @@ impl MemorySet {
                 self.page_table.set_flags(vpn, page.resident.flags(permissions));
             }
         }
-        crate::arch::flush_tlb();
+        crate::arch::local_flush_tlb();
         Ok(())
     }
 
@@ -432,7 +432,7 @@ impl MemorySet {
             }
         }
         self.vmas.write_protect_private(&mut self.page_table);
-        crate::arch::flush_tlb();
+        crate::arch::local_flush_tlb();
         Ok(child)
     }
     pub fn activate(&self) {

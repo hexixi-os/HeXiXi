@@ -6,6 +6,8 @@ static DETECTED_RAM_END: AtomicUsize = AtomicUsize::new(0);
 #[derive(Default)]
 pub struct BootInfo {
     pub ram_end: Option<usize>,
+    #[cfg(feature = "smp")]
+    pub hart_mask: usize,
     oscomp_group: [u8; 32],
 }
 
@@ -74,6 +76,10 @@ pub fn detect_boot_info() -> BootInfo {
     let mut node_is_memory = false;
     let mut node_is_chosen = false;
     let mut max_end = 0usize;
+    #[cfg(feature = "smp")]
+    let mut cpus = false;
+    #[cfg(feature = "smp")]
+    let mut cpu = None;
 
     loop {
         let token = read_be32(p);
@@ -98,9 +104,23 @@ pub fn detect_boot_info() -> BootInfo {
                 if depth == 2 {
                     node_is_chosen = name == "chosen";
                 }
+                #[cfg(feature = "smp")]
+                if depth == 2 {
+                    cpus = name == "cpus";
+                } else if cpus && depth == 3 && name.starts_with("cpu@") {
+                    cpu = Some((None, true));
+                }
             }
             2 => {
                 // FDT_END_NODE
+                #[cfg(feature = "smp")]
+                if depth == 3 {
+                    if let Some((Some(hart), true)) = cpu.take() {
+                        if hart < usize::BITS as usize {
+                            info.hart_mask |= 1usize << hart;
+                        }
+                    }
+                }
                 if depth == 2 {
                     node_is_memory = false;
                     node_is_chosen = false;
@@ -132,6 +152,20 @@ pub fn detect_boot_info() -> BootInfo {
                 if depth == 2 && node_is_chosen && pname == "bootargs" && len <= 4096 {
                     let args = unsafe { core::slice::from_raw_parts(value as *const u8, len) };
                     info.read_bootargs(args);
+                }
+                #[cfg(feature = "smp")]
+                if depth == 3 {
+                    if let Some((hart, enabled)) = cpu.as_mut() {
+                        match pname {
+                            "reg" if len == 4 => *hart = Some(read_be32(value) as usize),
+                            "reg" if len == 8 => *hart = Some(read_be64(value) as usize),
+                            "status" => {
+                                let status = unsafe { core::slice::from_raw_parts(value as *const u8, len) };
+                                *enabled = matches!(status, b"okay\0" | b"ok\0");
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 if node_is_memory && pname == "reg" {
                     let entry = addr_cells + size_cells;

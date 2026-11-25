@@ -19,7 +19,17 @@ impl TaskManager {
         self.ready_queue.push_back(task);
     }
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        #[cfg(feature = "smp")]
+        {
+            let hart = crate::arch::hart_id();
+            // A process's threads share its affinity, including across exec.
+            let index = self.ready_queue.iter().position(|task| {
+                task.process.upgrade().expect("ready task without process").affinity_hart() == hart
+            })?;
+            self.ready_queue.remove(index)
+        }
+        #[cfg(not(feature = "smp"))]
+        { self.ready_queue.pop_front() }
     }
     pub fn remove(&mut self, task: Arc<TaskControlBlock>) {
         if let Some((id, _)) = self.ready_queue
@@ -74,7 +84,7 @@ pub fn remove_from_pid2process(pid: usize) {
     }
 }
 
-/// Truncate runs without a process or file borrow on the single hart.
+/// Truncate holds the kernel lock and has released its file borrow.
 pub(crate) fn invalidate_file_pages(identity: (u64, u64), first_invalid: usize) {
     for process in PID2PCB.exclusive_access().values() {
         process.inner_exclusive_access().memory_set.invalidate_file_pages(identity, first_invalid);

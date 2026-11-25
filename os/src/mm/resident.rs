@@ -1,6 +1,8 @@
 use super::{
-    frame_alloc, FrameTracker, MapPermission, PTEFlags, PageFault, PageTable, VirtPageNum,
+    copy_live_bytes, frame_alloc, FrameTracker, MapPermission, PTEFlags, PageFault, PageTable,
+    VirtPageNum,
 };
+use crate::config::PAGE_SIZE;
 use alloc::sync::Arc;
 
 pub(super) fn alloc_page() -> Result<Arc<FrameTracker>, PageFault> {
@@ -48,10 +50,8 @@ impl ResidentPage {
 
     pub(super) fn private_copy(&self) -> Result<Self, PageFault> {
         let frame = alloc_page()?;
-        frame
-            .ppn
-            .get_bytes_array()
-            .copy_from_slice(self.frame.ppn.get_bytes_array());
+        // A private file mapping can still source its COW bytes from an active shared mapping.
+        unsafe { copy_live_bytes(self.frame.ppn.bytes_ptr(), frame.ppn.bytes_ptr(), PAGE_SIZE) };
         #[cfg(feature = "elf_startup_stats")]
         crate::fork_stats::on_frame_copy();
         Ok(Self::new(frame, false))
@@ -88,7 +88,7 @@ impl ResidentPage {
             Err(fault) => return fault,
         };
         table.remap(vpn, self.frame.ppn, self.flags(permissions));
-        crate::arch::flush_tlb();
+        crate::arch::local_flush_tlb();
         drop(retired);
         PageFault::Resolved
     }

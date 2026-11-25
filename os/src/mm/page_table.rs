@@ -1,3 +1,4 @@
+use super::user_access::{copy_live_bytes, zero_live_bytes, UserValue};
 use super::{
     frame_alloc, FrameTracker, MapPermission, PageFault, PhysAddr, PhysPageNum, VirtAddr,
     VirtPageNum, USER_END,
@@ -35,6 +36,12 @@ impl PageTableEntry {
     }
     fn directory(ppn: PhysPageNum) -> Self {
         Self { bits: crate::arch::directory_entry(ppn.0) }
+    }
+    fn publish_directory(&mut self, ppn: PhysPageNum) {
+        // A hardware walker may follow the pointer as soon as it becomes valid.
+        #[cfg(feature = "smp")]
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        *self = Self::directory(ppn);
     }
     pub fn empty() -> Self {
         PageTableEntry { bits: 0 }
@@ -81,34 +88,25 @@ impl PageTable {
         }
     }
     fn find_pte_create(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
-        let idxs = vpn.indexes();
-        let mut ppn = self.root_ppn;
-        let mut created = [(ppn, 0); 2];
-        let mut created_count = 0;
-        for (i, idx) in idxs.iter().enumerate() {
-            let pte = &mut ppn.get_pte_array()[*idx];
-            if i == 2 {
-                return Some(pte);
-            }
-            if !pte.is_valid() {
-                let frame = match frame_alloc() {
-                    Some(frame) => frame,
-                    None => {
-                        for &(parent, slot) in created[..created_count].iter().rev() {
-                            parent.get_pte_array()[slot] = PageTableEntry::empty();
-                            self.frames.pop();
-                        }
-                        return None;
-                    }
-                };
-                created[created_count] = (ppn, *idx);
-                created_count += 1;
-                *pte = PageTableEntry::directory(frame.ppn);
-                self.frames.push(frame);
-            }
-            ppn = pte.ppn();
+        let [top, middle, leaf] = vpn.indexes();
+        let top_entry = &mut self.root_ppn.get_pte_array()[top];
+        if !top_entry.is_valid() {
+            // Allocate the full branch before publishing it. A failed allocation
+            // can then free its frames without involving remote page-table walkers.
+            let middle_frame = frame_alloc()?;
+            let leaf_frame = frame_alloc()?;
+            middle_frame.ppn.get_pte_array()[middle] = PageTableEntry::directory(leaf_frame.ppn);
+            top_entry.publish_directory(middle_frame.ppn);
+            self.frames.push(middle_frame);
+            self.frames.push(leaf_frame);
         }
-        None
+        let middle_entry = &mut top_entry.ppn().get_pte_array()[middle];
+        if !middle_entry.is_valid() {
+            let leaf_frame = frame_alloc()?;
+            middle_entry.publish_directory(leaf_frame.ppn);
+            self.frames.push(leaf_frame);
+        }
+        Some(&mut middle_entry.ppn().get_pte_array()[leaf])
     }
     fn find_pte(&self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
         let idxs = vpn.indexes();
@@ -230,6 +228,17 @@ fn report_bad_translation(token: usize, va: usize, pa: usize) {
     );
 }
 
+fn checked_phys_addr(token: usize, va: usize, pa: PhysAddr) -> Option<PhysAddr> {
+    if phys_addr_sane(pa.0) {
+        Some(pa)
+    } else {
+        if !dummy_warned() {
+            report_bad_translation(token, va, pa.0);
+        }
+        None
+    }
+}
+
 fn ensure_user_page_mapped(table: &PageTable, va: usize, access: MapPermission) -> bool {
     if va >= USER_END {
         return false;
@@ -273,18 +282,12 @@ pub fn translated_byte_buffer(
         }
         let va = VirtAddr::from(start);
         let ppn = page_table.translate(va.floor())?.ppn();
-        let pa = usize::from(PhysAddr::from(ppn));
-        if !phys_addr_sane(pa) {
-            if !dummy_warned() {
-                report_bad_translation(token, start, pa);
-            }
-            return None;
-        }
+        let pa = checked_phys_addr(token, start, ppn.into())?;
         let first = va.page_offset();
         let count = (end - start).min(PAGE_SIZE - first);
         pin_user_page(token, va.floor());
         buffers.push(UserSlice {
-            ptr: crate::arch::phys_to_virt(pa + first) as *mut u8,
+            ptr: (pa.kernel_address() + first) as *mut u8,
             len: count,
         });
         start += count;
@@ -317,19 +320,20 @@ fn read_user_string<T: Default>(
     let page_table = PageTable::from_token(token);
     let mut string = T::default();
     let mut va = ptr as usize;
-    let mut checked_vpn = usize::MAX;
+    let mut page_base = 0;
     for _ in 0..PATH_MAX {
-        let vpn = VirtAddr::from(va).floor().0;
-        if vpn != checked_vpn {
+        let offset = va % PAGE_SIZE;
+        if page_base == 0 || offset == 0 {
             if !ensure_user_page_mapped(&page_table, va, MapPermission::R) {
                 return Err((string, -14)); // EFAULT
             }
-            checked_vpn = vpn;
+            let ppn = page_table.translate(VirtAddr::from(va).floor()).unwrap().ppn();
+            page_base = match checked_phys_addr(token, va, ppn.into()) {
+                Some(pa) => pa.kernel_address(),
+                None => return Err((string, -14)),
+            };
         }
-        let ch: u8 = *(page_table
-            .translate_va(VirtAddr::from(va))
-            .unwrap()
-            .get_ref());
+        let ch = unsafe { u8::load((page_base + offset) as *const u8) };
         if ch == 0 {
             return Ok(string);
         }
@@ -349,30 +353,41 @@ fn typed_user_addr<T>(token: usize, va: usize, access: MapPermission) -> Option<
     if !ensure_user_page_mapped(&page_table, va, access) {
         return None;
     }
-    let pa = page_table.translate_va(VirtAddr::from(va))?;
-    if !phys_addr_sane(usize::from(pa)) {
-        if !dummy_warned() {
-            report_bad_translation(token, va, usize::from(pa));
-        }
-        return None;
+    checked_phys_addr(token, va, page_table.translate_va(VirtAddr::from(va))?)
+}
+
+pub(crate) fn read_user<T: UserValue>(token: usize, ptr: *const T) -> T {
+    try_read_user(token, ptr).unwrap_or_else(|| unsafe { T::load(dummy_user_page().cast()) })
+}
+
+pub(crate) fn try_read_user<T: UserValue>(token: usize, ptr: *const T) -> Option<T> {
+    let pa = typed_user_addr::<T>(token, ptr as usize, MapPermission::R)?;
+    Some(unsafe { T::load(pa.kernel_address() as *const T) })
+}
+
+/// A validated copyout address. Consume it before scheduling or changing the mapping.
+pub(crate) struct UserWrite<T>(*mut T);
+
+impl<T: UserValue> UserWrite<T> {
+    pub(crate) fn write(self, value: T) {
+        unsafe { T::store(self.0, value) };
     }
-    Some(pa)
 }
 
-pub fn translated_ref<T>(token: usize, ptr: *const T) -> &'static T {
-    try_translated_ref(token, ptr).unwrap_or_else(|| unsafe { &*(dummy_user_page() as *const T) })
+pub(crate) fn prepare_user_write<T: UserValue>(token: usize, ptr: *mut T) -> Option<UserWrite<T>> {
+    let pa = typed_user_addr::<T>(token, ptr as usize, MapPermission::W)?;
+    Some(UserWrite(pa.kernel_address() as *mut T))
 }
 
-pub(crate) fn try_translated_ref<T>(token: usize, ptr: *const T) -> Option<&'static T> {
-    typed_user_addr::<T>(token, ptr as usize, MapPermission::R).map(|pa| pa.get_ref())
+pub(crate) fn try_write_user<T: UserValue>(token: usize, ptr: *mut T, value: T) -> Option<()> {
+    prepare_user_write(token, ptr)?.write(value);
+    Some(())
 }
 
-pub(crate) fn try_translated_refmut<T>(token: usize, ptr: *mut T) -> Option<&'static mut T> {
-    typed_user_addr::<T>(token, ptr as usize, MapPermission::W).map(|pa| pa.get_mut())
-}
-
-pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
-    try_translated_refmut(token, ptr).unwrap_or_else(|| unsafe { &mut *(dummy_user_page() as *mut T) })
+pub(crate) fn write_user<T: UserValue>(token: usize, ptr: *mut T, value: T) {
+    prepare_user_write(token, ptr)
+        .unwrap_or_else(|| UserWrite(dummy_user_page().cast()))
+        .write(value);
 }
 
 // User pages can be unmapped while a blocking syscall sleeps. Hold the frame in
@@ -402,14 +417,53 @@ pub struct UserSlice {
 }
 
 impl UserSlice {
-    pub fn as_ptr(&self) -> *const u8 {
+    /// Raw direct-map address for copying to or from another live range.
+    pub(crate) fn as_ptr(&self) -> *const u8 {
         self.ptr
     }
-    pub fn as_mut_ptr(&self) -> *mut u8 {
+    pub(crate) fn as_mut_ptr(&self) -> *mut u8 {
         self.ptr
     }
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// Give a kernel consumer a stable slice for this part of a write syscall.
+    pub(crate) fn read_with<R>(
+        &self,
+        _scratch: &mut Vec<u8>,
+        consume: impl FnOnce(&[u8]) -> R,
+    ) -> R {
+        #[cfg(feature = "smp")]
+        {
+            _scratch.resize(self.len, 0);
+            unsafe { copy_live_bytes(self.ptr, _scratch.as_mut_ptr(), self.len) };
+            consume(_scratch)
+        }
+        #[cfg(not(feature = "smp"))]
+        consume(unsafe { core::slice::from_raw_parts(self.ptr, self.len) })
+    }
+
+    /// Copy the number of bytes the kernel producer actually wrote back to userspace.
+    pub(crate) fn write_with(
+        &self,
+        _scratch: &mut Vec<u8>,
+        produce: impl FnOnce(&mut [u8]) -> usize,
+    ) -> usize {
+        #[cfg(feature = "smp")]
+        {
+            _scratch.resize(self.len, 0);
+            let written = produce(_scratch);
+            self.copy_from(&_scratch[..written]);
+            written
+        }
+        #[cfg(not(feature = "smp"))]
+        produce(unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) })
+    }
+
+    fn copy_from(&self, src: &[u8]) {
+        assert!(src.len() <= self.len);
+        unsafe { copy_live_bytes(src.as_ptr(), self.ptr, src.len()) };
     }
 }
 
@@ -424,10 +478,31 @@ impl UserBuffer {
     pub fn len(&self) -> usize {
         self.buffers.iter().map(UserSlice::len).sum()
     }
+
+    pub(crate) fn copy_from(&self, src: &[u8]) {
+        let mut remaining = src;
+        for buffer in &self.buffers {
+            if remaining.is_empty() {
+                break;
+            }
+            let (chunk, rest) = remaining.split_at(remaining.len().min(buffer.len()));
+            buffer.copy_from(chunk);
+            remaining = rest;
+        }
+    }
+
+    pub(crate) fn fill_zero(&self) -> usize {
+        let mut total = 0;
+        for buffer in &self.buffers {
+            unsafe { zero_live_bytes(buffer.ptr, buffer.len) };
+            total += buffer.len;
+        }
+        total
+    }
 }
 
 impl IntoIterator for UserBuffer {
-    type Item = *mut u8;
+    type Item = UserByte;
     type IntoIter = UserBufferIterator;
     fn into_iter(self) -> Self::IntoIter {
         UserBufferIterator {
@@ -444,8 +519,20 @@ pub struct UserBufferIterator {
     current_idx: usize,
 }
 
+pub struct UserByte(*mut u8);
+
+impl UserByte {
+    pub(crate) fn read(self) -> u8 {
+        unsafe { u8::load(self.0) }
+    }
+
+    pub(crate) fn write(self, byte: u8) {
+        unsafe { u8::store(self.0, byte) };
+    }
+}
+
 impl Iterator for UserBufferIterator {
-    type Item = *mut u8;
+    type Item = UserByte;
     fn next(&mut self) -> Option<Self::Item> {
         let buffer = self.buffers.get(self.current_buffer)?;
         let ptr = unsafe { buffer.ptr.add(self.current_idx) };
@@ -454,6 +541,6 @@ impl Iterator for UserBufferIterator {
             self.current_buffer += 1;
             self.current_idx = 0;
         }
-        Some(ptr)
+        Some(UserByte(ptr))
     }
 }

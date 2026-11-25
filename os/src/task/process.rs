@@ -5,7 +5,7 @@ use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{DirectoryLocation, Executable, File, Stdin, Stdout};
-use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
+use crate::mm::{write_user, MemorySet, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
@@ -17,6 +17,8 @@ use core::cell::RefMut;
 pub struct ProcessControlBlock {
     // immutable
     pub pid: PidHandle,
+    #[cfg(feature = "smp")]
+    hart: usize,
     // mutable
     inner: UPSafeCell<ProcessControlBlockInner>,
 }
@@ -104,6 +106,13 @@ impl ProcessControlBlockInner {
 }
 
 impl ProcessControlBlock {
+    pub(crate) fn affinity_hart(&self) -> usize {
+        #[cfg(feature = "smp")]
+        { self.hart }
+        #[cfg(not(feature = "smp"))]
+        { 0 }
+    }
+
     pub fn inner_exclusive_access(&self) -> RefMut<'_, ProcessControlBlockInner> {
         self.inner.exclusive_access()
     }
@@ -119,6 +128,8 @@ impl ProcessControlBlock {
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
             pid: pid_handle,
+            #[cfg(feature = "smp")]
+            hart: crate::arch::hart_id(),
             inner: unsafe {
                 UPSafeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
@@ -196,14 +207,14 @@ impl ProcessControlBlock {
         for arg in args {
             sp -= arg.len() + 1;
             for (offset, byte) in arg.bytes().chain(core::iter::once(0)).enumerate() {
-                *translated_refmut(token, (sp + offset) as *mut u8) = byte;
+                write_user(token, (sp + offset) as *mut u8, byte);
             }
             pointers.push(sp);
         }
         let word = core::mem::size_of::<usize>();
         sp = (sp - (pointers.len() + 1) * word) & !15;
         for (index, pointer) in pointers.into_iter().chain(core::iter::once(0)).enumerate() {
-            *translated_refmut(token, (sp + index * word) as *mut usize) = pointer;
+            write_user(token, (sp + index * word) as *mut usize, pointer);
         }
         let trap = inner.get_trap_cx();
         trap.set_sp(sp);
@@ -284,10 +295,10 @@ impl ProcessControlBlock {
             sp -= env.len() + 1;
             let mut ep = sp;
             for c in env {
-                *translated_refmut(new_token, ep as *mut u8) = *c;
+                write_user(new_token, ep as *mut u8, *c);
                 ep += 1;
             }
-            *translated_refmut(new_token, ep as *mut u8) = 0;
+            write_user(new_token, ep as *mut u8, 0);
             env_ptrs.push(sp);
         }
         env_ptrs.reverse();
@@ -298,10 +309,10 @@ impl ProcessControlBlock {
             sp -= arg.len() + 1;
             let mut p = sp;
             for c in arg {
-                *translated_refmut(new_token, p as *mut u8) = *c;
+                write_user(new_token, p as *mut u8, *c);
                 p += 1;
             }
-            *translated_refmut(new_token, p as *mut u8) = 0;
+            write_user(new_token, p as *mut u8, 0);
             arg_ptrs.push(sp);
         }
         arg_ptrs.reverse();
@@ -309,7 +320,7 @@ impl ProcessControlBlock {
         sp -= exec_name.len() + 1;
         let execfn_addr = sp;
         for (i, byte) in exec_name.bytes().chain(core::iter::once(0)).enumerate() {
-            *translated_refmut(new_token, (execfn_addr + i) as *mut u8) = byte;
+            write_user(new_token, (execfn_addr + i) as *mut u8, byte);
         }
         // ld.so derives the main executable's load bias from its mapped program table.
         let phdr_addr = if let Some(address) = elf.program_addr {
@@ -318,7 +329,7 @@ impl ProcessControlBlock {
             sp -= elf.programs.len();
             sp -= sp % 8;
             for (i, &byte) in elf.programs.iter().enumerate() {
-                *translated_refmut(new_token, (sp + i) as *mut u8) = byte;
+                write_user(new_token, (sp + i) as *mut u8, byte);
             }
             sp
         };
@@ -327,8 +338,8 @@ impl ProcessControlBlock {
         sp -= 16;
         let random_addr = sp;
         for i in 0..16usize {
-            *translated_refmut(new_token, (random_addr + i) as *mut u8) =
-                (i as u8).wrapping_mul(37).wrapping_add(11);
+            let byte = (i as u8).wrapping_mul(37).wrapping_add(11);
+            write_user(new_token, (random_addr + i) as *mut u8, byte);
         }
 
         // 4. 数组区：argc / argv / envp / auxv 必须连续
@@ -354,19 +365,19 @@ impl ProcessControlBlock {
         sp -= sp % 16;
         let base = sp;
         let sz = core::mem::size_of::<usize>();
-        *translated_refmut(new_token, base as *mut usize) = argc;
+        write_user(new_token, base as *mut usize, argc);
         for i in 0..argc {
-            *translated_refmut(new_token, (base + (1 + i) * sz) as *mut usize) = arg_ptrs[i];
+            write_user(new_token, (base + (1 + i) * sz) as *mut usize, arg_ptrs[i]);
         }
-        *translated_refmut(new_token, (base + (1 + argc) * sz) as *mut usize) = 0;
+        write_user(new_token, (base + (1 + argc) * sz) as *mut usize, 0);
         for (i, p) in env_ptrs.iter().enumerate() {
-            *translated_refmut(new_token, (base + (2 + argc + i) * sz) as *mut usize) = *p;
+            write_user(new_token, (base + (2 + argc + i) * sz) as *mut usize, *p);
         }
         let envc = env_ptrs.len();
-        *translated_refmut(new_token, (base + (2 + argc + envc) * sz) as *mut usize) = 0;
+        write_user(new_token, (base + (2 + argc + envc) * sz) as *mut usize, 0);
         for (i, (t, v)) in auxv.iter().enumerate() {
-            *translated_refmut(new_token, (base + (3 + argc + envc + i * 2) * sz) as *mut usize) = *t;
-            *translated_refmut(new_token, (base + (4 + argc + envc + i * 2) * sz) as *mut usize) = *v;
+            write_user(new_token, (base + (3 + argc + envc + i * 2) * sz) as *mut usize, *t);
+            write_user(new_token, (base + (4 + argc + envc + i * 2) * sz) as *mut usize, *v);
         }
         let user_sp = base;
         // initialize trap_cx
@@ -414,6 +425,8 @@ impl ProcessControlBlock {
         // create child process pcb
         let child = Arc::new(Self {
             pid,
+            #[cfg(feature = "smp")]
+            hart: crate::arch::next_hart(),
             inner: unsafe {
                 UPSafeCell::new(ProcessControlBlockInner {
                     is_zombie: false,

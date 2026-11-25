@@ -84,8 +84,7 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
     // A private file mapping may need a COW fault while the task is still current.
     if clear_child_tid != 0 && !last_thread {
         let token = process.inner_exclusive_access().memory_set.token();
-        if let Some(word) = crate::mm::try_translated_refmut(token, clear_child_tid as *mut i32) {
-            *word = 0;
+        if crate::mm::try_write_user(token, clear_child_tid as *mut i32, 0).is_some() {
             crate::syscall::futex::wake_one(token, clear_child_tid);
         }
     }

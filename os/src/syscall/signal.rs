@@ -1,5 +1,6 @@
-use crate::mm::{translated_ref, try_translated_ref, try_translated_refmut};
-use crate::mm::{MapPermission, MemorySet, VirtAddr};
+use crate::mm::{
+    read_user, try_read_user, try_write_user, MapPermission, MemorySet, UserValue, VirtAddr,
+};
 use crate::task::{current_process, current_task, current_user_token, pid2process};
 use alloc::sync::Arc;
 
@@ -20,6 +21,23 @@ pub struct SignalAction {
     pub handler: usize,
     flags: usize,
     mask: u64,
+}
+
+// The ABI is three aligned integer fields. A shared mapping may change between fields.
+unsafe impl UserValue for SignalAction {
+    unsafe fn load(src: *const Self) -> Self {
+        Self {
+            handler: usize::load(core::ptr::addr_of!((*src).handler)),
+            flags: usize::load(core::ptr::addr_of!((*src).flags)),
+            mask: u64::load(core::ptr::addr_of!((*src).mask)),
+        }
+    }
+
+    unsafe fn store(dst: *mut Self, value: Self) {
+        usize::store(core::ptr::addr_of_mut!((*dst).handler), value.handler);
+        usize::store(core::ptr::addr_of_mut!((*dst).flags), value.flags);
+        u64::store(core::ptr::addr_of_mut!((*dst).mask), value.mask);
+    }
 }
 
 fn signal_bit(signo: usize) -> u64 {
@@ -53,8 +71,8 @@ pub fn sys_setitimer(which: usize, new: *const u8, _old: *mut u8) -> isize {
     }
     let token = current_user_token();
     // struct itimerval { it_interval{sec,usec}, it_value{sec,usec} }：取 it_value
-    let sec = *translated_ref(token, (new as usize + 16) as *const u64) as usize;
-    let usec = *translated_ref(token, (new as usize + 24) as *const u64) as usize;
+    let sec = read_user(token, (new as usize + 16) as *const u64) as usize;
+    let usec = read_user(token, (new as usize + 24) as *const u64) as usize;
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     if sec == 0 && usec == 0 {
@@ -73,18 +91,15 @@ pub fn sys_rt_sigaction(signo: usize, act: usize, old: usize, size: usize) -> is
     let action = if act == 0 {
         None
     } else {
-        match try_translated_ref(token, act as *const SignalAction) {
-            Some(action) => Some(*action),
+        match try_read_user(token, act as *const SignalAction) {
+            Some(action) => Some(action),
             None => return -14,
         }
     };
     let process = current_process();
     let previous = process.inner_exclusive_access().signal_actions[signo - 1];
-    if old != 0 {
-        match try_translated_refmut(token, old as *mut SignalAction) {
-            Some(output) => *output = previous,
-            None => return -14,
-        }
+    if old != 0 && try_write_user(token, old as *mut SignalAction, previous).is_none() {
+        return -14;
     }
     if let Some(action) = action {
         process.inner_exclusive_access().signal_actions[signo - 1] = action;
@@ -102,20 +117,17 @@ pub fn sys_rt_sigprocmask(how: usize, set: usize, old: usize, size: usize) -> is
     let requested = if set == 0 {
         previous
     } else {
-        match try_translated_ref(token, set as *const u64) {
+        match try_read_user(token, set as *const u64) {
             Some(mask) => match how {
                 0 => previous | mask,
                 1 => previous & !mask,
-                _ => *mask,
+                _ => mask,
             },
             None => return -14,
         }
     };
-    if old != 0 {
-        match try_translated_refmut(token, old as *mut u64) {
-            Some(output) => *output = previous,
-            None => return -14,
-        }
+    if old != 0 && try_write_user(token, old as *mut u64, previous).is_none() {
+        return -14;
     }
     task.inner_exclusive_access().signal_mask = requested & !UNBLOCKABLE;
     0

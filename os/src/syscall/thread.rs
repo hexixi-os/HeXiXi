@@ -123,7 +123,7 @@ pub fn sys_clone_thread(flags: usize, stack: usize, ptid: usize, tls: usize, cti
     let process = task.process.upgrade().unwrap();
     let token = task.get_user_token();
     let parent_tid = if flags & CLONE_PARENT_SETTID != 0 {
-        match crate::mm::try_translated_refmut(token, ptid as *mut i32) {
+        match crate::mm::prepare_user_write(token, ptid as *mut i32) {
             Some(word) => Some(word),
             None => return -14,
         }
@@ -141,7 +141,7 @@ pub fn sys_clone_thread(flags: usize, stack: usize, ptid: usize, tls: usize, cti
     };
     let linux_tid = new_task.linux_tid();
     if let Some(word) = parent_tid {
-        *word = linux_tid as i32;
+        word.write(linux_tid as i32);
     }
     let mut new_task_inner = new_task.inner_exclusive_access();
     new_task_inner.signal_mask = signal_mask;

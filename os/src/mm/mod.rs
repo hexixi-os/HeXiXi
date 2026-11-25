@@ -5,6 +5,7 @@ mod heap_allocator;
 mod memory_set;
 mod page_table;
 mod resident;
+mod user_access;
 mod vma;
 
 use address::VPNRange;
@@ -17,12 +18,13 @@ pub use memory_set::remap_test;
 pub use memory_set::{kernel_token, MapPermission, MemorySet, KERNEL_SPACE};
 pub use vma::{PageFault, VmaBacking, USER_END};
 use page_table::PTEFlags;
-pub(crate) use page_table::{translated_c_bytes, try_translated_ref, try_translated_refmut};
-pub use page_table::{
-    translated_byte_buffer, translated_path, translated_ref, translated_refmut, translated_str,
-    PageTable,
-    PageTableEntry, UserBuffer, UserBufferIterator,
+pub(crate) use page_table::{
+    prepare_user_write, read_user, translated_c_bytes, try_read_user, try_write_user, write_user,
 };
+pub use page_table::{
+    translated_byte_buffer, translated_path, translated_str, PageTable, PageTableEntry, UserBuffer,
+};
+pub(crate) use user_access::{copy_live_bytes, zero_live_bytes, UserValue};
 
 pub fn init() {
     heap_allocator::init_heap();

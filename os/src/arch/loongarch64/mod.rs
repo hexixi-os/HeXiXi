@@ -16,6 +16,8 @@ pub const OFFICIAL_BASIC_INTERPRETER: &str = "/lib64/ld-linux-loongarch-lp64d.so
 pub const CLONE_CHILD_TID_FIRST: bool = true;
 pub const RAM_BASE: usize = 0;
 pub const PA_BITS: usize = 48;
+pub const fn hart_id() -> usize { 0 }
+
 pub const REG_SP: usize = 3;
 pub const REG_TP: usize = 2;
 pub const REG_FP: usize = 22;
@@ -140,6 +142,8 @@ pub fn flush_tlb() {
         asm!("dbar 0", "invtlb 0, $zero, $zero");
     }
 }
+
+pub use self::flush_tlb as local_flush_tlb;
 
 pub fn activate_kernel_table(token: usize) {
     unsafe {

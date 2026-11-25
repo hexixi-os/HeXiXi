@@ -1,6 +1,8 @@
 use super::{ext4::Ext4File, File, OpenFlags};
 use crate::config::PAGE_SIZE;
-use crate::mm::{frame_alloc_charged, ram_end, FrameTracker, PhysAddr, UserBuffer};
+use crate::mm::{
+    copy_live_bytes, frame_alloc_charged, ram_end, zero_live_bytes, FrameTracker, UserBuffer,
+};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -346,7 +348,7 @@ impl FileData {
         let tail = offset % PAGE_SIZE;
         if tail != 0 {
             if let Some(page) = self.pages.get(&(offset / PAGE_SIZE)) {
-                page.ppn.get_bytes_array()[tail..end_in_page].fill(0);
+                unsafe { zero_live_bytes(page.ppn.bytes_ptr().add(tail), end_in_page - tail) };
             }
         }
     }
@@ -367,9 +369,7 @@ impl FileData {
         let mut pages = BTreeMap::new();
         for (&index, source) in &self.pages {
             let page = alloc_overlay_page().ok_or(-12isize)?;
-            page.ppn
-                .get_bytes_array()
-                .copy_from_slice(source.ppn.get_bytes_array());
+            unsafe { copy_live_bytes(source.ppn.bytes_ptr(), page.ppn.bytes_ptr(), PAGE_SIZE) };
             pages.insert(index, page);
         }
         Ok(Self {
@@ -381,11 +381,19 @@ impl FileData {
     }
 
     pub(super) fn read_at(&self, offset: usize, buffer: &mut [u8]) -> usize {
-        unsafe { self.copy_out(offset, buffer.as_mut_ptr(), buffer.len()) }
+        unsafe { self.copy_out(offset, buffer.as_mut_ptr(), buffer.len(), None) }
     }
 
     // The destination can be another virtual mapping of the file's own frames.
-    unsafe fn copy_out(&self, offset: usize, dst: *mut u8, capacity: usize) -> usize {
+    // Pass a scratch buffer when `dst` may be mapped in userspace, so lower-layer
+    // I/O gets kernel-owned bytes even when another hart can write that mapping.
+    unsafe fn copy_out(
+        &self,
+        offset: usize,
+        dst: *mut u8,
+        capacity: usize,
+        mut user_scratch: Option<&mut Vec<u8>>,
+    ) -> usize {
         let len = self.len.saturating_sub(offset).min(capacity);
         let mut copied = 0;
         while copied < len {
@@ -393,12 +401,22 @@ impl FileData {
             let start = pos % PAGE_SIZE;
             let count = (len - copied).min(PAGE_SIZE - start);
             if let Some(page) = self.pages.get(&(pos / PAGE_SIZE)) {
-                let src = PhysAddr::from(page.ppn).kernel_address() as *const u8;
-                core::ptr::copy(src.add(start), dst.add(copied), count);
+                copy_live_bytes(page.ppn.bytes_ptr().add(start), dst.add(copied), count);
             } else if pos < self.lower_len {
-                self.read_lower(pos, core::slice::from_raw_parts_mut(dst.add(copied), count));
+                match user_scratch.as_deref_mut() {
+                    #[cfg(feature = "smp")]
+                    Some(scratch) => {
+                        scratch.resize(count, 0);
+                        self.read_lower(pos, scratch);
+                        copy_live_bytes(scratch.as_ptr(), dst.add(copied), count);
+                    }
+                    _ => self.read_lower(
+                        pos,
+                        core::slice::from_raw_parts_mut(dst.add(copied), count),
+                    ),
+                }
             } else {
-                dst.add(copied).write_bytes(0, count);
+                zero_live_bytes(dst.add(copied), count);
             }
             copied += count;
         }
@@ -415,8 +433,7 @@ impl FileData {
                 Some(page) => page,
                 None => break,
             };
-            let dst = PhysAddr::from(page.ppn).kernel_address() as *mut u8;
-            core::ptr::copy(src.add(written), dst.add(start), count);
+            copy_live_bytes(src.add(written), page.ppn.bytes_ptr().add(start), count);
             // The source may be in the shared tail of this file. Copy before zeroing any gap.
             if self.len < pos {
                 self.zero_tail(
@@ -468,10 +485,15 @@ impl File for OverlayFile {
         let data = self.data.exclusive_access();
         let mut offset = self.offset.exclusive_access();
         let start = *offset;
+        let mut scratch = Vec::new();
         for chunk in buf.buffers {
             let n = unsafe {
-                data.contents
-                    .copy_out(*offset, chunk.as_mut_ptr(), chunk.len())
+                data.contents.copy_out(
+                    *offset,
+                    chunk.as_mut_ptr(),
+                    chunk.len(),
+                    Some(&mut scratch),
+                )
             };
             *offset += n;
             if n < chunk.len() {

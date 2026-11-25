@@ -164,10 +164,6 @@ impl PhysAddr {
     pub fn kernel_address(self) -> usize {
         crate::arch::phys_to_virt(self.0)
     }
-    pub fn get_ref<T>(&self) -> &'static T {
-        assert_ne!(self.0, 0, "null physical address");
-        unsafe { &*(self.kernel_address() as *const T) }
-    }
     pub fn get_mut<T>(&self) -> &'static mut T {
         assert_ne!(self.0, 0, "null physical address");
         unsafe { &mut *(self.kernel_address() as *mut T) }
@@ -179,8 +175,10 @@ impl PhysPageNum {
         unsafe { core::slice::from_raw_parts_mut(pa.kernel_address() as *mut PageTableEntry, 512) }
     }
     pub fn get_bytes_array(&self) -> &'static mut [u8] {
-        let pa: PhysAddr = (*self).into();
-        unsafe { core::slice::from_raw_parts_mut(pa.kernel_address() as *mut u8, 4096) }
+        unsafe { core::slice::from_raw_parts_mut(self.bytes_ptr(), PAGE_SIZE) }
+    }
+    pub(crate) fn bytes_ptr(self) -> *mut u8 {
+        PhysAddr::from(self).kernel_address() as *mut u8
     }
     pub fn get_mut<T>(&self) -> &'static mut T {
         let pa: PhysAddr = (*self).into();

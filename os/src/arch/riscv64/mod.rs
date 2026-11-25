@@ -1,4 +1,8 @@
 mod sbi;
+#[cfg(feature = "smp")]
+mod smp;
+#[cfg(feature = "smp")]
+pub(crate) use smp::{boot as boot_smp, next_hart, MAX_HARTS};
 
 pub use sbi::{console_getchar, console_putchar, set_timer, shutdown};
 
@@ -14,7 +18,10 @@ use riscv::register::{
     sepc, sie, sstatus, stval, stvec, time,
 };
 
+#[cfg(not(feature = "smp"))]
 global_asm!(include_str!("entry.S"));
+#[cfg(feature = "smp")]
+global_asm!(include_str!("smp_entry.S"), max_harts = const MAX_HARTS);
 global_asm!(include_str!("trap.S"));
 global_asm!(include_str!("switch.S"));
 
@@ -24,6 +31,22 @@ pub const OFFICIAL_BASIC_INTERPRETER: &str = "/lib/ld-linux-riscv64-lp64d.so.1";
 pub const CLONE_CHILD_TID_FIRST: bool = false;
 pub const RAM_BASE: usize = 0x8000_0000;
 pub const PA_BITS: usize = 56;
+#[inline]
+pub fn hart_id() -> usize {
+    #[cfg(feature = "smp")]
+    {
+        let hart: usize;
+        unsafe {
+            asm!("mv {}, tp", out(reg) hart, options(nomem, nostack));
+        }
+        hart
+    }
+    #[cfg(not(feature = "smp"))]
+    {
+        0
+    }
+}
+
 pub const REG_SP: usize = 2;
 pub const REG_TP: usize = 4;
 pub const REG_FP: usize = 8;
@@ -56,7 +79,16 @@ pub fn directory_entry(ppn: usize) -> usize {
 }
 
 pub fn pte(ppn: usize, flags: u8) -> usize {
-    ppn << 10 | usize::from(flags)
+    // A hardware A/D update must not overlap a supervisor update of the PTE.
+    // Only leaves get A/D bits. A read-only entry still rejects all writes.
+    let mut bits = usize::from(flags);
+    if cfg!(feature = "smp") && bits & 0b1110 != 0 {
+        bits |= 1 << 6;
+        if bits & (1 << 2) != 0 {
+            bits |= 1 << 7;
+        }
+    }
+    ppn << 10 | bits
 }
 
 pub fn pte_ppn(pte: usize) -> usize {
@@ -68,6 +100,16 @@ pub fn pte_flags(pte: usize) -> u8 {
 }
 
 pub fn flush_tlb() {
+    local_flush_tlb();
+    #[cfg(feature = "smp")]
+    smp::flush_remote();
+}
+
+pub fn local_flush_tlb() {
+    #[cfg(feature = "smp")]
+    unsafe {
+        asm!("fence rw, rw");
+    }
     unsafe {
         asm!("sfence.vma");
     }
@@ -77,7 +119,7 @@ pub fn activate_kernel_table(token: usize) {
     unsafe {
         satp::write(token);
     }
-    flush_tlb();
+    local_flush_tlb();
 }
 
 #[inline(always)]
@@ -131,13 +173,15 @@ pub fn trap_info() -> (TrapCause, usize, usize) {
     (cause, stval::read(), sepc::read())
 }
 
-pub unsafe fn return_to_user(_: *mut TrapContext, context_va: usize, token: usize) -> ! {
+pub unsafe fn return_to_user(context: *mut TrapContext, context_va: usize, token: usize) -> ! {
     extern "C" {
         fn __alltraps();
         fn __restore();
     }
+    (*context).kernel_hart = hart_id();
     stvec::write(TRAMPOLINE, TrapMode::Direct);
     let restore_va = __restore as usize - __alltraps as usize + TRAMPOLINE;
+    crate::sync::leave_kernel();
     asm!(
         "fence.i",
         "jr {restore_va}",

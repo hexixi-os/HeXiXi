@@ -2,6 +2,10 @@
 #![no_main]
 #![cfg_attr(target_arch = "riscv64", feature(panic_info_message))]
 #![feature(alloc_error_handler)]
+#![cfg_attr(feature = "smp", feature(asm_const))]
+
+#[cfg(all(feature = "smp", not(all(target_arch = "riscv64", feature = "board_qemu")),))]
+compile_error!("SMP is supported on RISC-V QEMU virt");
 
 extern crate alloc;
 
@@ -52,6 +56,7 @@ fn clear_bss() {
 #[no_mangle]
 pub fn rust_main() -> ! {
     clear_bss();
+    sync::enter_kernel();
     println!("[kernel] Hello, world!");
     let boot = arch::boot_info();
     match boot.ram_end {
@@ -69,11 +74,12 @@ pub fn rust_main() -> ! {
     trap::init();
     trap::enable_timer_interrupt();
     timer::set_next_trigger();
+    #[cfg(feature = "smp")]
+    arch::boot_smp(boot.hart_mask);
     let is_ext4 = fs::ext4::probe();
     if !is_ext4 {
         fs::list_apps();
     }
     task::add_initproc(boot.oscomp_group());
-    task::run_tasks();
-    panic!("Unreachable in rust_main!");
+    task::run_tasks()
 }

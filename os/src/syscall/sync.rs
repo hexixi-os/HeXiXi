@@ -140,8 +140,8 @@ pub fn sys_nanosleep(req: usize, _rem: usize) -> isize {
         req
     } else {
         let token = crate::task::current_user_token();
-        let sec = *crate::mm::translated_ref(token, req as *const usize) as i64;
-        let nsec = *crate::mm::translated_ref(token, (req + 8) as *const usize) as i64;
+        let sec = crate::mm::read_user(token, req as *const usize) as i64;
+        let nsec = crate::mm::read_user(token, (req + 8) as *const usize) as i64;
         (sec * 1000 + nsec / 1_000_000) as usize
     };
     sys_sleep(ms);
@@ -155,8 +155,8 @@ pub fn sys_clock_gettime(tp: *mut u8) -> isize {
     let ns = crate::timer::get_time_ns();
     let sec = ns / 1_000_000_000;
     let nsec = ns % 1_000_000_000;
-    *crate::mm::translated_refmut(token, tp as *mut usize) = sec;
-    *crate::mm::translated_refmut(token, (tp as usize + 8) as *mut usize) = nsec;
+    crate::mm::write_user(token, tp as *mut usize, sec);
+    crate::mm::write_user(token, (tp as usize + 8) as *mut usize, nsec);
     0
 }
 
@@ -167,9 +167,9 @@ pub fn sys_clock_getres(ts: *mut u8) -> isize {
     }
     let token = crate::task::current_user_token();
     for i in 0..8 {
-        *crate::mm::translated_refmut(token, (ts as usize + i) as *mut u8) = 0;
+        crate::mm::write_user(token, (ts as usize + i) as *mut u8, 0);
     }
-    *crate::mm::translated_refmut(token, (ts as usize + 8) as *mut u64) = 1;
+    crate::mm::write_user(token, (ts as usize + 8) as *mut u64, 1);
     0
 }
 
@@ -179,8 +179,8 @@ pub fn sys_clock_nanosleep(req: *const u8) -> isize {
         return -22;
     }
     let token = crate::task::current_user_token();
-    let sec = unsafe { *crate::mm::translated_ref(token, req as *const u64) } as usize;
-    let nsec = unsafe { *crate::mm::translated_ref(token, (req as usize + 8) as *const u64) } as usize;
+    let sec = crate::mm::read_user(token, req as *const u64) as usize;
+    let nsec = crate::mm::read_user(token, (req as usize + 8) as *const u64) as usize;
     let deadline = crate::timer::get_time_ms() + sec * 1000 + (nsec + 999_999) / 1_000_000;
     while crate::timer::get_time_ms() < deadline {
         crate::task::suspend_current_and_run_next();

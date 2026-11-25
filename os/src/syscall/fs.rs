@@ -1,7 +1,7 @@
 use crate::fs::{self, make_pipe, OpenFlags};
 use crate::mm::{
-    translated_byte_buffer, translated_path, translated_ref, translated_refmut, translated_str,
-    MapPermission, UserBuffer,
+    read_user, translated_byte_buffer, translated_path, translated_str, write_user, MapPermission,
+    UserBuffer,
 };
 use crate::task::{current_process, current_user_token};
 use alloc::{string::String, sync::Arc};
@@ -137,7 +137,7 @@ pub fn sys_pipe(pipe: *mut usize, flags: u32) -> isize {
         .into_iter()
         .chain((write_fd as i32).to_ne_bytes());
     for (dst, byte) in output.into_iter().zip(descriptors) {
-        unsafe { dst.write(byte) };
+        dst.write(byte);
     }
     0
 }
@@ -177,8 +177,8 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         let mut buffers = alloc::vec::Vec::new();
         for i in 0..iovcnt {
             let entry = (iov as usize + i * 16) as *const usize;
-            let base = *translated_ref(token, entry);
-            let len = *translated_ref(token, (entry as usize + 8) as *const usize);
+            let base = read_user(token, entry);
+            let len = read_user(token, (entry as usize + 8) as *const usize);
             if len == 0 {
                 continue;
             }
@@ -327,7 +327,7 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     };
     let bytes = core::iter::once(b'/').chain(path.bytes()).chain(core::iter::once(0));
     for (dst, byte) in target.into_iter().zip(bytes) {
-        unsafe { dst.write(byte); }
+        dst.write(byte);
     }
     count as isize
 }
@@ -438,9 +438,7 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
         Some(buffers) => UserBuffer::new(buffers),
         None => return -14,
     };
-    for (dst, byte) in target.into_iter().zip(out) {
-        unsafe { dst.write(byte) };
-    }
+    target.copy_from(&out);
     directory.set_position(position);
     n as isize
 }
@@ -454,9 +452,7 @@ fn write_stat_bytes(st: *mut u8, bytes: &[u8]) -> isize {
         Some(buffers) => UserBuffer::new(buffers),
         None => return -14,
     };
-    for (dst, &byte) in target.into_iter().zip(bytes) {
-        unsafe { dst.write(byte); }
-    }
+    target.copy_from(bytes);
     0
 }
 
@@ -620,8 +616,8 @@ pub fn sys_ppoll(fds: *mut u8, nfds: usize) -> isize {
     let token = current_user_token();
     for i in 0..nfds {
         let base = fds as usize + i * 8;
-        let events = *translated_ref(token, (base + 4) as *const u16);
-        *translated_refmut(token, (base + 6) as *mut u16) = events | 0x1; // POLLIN
+        let events = read_user(token, (base + 4) as *const u16);
+        write_user(token, (base + 6) as *mut u16, events | 0x1); // POLLIN
     }
     nfds as isize
 }
@@ -664,7 +660,7 @@ pub fn sys_statfs(buf: *mut u8) -> isize {
     b[48..56].copy_from_slice(&3000u64.to_le_bytes());
     b[56..64].copy_from_slice(&255u64.to_le_bytes());
     for (i, byte) in b.iter().enumerate() {
-        *translated_refmut(token, (buf as usize + i) as *mut u8) = *byte;
+        write_user(token, (buf as usize + i) as *mut u8, *byte);
     }
     0
 }
@@ -704,8 +700,8 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         let mut buffers = alloc::vec::Vec::new();
         for i in 0..iovcnt {
             let entry = (iov as usize + i * 16) as *const usize;
-            let base = *translated_ref(token, entry);
-            let len = *translated_ref(token, (entry as usize + 8) as *const usize);
+            let base = read_user(token, entry);
+            let len = read_user(token, (entry as usize + 8) as *const usize);
             if len == 0 {
                 continue;
             }

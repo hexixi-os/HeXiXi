@@ -146,10 +146,8 @@ impl File for Pipe {
             }
             // read at most loop_read bytes
             for _ in 0..loop_read {
-                if let Some(byte_ref) = buf_iter.next() {
-                    unsafe {
-                        *byte_ref = ring_buffer.read_byte();
-                    }
+                if let Some(slot) = buf_iter.next() {
+                    slot.write(ring_buffer.read_byte());
                     read_size += 1;
                 } else {
                     return read_size;
@@ -172,8 +170,8 @@ impl File for Pipe {
             }
             // write at most loop_write bytes
             for _ in 0..loop_write {
-                if let Some(byte_ref) = buf_iter.next() {
-                    ring_buffer.write_byte(unsafe { *byte_ref });
+                if let Some(slot) = buf_iter.next() {
+                    ring_buffer.write_byte(slot.read());
                     write_size += 1;
                 } else {
                     return write_size as isize;

@@ -82,6 +82,9 @@ pub(super) fn try_kstack_alloc() -> Option<KernelStack> {
         MapPermission::R | MapPermission::W,
     );
     if mapped {
+        // Harts may have cached an invalid translation before this stack existed.
+        #[cfg(feature = "smp")]
+        crate::arch::flush_tlb();
         Some(KernelStack(kstack_id))
     } else {
         KSTACK_ALLOCATOR.exclusive_access().dealloc(kstack_id);

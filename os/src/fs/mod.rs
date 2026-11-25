@@ -120,14 +120,7 @@ impl File for ZeroFile {
         true
     }
     fn read(&self, buf: UserBuffer) -> usize {
-        let mut n = 0usize;
-        for ptr in buf {
-            unsafe {
-                *ptr = 0;
-            }
-            n += 1;
-        }
-        n
+        buf.fill_zero()
     }
     fn write(&self, buf: UserBuffer) -> isize {
         buf.len() as isize
@@ -514,9 +507,7 @@ impl File for ProcSnapshot {
         let mut offset = self.offset.exclusive_access();
         let remaining = self.bytes.get(*offset..).unwrap_or(&[]);
         let count = remaining.len().min(buffer.len());
-        for (dst, &byte) in buffer.into_iter().zip(&remaining[..count]) {
-            unsafe { dst.write(byte) };
-        }
+        buffer.copy_from(&remaining[..count]);
         *offset += count;
         count
     }

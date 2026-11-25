@@ -1,7 +1,8 @@
 use super::File;
+use crate::arch::{console_getchar, console_putchar};
 use crate::mm::UserBuffer;
-use crate::arch::console_getchar;
 use crate::task::suspend_current_and_run_next;
+use alloc::vec::Vec;
 
 pub struct Stdin;
 
@@ -28,7 +29,7 @@ impl File for Stdin {
                 }
                 suspend_current_and_run_next();
             };
-            unsafe { slot.write(c as u8); }
+            slot.write(c as u8);
             n += 1;
         }
         n
@@ -49,9 +50,16 @@ impl File for Stdout {
         panic!("Cannot read from stdout!");
     }
     fn write(&self, user_buf: UserBuffer) -> isize {
+        let mut scratch = Vec::new();
         for buffer in user_buf.buffers.iter() {
-            let slice = unsafe { core::slice::from_raw_parts(buffer.as_ptr(), buffer.len()) };
-            print!("{}", core::str::from_utf8(slice).unwrap());
+            buffer.read_with(&mut scratch, |slice| match core::str::from_utf8(slice) {
+                Ok(text) => print!("{}", text),
+                Err(_) => {
+                    for &byte in slice {
+                        console_putchar(byte as usize);
+                    }
+                }
+            });
         }
         user_buf.len() as isize
     }

@@ -9,6 +9,8 @@ pub struct TrapContext {
     pub kernel_satp: usize,
     pub kernel_sp: usize,
     pub trap_handler: usize,
+    #[cfg(target_arch = "riscv64")]
+    pub kernel_hart: usize,
     #[cfg(target_arch = "loongarch64")]
     pub f: [usize; 32],
     #[cfg(target_arch = "loongarch64")]
@@ -48,6 +50,8 @@ impl TrapContext {
             kernel_satp,
             kernel_sp,
             trap_handler,
+            #[cfg(target_arch = "riscv64")]
+            kernel_hart: 0,
             #[cfg(target_arch = "loongarch64")]
             f: [0; 32],
             #[cfg(target_arch = "loongarch64")]

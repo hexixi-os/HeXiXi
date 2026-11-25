@@ -44,3 +44,36 @@ pub fn shutdown() -> ! {
     sbi_call(SBI_SHUTDOWN, 0, 0, 0);
     panic!("It should shutdown!");
 }
+
+#[cfg(feature = "smp")]
+fn call(extension: usize, function: usize, args: [usize; 4]) -> Result<(), isize> {
+    let error: isize;
+    unsafe {
+        asm!(
+            "ecall",
+            inlateout("a0") args[0] => error,
+            inlateout("a1") args[1] => _,
+            in("a2") args[2],
+            in("a3") args[3],
+            in("a6") function,
+            in("a7") extension,
+        );
+    }
+    if error == 0 {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(feature = "smp")]
+pub(super) fn hart_start(hart: usize, entry: usize, opaque: usize) -> Result<(), isize> {
+    const HSM: usize = 0x0048_534d;
+    call(HSM, 0, [hart, entry, opaque, 0])
+}
+
+#[cfg(feature = "smp")]
+pub(super) fn remote_sfence_vma(hart_mask: usize) -> Result<(), isize> {
+    const RFENCE: usize = 0x5246_4e43;
+    call(RFENCE, 1, [hart_mask, 0, 0, usize::MAX])
+}

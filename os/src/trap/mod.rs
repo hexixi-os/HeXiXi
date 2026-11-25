@@ -44,6 +44,7 @@ fn handle_user_fault(cause: TrapCause, stval: usize, signal: SignalFlags) {
 #[no_mangle]
 pub fn trap_handler() -> ! {
     arch::install_kernel_trap();
+    crate::sync::enter_kernel();
     // 在别人的内核栈上析构已退出线程（不能在自己的栈上析构）
     crate::task::drain_recycled_tasks();
     let (cause, address, _) = arch::trap_info();
@@ -78,7 +79,7 @@ pub fn trap_handler() -> ! {
             };
             match crate::mm::handle_user_page_fault(address, access) {
                 PageFault::Resolved => {
-                    arch::flush_tlb();
+                    arch::local_flush_tlb();
                     trap_return();
                 }
                 PageFault::FileUnavailable => {
@@ -126,9 +127,7 @@ pub fn trap_return() -> ! {
     let task = crate::task::current_task().unwrap();
     let child_tid = task.inner_exclusive_access().set_child_tid.take();
     if let Some(address) = child_tid {
-        if let Some(word) = crate::mm::try_translated_refmut(user_token, address as *mut i32) {
-            *word = task.linux_tid() as i32;
-        }
+        let _ = crate::mm::try_write_user(user_token, address as *mut i32, task.linux_tid() as i32);
     }
     drop(task);
     unsafe { arch::return_to_user(current_trap_cx(), trap_cx_user_va, user_token) }

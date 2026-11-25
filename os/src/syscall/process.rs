@@ -3,8 +3,8 @@ use crate::mm::{MapPermission, VirtPageNum, VmaBacking, USER_END};
 use core::ops::Range;
 use crate::fs::{open_executable, Executable};
 use crate::mm::{
-    translated_byte_buffer, translated_c_bytes, translated_path, translated_ref, translated_refmut,
-    try_translated_refmut, UserBuffer,
+    read_user, translated_byte_buffer, translated_c_bytes, translated_path, try_read_user,
+    try_write_user, write_user, UserBuffer,
 };
 use crate::task::{
     current_process, current_task, current_user_token, exit_current_and_run_next,
@@ -102,7 +102,7 @@ fn exec_arguments(token: usize, args: *const usize) -> Result<Vec<Vec<u8>>, isiz
             .ok_or(-14isize)?;
         let mut bytes = [0; WORD];
         for (byte, user) in bytes.iter_mut().zip(UserBuffer::new(buffers)) {
-            *byte = unsafe { user.read() };
+            *byte = user.read();
         }
         let pointer = usize::from_ne_bytes(bytes);
         if pointer == 0 {
@@ -178,11 +178,8 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
             let status = child.inner_exclusive_access().wait_status;
             let token = inner.memory_set.token();
             drop(inner);
-            if !exit_code_ptr.is_null() {
-                match try_translated_refmut(token, exit_code_ptr) {
-                    Some(out) => *out = status,
-                    None => return -14, // EFAULT
-                }
+            if !exit_code_ptr.is_null() && try_write_user(token, exit_code_ptr, status).is_none() {
+                return -14; // EFAULT
             }
             process.inner_exclusive_access().children.remove(idx);
             return found_pid as isize;
@@ -227,7 +224,7 @@ pub fn sys_uname(buf: *mut u8) -> isize {
     for (i, f) in fields.iter().enumerate() {
         for j in 0..65usize {
             let c = if j < f.len() { f.as_bytes()[j] } else { 0 };
-            *translated_refmut(token, (buf as usize + i * 65 + j) as *mut u8) = c;
+            write_user(token, (buf as usize + i * 65 + j) as *mut u8, c);
         }
     }
     0
@@ -237,7 +234,7 @@ pub fn sys_uname(buf: *mut u8) -> isize {
 pub fn sys_times(buf: *mut u8) -> isize {
     let token = current_user_token();
     for i in 0..32usize {
-        *translated_refmut(token, (buf as usize + i) as *mut u8) = 0;
+        write_user(token, (buf as usize + i) as *mut u8, 0);
     }
     (crate::timer::get_time_ms() / 10) as isize
 }
@@ -262,8 +259,8 @@ pub fn sys_gettimeofday(tv: *mut u8) -> isize {
     let token = current_user_token();
     // 微秒分辨率（基准测试靠它做时间校准）
     let us = crate::timer::get_time_us();
-    *translated_refmut(token, tv as *mut usize) = us / 1_000_000;
-    *translated_refmut(token, (tv as usize + 8) as *mut usize) = us % 1_000_000;
+    write_user(token, tv as *mut usize, us / 1_000_000);
+    write_user(token, (tv as usize + 8) as *mut usize, us % 1_000_000);
     0
 }
 
@@ -433,22 +430,33 @@ pub fn sys_sched_getparam(param: *mut u8) -> isize {
     }
     let token = crate::task::current_user_token();
     for i in 0..4 {
-        *crate::mm::translated_refmut(token, (param as usize + i) as *mut u8) = 0;
+        write_user(token, (param as usize + i) as *mut u8, 0);
     }
     0
 }
 
-/// sched_getaffinity(122)：只报告 CPU0
-pub fn sys_sched_getaffinity(size: usize, mask: *mut u8) -> isize {
-    if mask.is_null() {
+pub fn sys_sched_getaffinity(tid: i32, size: usize, mask: *mut u8) -> isize {
+    let word = core::mem::size_of::<usize>();
+    if size < word || size % word != 0 {
         return -22;
     }
-    let token = crate::task::current_user_token();
-    for i in 0..size {
-        let val: u8 = if i == 0 { 1 } else { 0 };
-        *crate::mm::translated_refmut(token, (mask as usize + i) as *mut u8) = val;
+    let process = if tid == 0 {
+        current_process()
+    } else {
+        match crate::task::tid2task(tid as usize).and_then(|task| task.process.upgrade()) {
+            Some(process) => process,
+            None => return -3, // ESRCH
+        }
+    };
+    let cpuset = (1usize << process.affinity_hart()).to_le_bytes();
+    let buffers = match translated_byte_buffer(current_user_token(), mask, word, MapPermission::W) {
+        Some(buffers) => UserBuffer::new(buffers),
+        None => return -14,
+    };
+    for (output, byte) in buffers.into_iter().zip(cpuset) {
+        output.write(byte);
     }
-    size as isize
+    word as isize
 }
 
 /// pselect6(72)：按真实 fd 就绪状态轮询。
@@ -459,14 +467,14 @@ pub fn sys_sched_getaffinity(size: usize, mask: *mut u8) -> isize {
 fn read_fdset(token: usize, ptr: *mut u8, bytes: usize) -> alloc::vec::Vec<u8> {
     let mut v = alloc::vec![0u8; bytes];
     for (i, slot) in v.iter_mut().enumerate() {
-        *slot = *translated_ref(token, (ptr as usize + i) as *const u8);
+        *slot = read_user(token, (ptr as usize + i) as *const u8);
     }
     v
 }
 
 fn write_fdset(token: usize, ptr: *mut u8, v: &[u8]) {
     for (i, b) in v.iter().enumerate() {
-        *translated_refmut(token, (ptr as usize + i) as *mut u8) = *b;
+        write_user(token, (ptr as usize + i) as *mut u8, *b);
     }
 }
 
@@ -488,8 +496,8 @@ pub fn sys_pselect6(
     let (deadline, sleep_ms) = if timeout.is_null() {
         (None, 0usize)
     } else {
-        let sec = unsafe { *translated_ref(token, timeout as *const usize) } as usize;
-        let nsec = unsafe { *translated_ref(token, (timeout as usize + 8) as *const usize) } as usize;
+        let sec = read_user(token, timeout as *const usize) as usize;
+        let nsec = read_user(token, (timeout as usize + 8) as *const usize) as usize;
         let ms = sec * 1000 + (nsec + 999_999) / 1_000_000;
         (Some(crate::timer::get_time_ms() + ms), ms)
     };
@@ -578,7 +586,7 @@ pub fn sys_getrusage(buf: *mut u8) -> isize {
     }
     let token = current_user_token();
     for i in 0..144usize {
-        *translated_refmut(token, (buf as usize + i) as *mut u8) = 0;
+        write_user(token, (buf as usize + i) as *mut u8, 0);
     }
     0
 }
@@ -590,8 +598,8 @@ pub fn sys_getrandom(buf: *mut u8, len: usize) -> isize {
     }
     let token = current_user_token();
     for i in 0..len {
-        *translated_refmut(token, (buf as usize + i) as *mut u8) =
-            (i as u8).wrapping_mul(73).wrapping_add(41);
+        let byte = (i as u8).wrapping_mul(73).wrapping_add(41);
+        write_user(token, (buf as usize + i) as *mut u8, byte);
     }
     len as isize
 }
@@ -604,24 +612,24 @@ pub fn sys_rt_sigtimedwait(set: *const u8, info: *mut u8, timeout: *const u8) ->
         return -14;
     }
     let token = current_user_token();
-    let setbits = match crate::mm::try_translated_ref(token, set as *const u64) {
-        Some(set) => *set,
+    let setbits = match try_read_user(token, set as *const u64) {
+        Some(set) => set,
         None => return -14,
     };
     let deadline = if timeout.is_null() {
         usize::MAX
     } else {
-        let sec = unsafe { *translated_ref(token, timeout as *const usize) } as usize;
-        let nsec = unsafe { *translated_ref(token, (timeout as usize + 8) as *const usize) } as usize;
+        let sec = read_user(token, timeout as *const usize) as usize;
+        let nsec = read_user(token, (timeout as usize + 8) as *const usize) as usize;
         crate::timer::get_time_ms() + sec * 1000 + (nsec + 999_999) / 1_000_000
     };
     loop {
         if let Some(signo) = super::signal::take_pending(setbits) {
             if !info.is_null() {
                 for i in 0..128usize {
-                    *translated_refmut(token, (info as usize + i) as *mut u8) = 0;
+                    write_user(token, (info as usize + i) as *mut u8, 0);
                 }
-                *translated_refmut(token, info.cast::<i32>()) = signo as i32;
+                write_user(token, info.cast::<i32>(), signo as i32);
             }
             return signo as isize;
         }
@@ -647,8 +655,8 @@ fn current_rlimit(resource: usize) -> (usize, usize) {
 }
 
 fn write_rlimit(token: usize, ptr: *mut u8, cur: usize, max: usize) {
-    *translated_refmut(token, ptr as *mut usize) = cur;
-    *translated_refmut(token, (ptr as usize + 8) as *mut usize) = max;
+    write_user(token, ptr as *mut usize, cur);
+    write_user(token, (ptr as usize + 8) as *mut usize, max);
 }
 
 /// 应用一个 RLIMIT_NOFILE 设置（夹到 [16, 65536]，避免把 busybox 之类直接卡死）
@@ -712,7 +720,7 @@ pub fn sys_setrlimit(resource: usize, ptr: *const u8) -> isize {
         return -14;
     }
     let token = current_user_token();
-    let cur = unsafe { *translated_ref(token, ptr as *const usize) } as usize;
+    let cur = read_user(token, ptr as *const usize) as usize;
     if resource == 7 {
         apply_nofile(cur);
     }
@@ -723,7 +731,7 @@ pub fn sys_setrlimit(resource: usize, ptr: *const u8) -> isize {
 pub fn sys_prlimit64(_pid: usize, resource: usize, new: *const u8, old: *mut u8) -> isize {
     let token = current_user_token();
     if !new.is_null() {
-        let cur = unsafe { *translated_ref(token, new as *const usize) } as usize;
+        let cur = read_user(token, new as *const usize) as usize;
         if resource == 7 {
             apply_nofile(cur);
         }

@@ -36,6 +36,8 @@ __alltraps:
     ld t0, 34*8(sp)
     # load trap_handler into t1
     ld t1, 36*8(sp)
+    # Restore the kernel hart ID after saving the user TLS pointer.
+    ld tp, 37*8(sp)
     # move to kernel_sp
     ld sp, 35*8(sp)
     # switch to kernel space

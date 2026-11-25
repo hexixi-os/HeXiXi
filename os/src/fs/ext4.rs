@@ -265,7 +265,9 @@ impl Ext4Fs {
                 .as_deref_mut()
                 .map_or_else(Access::read, |stream| stream.access(offset, count));
             if let Some(frame) = self.file_page(inode, offset / PAGE_SIZE as u64, access) {
-                let bytes = frame.ppn.get_bytes_array();
+                // Cache frames stay immutable; writable private mappings copy them first.
+                let bytes =
+                    unsafe { core::slice::from_raw_parts(frame.ppn.bytes_ptr(), PAGE_SIZE) };
                 chunk.copy_from_slice(&bytes[in_page..in_page + count]);
             } else {
                 self.read_file_at(inode, offset, chunk);
@@ -392,15 +394,15 @@ impl File for Ext4File {
         let mut off = self.offset.exclusive_access();
         let mut stream = self.stream.exclusive_access();
         let mut total = 0;
+        let mut scratch = Vec::new();
         for buffer in buf.buffers {
-            let chunk =
-                unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), buffer.len()) };
-            let read = self
-                .fs
-                .read_cached_at(&self.inode, *off as u64, chunk, Some(&mut stream));
+            let read = buffer.write_with(&mut scratch, |chunk| {
+                self.fs
+                    .read_cached_at(&self.inode, *off as u64, chunk, Some(&mut stream))
+            });
             *off += read;
             total += read;
-            if read < chunk.len() {
+            if read < buffer.len() {
                 break;
             }
         }

@@ -1,5 +1,18 @@
 # 测试状态
 
+## 2026-11-25 PR-16 RISC-V 双核
+
+在 QEMU 8.2.2 和 OpenSBI v1.3 上用 `-smp 2` 启动。双核专项连续通过 12 次，两种启动 hart 各出现 6 次。每次在不同 hart 上运行 8 轮父子进程，核对 `getcpu` 与 `sched_getaffinity` 一致、私有映射写入互不影响，以及截短共享文件后，另一 hart 访问已撤销的页收到 `SIGBUS`。
+
+单核与双核均通过 basic ABI、mmap/VMA、fork COW、页缓存、ELF 按需加载、动态 ELF、pthread、可写 Overlay 和 easy-fs `usertests`。双核 `usertests` 跑完 29 项正常用例、8 项预期失败用例和 1,000 轮管道测试。LoongArch64 单核启动和 `clone` 回归也通过。
+
+| RISC-V 官方原盘 | basic-musl | basic-glibc |
+| --- | --- | --- |
+| 单核 | 102/102 | 102/102 |
+| 双核，5 次 | 98–102/102 | 98–99/102 |
+
+双核失分均来自 `test_pipe` 的父子串口输出交错。每次评测都得到完整的组输出，glibc 外层脚本仍在组结束后以 139 退出。内核态由全局锁串行执行，同进程线程固定在同一 hart，进程之间可并行。构建与复跑见[双核运行说明](BUILD.md#在-risc-v-qemu-上启用双核)。
+
 ## 2026-11-24 PR-15 LoongArch64
 
 QEMU 8.2.2 单核下，LoongArch64 内核从 ELF 直启，通过现代 VirtIO PCI 读取只读 EXT4，加载用户程序后正常关机。专项测试核对了 Linux `clone` 的 TLS 和 child TID 参数顺序，修正前缺少成功标记，修正后通过。缺页入口在遍历三层页表前检查 39 位规范地址。

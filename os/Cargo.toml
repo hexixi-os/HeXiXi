@@ -21,6 +21,7 @@ virtio-drivers = { git = "https://gitee.com/rcore-os/virtio-drivers", rev = "4ee
 virtio-pci = { package = "virtio-drivers", version = "=0.7.0" }
 
 [features]
+smp = []
 board_qemu = []
 board_k210 = []
 oscomp_runner = []

@@ -142,7 +142,7 @@ def run_group(args, name, run, kernel):
     serial = directory / "serial.log"
     group_log = directory / "group.log"
     command = [
-        args.qemu, "-machine", "virt", "-m", args.memory, "-smp", "1",
+        args.qemu, "-machine", "virt", "-m", args.memory, "-smp", str(args.smp),
         "-nographic", "-kernel", str(kernel), "-no-reboot",
     ]
     with tempfile.NamedTemporaryFile(dir=directory, prefix="scratch.", suffix=".img") as scratch:
@@ -207,9 +207,14 @@ def main():
     parser.add_argument("--arch", choices=("riscv64", "loongarch64"), default="riscv64")
     parser.add_argument("--qemu", default=os.getenv("QEMU"))
     parser.add_argument("--memory", default=os.getenv("QEMU_MEM", "1G"))
+    parser.add_argument("--smp", type=int, choices=range(1, 9), default=os.getenv("QEMU_SMP", "1"))
     parser.add_argument("--timeout", type=float, default=os.getenv("QEMU_TIMEOUT", "200"))
     args = parser.parse_intermixed_args()
     args.qemu = args.qemu or f"qemu-system-{args.arch}"
+    if not 1 <= args.smp <= 8:
+        parser.error("--smp 必须在 1 至 8 之间")
+    if args.arch == "loongarch64" and args.smp != 1:
+        parser.error("LoongArch64 当前只支持单核")
     try:
         names = select_groups(args.groups)
     except ValueError as error:
@@ -235,6 +240,7 @@ def main():
     metadata = {
         "source": checkout(REPO),
         "arch": args.arch,
+        "harts": args.smp,
         "suite": checkout(args.suite),
         "judge_checkout": checkout(args.judges) if args.judges else None,
         "qemu_version": subprocess.check_output([args.qemu, "--version"], text=True).splitlines()[0],
@@ -247,8 +253,10 @@ def main():
     write_json(run / "run.meta.json", metadata)
     if not args.kernel:
         with (run / "build.log").open("wb") as log:
-            build = subprocess.run(["make", "-C", str(REPO), target, f"{output}={kernel}"],
-                                   stdout=log, stderr=subprocess.STDOUT)
+            command = ["make", "-C", str(REPO), target, f"{output}={kernel}"]
+            if args.smp > 1:
+                command.append("SMP=1")
+            build = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
         if build.returncode:
             sys.exit(f"内核构建失败，见 {run / 'build.log'}")
     metadata["kernel_sha256"] = sha256(kernel)

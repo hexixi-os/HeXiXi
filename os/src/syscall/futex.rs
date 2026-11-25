@@ -1,4 +1,4 @@
-use crate::mm::try_translated_ref;
+use crate::mm::try_read_user;
 use crate::sync::UPSafeCell;
 use crate::task::{
     add_task, block_current_and_run_next, current_task, current_user_token, TaskControlBlock,
@@ -75,9 +75,9 @@ fn deadline(token: usize, pointer: usize, relative: bool) -> Result<Option<usize
     if pointer == 0 {
         return Ok(None);
     }
-    let seconds = *try_translated_ref(token, pointer as *const i64).ok_or(-14isize)?;
+    let seconds = try_read_user(token, pointer as *const i64).ok_or(-14isize)?;
     let nanos_pointer = pointer.checked_add(8).ok_or(-14isize)?;
-    let nanos = *try_translated_ref(token, nanos_pointer as *const i64).ok_or(-14isize)?;
+    let nanos = try_read_user(token, nanos_pointer as *const i64).ok_or(-14isize)?;
     if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
         return Err(-22);
     }
@@ -118,8 +118,8 @@ pub(super) fn sys_futex([address, op, value, arg4, address2, arg6]: [usize; 6]) 
     }
     match command {
         WAIT | WAIT_BITSET => {
-            let word = match try_translated_ref(token, address as *const u32) {
-                Some(word) => *word,
+            let word = match try_read_user(token, address as *const u32) {
+                Some(word) => word,
                 None => return -14,
             };
             if word != value as u32 {
@@ -157,14 +157,14 @@ pub(super) fn sys_futex([address, op, value, arg4, address2, arg6]: [usize; 6]) 
             {
                 return -22;
             }
-            let word = match try_translated_ref(token, address as *const u32) {
-                Some(word) => *word,
+            let word = match try_read_user(token, address as *const u32) {
+                Some(word) => word,
                 None => return -14,
             };
             if command == CMP_REQUEUE && word != arg6 as u32 {
                 return -11;
             }
-            if requeue && try_translated_ref(token, address2 as *const u32).is_none() {
+            if requeue && try_read_user(token, address2 as *const u32).is_none() {
                 return -14;
             }
             let mut waiters = WAITERS.exclusive_access();

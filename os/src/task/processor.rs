@@ -29,14 +29,31 @@ impl Processor {
     }
 }
 
+#[cfg(not(feature = "smp"))]
 lazy_static! {
-    pub static ref PROCESSOR: UPSafeCell<Processor> = unsafe { UPSafeCell::new(Processor::new()) };
+    static ref PROCESSOR: UPSafeCell<Processor> = unsafe { UPSafeCell::new(Processor::new()) };
+}
+#[cfg(feature = "smp")]
+lazy_static! {
+    static ref PROCESSORS: [UPSafeCell<Processor>; crate::arch::MAX_HARTS] =
+        core::array::from_fn(|_| unsafe { UPSafeCell::new(Processor::new()) });
 }
 
-pub fn run_tasks() {
+fn local_processor() -> &'static UPSafeCell<Processor> {
+    #[cfg(feature = "smp")]
+    {
+        &PROCESSORS[crate::arch::hart_id()]
+    }
+    #[cfg(not(feature = "smp"))]
+    {
+        &PROCESSOR
+    }
+}
+
+pub fn run_tasks() -> ! {
     loop {
         super::drain_recycled_tasks();
-        let mut processor = PROCESSOR.exclusive_access();
+        let mut processor = local_processor().exclusive_access();
         if let Some(task) = fetch_task() {
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
             // access coming task TCB exclusively
@@ -52,20 +69,25 @@ pub fn run_tasks() {
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
             }
         } else {
+            drop(processor);
             // 内核态中断被屏蔽，不能依赖时钟中断唤醒休眠任务，
             // 空闲时主动轮询定时器，否则所有任务都阻塞时系统死锁。
             crate::timer::check_timer();
-            core::hint::spin_loop();
         }
+        // Allow other harts into the kernel after every completed switch.
+        // The previous task's context has been saved and no RefCell is borrowed.
+        crate::sync::leave_kernel();
+        core::hint::spin_loop();
+        crate::sync::enter_kernel();
     }
 }
 
 pub fn take_current_task() -> Option<Arc<TaskControlBlock>> {
-    PROCESSOR.exclusive_access().take_current()
+    local_processor().exclusive_access().take_current()
 }
 
 pub fn current_task() -> Option<Arc<TaskControlBlock>> {
-    PROCESSOR.exclusive_access().current()
+    local_processor().exclusive_access().current()
 }
 
 pub fn current_process() -> Arc<ProcessControlBlock> {
@@ -100,7 +122,7 @@ pub fn current_kstack_top() -> usize {
 }
 
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
-    let mut processor = PROCESSOR.exclusive_access();
+    let mut processor = local_processor().exclusive_access();
     let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
     drop(processor);
     unsafe {

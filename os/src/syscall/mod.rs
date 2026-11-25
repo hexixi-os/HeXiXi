@@ -206,7 +206,17 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_PRLIMIT64 => {
             sys_prlimit64(args[0], args[1], args[2] as *const u8, args[3] as *mut u8)
         }
-        SYSCALL_UMASK | SYSCALL_PRCTL | SYSCALL_GETCPU => 0,
+        SYSCALL_GETCPU => {
+            let token = crate::task::current_user_token();
+            let cpu = args[0] as *mut u32;
+            let node = args[1] as *mut u32;
+            let cpu = cpu.is_null()
+                || crate::mm::try_write_user(token, cpu, crate::arch::hart_id() as u32).is_some();
+            let node = node.is_null()
+                || crate::mm::try_write_user(token, node, 0u32).is_some();
+            if cpu && node { 0 } else { -14 }
+        }
+        SYSCALL_UMASK | SYSCALL_PRCTL => 0,
         // LTP 每个用例 setup 都会 chown 临时目录、access 文件，全部按成功处理，
         // 否则 162 个用例全部 TBROK 在 setup 阶段。
         SYSCALL_FACCESSAT | SYSCALL_FCHMOD | SYSCALL_FCHMODAT | SYSCALL_FCHOWNAT => 0,
@@ -266,7 +276,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SCHED_SETPARAM | SYSCALL_SCHED_SETSCHEDULER | SYSCALL_SCHED_SETAFFINITY
         | SYSCALL_MLOCK | SYSCALL_MUNLOCK | SYSCALL_MLOCKALL | SYSCALL_MUNLOCKALL => 0,
         SYSCALL_SCHED_GETSCHEDULER => 0,
-        SYSCALL_SCHED_GETAFFINITY => sys_sched_getaffinity(args[1], args[2] as *mut u8),
+        SYSCALL_SCHED_GETAFFINITY => sys_sched_getaffinity(args[0] as i32, args[1], args[2] as *mut u8),
         SYSCALL_SCHED_GETPARAM => sys_sched_getparam(args[1] as *mut u8),
         SYSCALL_SCHED_YIELD => 0,
         SYSCALL_SCHED_PRIO_MAX => 99,
