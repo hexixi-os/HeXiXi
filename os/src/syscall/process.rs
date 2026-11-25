@@ -63,8 +63,10 @@ pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isiz
         Err(errno) => return errno,
     };
     let (source, path) = match open_executable_path(&raw_path).or_else(|errno| {
-        if errno == -2 && crate::config::legacy_oscomp_image()
-            && raw_path.rsplit('/').next() == Some("busybox") {
+        if errno == -2
+            && crate::config::legacy_oscomp_image()
+            && (raw_path.rsplit('/').next() == Some("busybox") || raw_path == "/bin/sh")
+        {
             open_busybox()
         } else {
             Err(errno)
@@ -184,6 +186,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
             let flag = if status == 0xffff { WCONTINUED } else { WUNTRACED };
             (options & flag != 0).then_some((idx, child.getpid(), status, false))
         });
+        let waiters = inner.child_waiters.clone();
         let token = inner.get_user_token();
         drop(inner); // Copyout may fault in a page through the calling PCB.
         if let Some((idx, found_pid, status, exited)) = event {
@@ -206,14 +209,18 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize
         if options & WNOHANG != 0 {
             return 0;
         }
-        // 父进程在内核里忙等，时钟中断不会到来，
-        // 必须主动轮询定时器，否则子进程的 sleep 永远醒不了。
-        crate::timer::check_timer();
+        crate::task::check_kill_current();
+        if !waiters.register_current_interruptible() {
+            return -4; // EINTR
+        }
+        crate::task::block_current_and_run_next();
+        if let Some(current) = crate::task::current_task() {
+            crate::task::WaitQueue::cancel(&current);
+        }
         crate::task::check_kill_current();
         if super::signal::current_wait_interrupted() {
             return -4; // EINTR
         }
-        suspend_current_and_run_next();
     }
 }
 
@@ -403,8 +410,11 @@ pub fn sys_gettimeofday(tv: *mut u8) -> isize {
     let token = current_user_token();
     // 微秒分辨率（基准测试靠它做时间校准）
     let us = crate::timer::get_time_us();
-    write_user(token, tv as *mut usize, us / 1_000_000);
-    write_user(token, (tv as usize + 8) as *mut usize, us % 1_000_000);
+    let pair = [us / 1_000_000, us % 1_000_000];
+    if try_write_user(token, tv as *mut [usize; 2], pair).is_none() {
+        write_user(token, tv as *mut usize, pair[0]);
+        write_user(token, (tv as usize + 8) as *mut usize, pair[1]);
+    }
     0
 }
 
@@ -521,14 +531,20 @@ pub fn sys_mmap(
         }
         range
     } else {
+        const MMAP_BASE: usize = 0x1000_0000;
         let hint = addr & !(PAGE_SIZE - 1);
         if let Some(range) = page_range(hint, size)
             .filter(|range| hint >= PAGE_SIZE && inner.memory_set.vacant(range))
         {
             range
         } else {
-            let start = VirtPageNum(inner.mmap_top / PAGE_SIZE);
-            match inner.memory_set.find_vacant(start, size / PAGE_SIZE) {
+            let pages = size / PAGE_SIZE;
+            let start = VirtPageNum(inner.mmap_top.max(MMAP_BASE) / PAGE_SIZE);
+            match inner
+                .memory_set
+                .find_vacant(start, pages)
+                .or_else(|| inner.memory_set.find_vacant(VirtPageNum(MMAP_BASE / PAGE_SIZE), pages))
+            {
                 Some(range) => {
                     inner.mmap_top = range.end.0 * PAGE_SIZE;
                     range
@@ -543,13 +559,22 @@ pub fn sys_mmap(
 }
 
 pub fn sys_munmap(addr: usize, len: usize) -> isize {
+    const MMAP_BASE: usize = 0x1000_0000;
     let range = match round_mapping_size(len).and_then(|size| page_range(addr, size)) {
         Some(range) => range,
         None => return -22,
     };
     let process = current_process();
-    let result = process.inner_exclusive_access().memory_set.munmap(range);
-    result.err().unwrap_or(0)
+    let mut inner = process.inner_exclusive_access();
+    match inner.memory_set.munmap(range.clone()) {
+        Ok(()) => {
+            if inner.mmap_top == range.end.0 * PAGE_SIZE {
+                inner.mmap_top = (range.start.0 * PAGE_SIZE).max(MMAP_BASE);
+            }
+            0
+        }
+        Err(errno) => errno,
+    }
 }
 
 pub fn sys_msync(addr: usize, len: usize, flags: usize) -> isize {
@@ -643,24 +668,41 @@ pub fn sys_pselect6(
     writefds: *mut u8,
     exceptfds: *mut u8,
     timeout: *const u8,
+    sigmask_arg: usize,
 ) -> isize {
+    let limit = current_process().inner_exclusive_access().nofile_limit;
+    if nfds > limit {
+        return -22;
+    }
+    let deadline = match super::fs::poll_deadline(timeout as usize) {
+        Ok(deadline) => deadline,
+        Err(error) => return error,
+    };
     let token = current_user_token();
+    let (mask_ptr, mask_size) = if sigmask_arg == 0 {
+        (0, 0)
+    } else {
+        let Some(ss) = try_read_user(token, sigmask_arg as *const usize) else {
+            return -14;
+        };
+        let Some(ss_len) = sigmask_arg
+            .checked_add(core::mem::size_of::<usize>())
+            .and_then(|p| try_read_user(token, p as *const usize))
+        else {
+            return -14;
+        };
+        (ss, ss_len)
+    };
     let bytes = (nfds + 7) / 8;
     let sleep_only =
         bytes == 0 || (readfds.is_null() && writefds.is_null() && exceptfds.is_null());
-    let (deadline, sleep_ms) = if timeout.is_null() {
-        (None, 0usize)
-    } else {
-        let sec = read_user(token, timeout as *const usize) as usize;
-        let nsec = read_user(token, (timeout as usize + 8) as *const usize) as usize;
-        let ms = sec * 1000 + (nsec + 999_999) / 1_000_000;
-        (Some(crate::timer::get_time_ms() + ms), ms)
-    };
     if sleep_only {
-        if !timeout.is_null() && sleep_ms > 0 {
-            crate::syscall::sync::sys_sleep(sleep_ms);
-        }
-        return 0;
+        return match super::signal::with_signal_mask(mask_ptr, mask_size, || {
+            super::fs::poll_wait(deadline, || Ok(0))
+        }) {
+            Ok(_) => 0,
+            Err(error) => error,
+        };
     }
     let req_r = if readfds.is_null() {
         None
@@ -672,64 +714,77 @@ pub fn sys_pselect6(
     } else {
         Some(read_fdset(token, writefds, bytes))
     };
-    loop {
-        // 先取 fd 表快照，再逐个 poll（避免持有进程锁去锁管道）
-        let files: alloc::vec::Vec<Option<alloc::sync::Arc<dyn crate::fs::File + Send + Sync>>> = {
-            let process = current_process();
-            let inner = process.inner_exclusive_access();
-            (0..nfds)
-                .map(|fd| inner.fd_table.get(fd).and_then(|f| f.clone()))
-                .collect()
-        };
-        let mut out_r = alloc::vec![0u8; bytes];
-        let mut out_w = alloc::vec![0u8; bytes];
-        let out_e = alloc::vec![0u8; bytes];
-        let mut nready = 0usize;
-        for fd in 0..nfds {
-            let file = match &files[fd] {
-                Some(f) => f,
-                None => continue,
+    let req_e = if exceptfds.is_null() {
+        None
+    } else {
+        Some(read_fdset(token, exceptfds, bytes))
+    };
+    let mut final_r = alloc::vec![0u8; bytes];
+    let mut final_w = alloc::vec![0u8; bytes];
+    let mut final_e = alloc::vec![0u8; bytes];
+    let result = super::signal::with_signal_mask(mask_ptr, mask_size, || {
+        super::fs::poll_wait(deadline, || {
+            final_r.fill(0);
+            final_w.fill(0);
+            final_e.fill(0);
+            let files: alloc::vec::Vec<Option<alloc::sync::Arc<dyn crate::fs::File + Send + Sync>>> = {
+                let process = current_process();
+                let inner = process.inner_exclusive_access();
+                (0..nfds)
+                    .map(|fd| {
+                        let want = req_r.as_ref().map_or(false, |r| fdset_get(r, fd))
+                            || req_w.as_ref().map_or(false, |w| fdset_get(w, fd))
+                            || req_e.as_ref().map_or(false, |e| fdset_get(e, fd));
+                        if want {
+                            inner.fd_table.get(fd).and_then(|f| f.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
             };
-            let mut ready = false;
-            if let Some(req) = &req_r {
-                if fdset_get(req, fd) && file.poll_readable() {
-                    out_r[fd / 8] |= 1 << (fd % 8);
-                    ready = true;
+            let mut nready = 0usize;
+            for fd in 0..nfds {
+                let want_r = req_r.as_ref().map_or(false, |r| fdset_get(r, fd));
+                let want_w = req_w.as_ref().map_or(false, |w| fdset_get(w, fd));
+                let want_e = req_e.as_ref().map_or(false, |e| fdset_get(e, fd));
+                if !want_r && !want_w && !want_e {
+                    continue;
+                }
+                let Some(file) = &files[fd] else {
+                    return Err(-9); // EBADF
+                };
+                let events = file.poll_events();
+                if want_r && (events & (1 | 8 | 16) != 0 || file.poll_readable()) {
+                    final_r[fd / 8] |= 1 << (fd % 8);
+                    nready += 1;
+                }
+                if want_w && (events & (4 | 8 | 16) != 0 || file.poll_writable()) {
+                    final_w[fd / 8] |= 1 << (fd % 8);
+                    nready += 1;
+                }
+                if want_e && (events & 2 != 0) {
+                    final_e[fd / 8] |= 1 << (fd % 8);
+                    nready += 1;
                 }
             }
-            if let Some(req) = &req_w {
-                if fdset_get(req, fd) && file.poll_writable() {
-                    out_w[fd / 8] |= 1 << (fd % 8);
-                    ready = true;
-                }
-            }
-            if ready {
-                nready += 1;
-            }
-        }
-        if nready > 0 || (deadline.is_some() && crate::timer::get_time_ms() >= deadline.unwrap()) {
+            Ok(nready)
+        })
+    });
+    match result {
+        Ok(nready) => {
             if !readfds.is_null() {
-                write_fdset(token, readfds, &out_r);
+                write_fdset(token, readfds, &final_r);
             }
             if !writefds.is_null() {
-                write_fdset(token, writefds, &out_w);
+                write_fdset(token, writefds, &final_w);
             }
             if !exceptfds.is_null() {
-                write_fdset(token, exceptfds, &out_e);
+                write_fdset(token, exceptfds, &final_e);
             }
-            return nready as isize;
+            nready as isize
         }
-        drop(files);
-        drop((out_r, out_w, out_e));
-        match deadline {
-            None => {
-                crate::syscall::sync::sys_sleep(5);
-            }
-            Some(d) => {
-                let now = crate::timer::get_time_ms();
-                crate::syscall::sync::sys_sleep((d.saturating_sub(now)).clamp(1, 10));
-            }
-        }
+        Err(error) => error,
     }
 }
 

@@ -21,15 +21,16 @@ pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
 pub(crate) use manager::{invalidate_file_pages, mount_is_busy, process_ids};
 pub use manager::{add_task, remove_task, pid2process, remove_from_pid2process, tid2task};
+#[allow(unused_imports)]
 pub use processor::{
-    current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, run_tasks, schedule, take_current_task,
+    current_kstack_top, current_process, current_slice_elapsed, current_task, current_trap_cx,
+    current_trap_cx_user_va, current_user_token, run_tasks, schedule, take_current_task,
 };
 pub use signal::SignalFlags;
-pub(crate) use manager::wake_blocked_task;
+pub(crate) use manager::{has_ready_task, wake_blocked_task};
 pub use task::{TaskControlBlock, TaskStatus};
 pub(crate) use task::TaskControlBlockInner;
-pub(crate) use wait_queue::WaitQueue;
+pub(crate) use wait_queue::{poll_waiters, wake_poll_waiters, WaitQueue};
 
 pub fn suspend_current_and_run_next() {
     // There must be an application running.
@@ -128,6 +129,7 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
         // 子进程退出 → 给父进程投递 SIGCHLD。
         // libc-test 的 runtest 在 fork 之后用 sigtimedwait(SIGCHLD) 等子进程结束，
         // 不投递的话每次测试都要空等 5s 超时。
+        let mut parent_waiters = None;
         if let Some(parent) = process_inner.parent.as_ref().and_then(|p| p.upgrade()) {
             let (code, status) = if wait_status & 0x7f == 0 {
                 (1, (wait_status >> 8) & 0xff) // CLD_EXITED
@@ -135,16 +137,26 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
                 (2, wait_status & 0x7f) // CLD_KILLED
             };
             let info = crate::syscall::signal::SignalInfo::child(pid, code, status);
-            crate::syscall::signal::queue_process_signal(&mut parent.inner_exclusive_access(), info);
+            let mut parent_inner = parent.inner_exclusive_access();
+            crate::syscall::signal::queue_process_signal(&mut parent_inner, info);
+            parent_waiters = Some(parent_inner.child_waiters.clone());
         }
 
-        {
+        let mut init_waiters = None;
+        if !process_inner.children.is_empty() {
             // move all child processes under init process
             let mut initproc_inner = INITPROC.inner_exclusive_access();
             for child in process_inner.children.iter() {
                 child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
                 initproc_inner.children.push(child.clone());
             }
+            init_waiters = Some(initproc_inner.child_waiters.clone());
+        }
+        if let Some(waiters) = parent_waiters {
+            waiters.wake_all();
+        }
+        if let Some(waiters) = init_waiters {
+            waiters.wake_all();
         }
 
         // deallocate user res (including tid/trap_cx/ustack) of all threads
@@ -248,8 +260,7 @@ pub fn add_initproc(oscomp_group: Option<&str>) {
 /// 进程被 kill(SIGKILL) 后，在内核里的轮询/等待循环中尽快退出。
 /// （用户态循环靠时钟中断里的信号检查退出；内核态等待循环必须主动检查）
 pub fn check_kill_current() {
-    crate::syscall::signal::park_while_stopped();
-    crate::syscall::signal::check_fatal_current();
+    crate::syscall::signal::check_stop_or_fatal_current();
 }
 
 /// 当前进程是否给 signo 注册了真的用户 handler（不是 SIG_DFL/SIG_IGN）
@@ -291,6 +302,8 @@ pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
     remove_timer(Arc::clone(&task));
 }
 
+static HAS_RECYCLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 lazy_static! {
     /// 已退出线程的 TCB 延迟回收（不能在自己的内核栈上析构）
     static ref RECYCLE_QUEUE: crate::sync::UPSafeCell<Vec<Arc<TaskControlBlock>>> =
@@ -299,15 +312,20 @@ lazy_static! {
 
 pub fn recycle_task(task: Arc<TaskControlBlock>) {
     RECYCLE_QUEUE.exclusive_access().push(task);
+    HAS_RECYCLED.store(true, core::sync::atomic::Ordering::Release);
 }
 
 /// 在“别的内核栈”上真正析构已退出线程的 TCB。
 /// 析构会 unmap 它的内核栈，所以绝不能析构正在运行的那个任务（那等于拆自己的梯子）。
 /// 调用点：trap_handler 入口（此时 sp 属于即将运行的任务，不是队列里的任何 TCB）。
 pub fn drain_recycled_tasks() {
+    if !HAS_RECYCLED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let cur = current_task();
     let tasks: Vec<Arc<TaskControlBlock>> = {
         let mut q = RECYCLE_QUEUE.exclusive_access();
+        HAS_RECYCLED.store(false, core::sync::atomic::Ordering::Release);
         if q.is_empty() {
             return;
         }
@@ -330,5 +348,6 @@ pub fn drain_recycled_tasks() {
         for t in requeue {
             q.push(t);
         }
+        HAS_RECYCLED.store(true, core::sync::atomic::Ordering::Release);
     }
 }

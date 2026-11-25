@@ -48,6 +48,8 @@ pub struct PipeRingBuffer {
     write_end: Option<Weak<Pipe>>,
     readers: Arc<WaitQueue>,
     writers: Arc<WaitQueue>,
+    read_gen: u64,
+    write_gen: u64,
 }
 
 impl PipeRingBuffer {
@@ -61,27 +63,50 @@ impl PipeRingBuffer {
             write_end: None,
             readers: WaitQueue::new(),
             writers: WaitQueue::new(),
+            read_gen: 0,
+            write_gen: 0,
         }
     }
     pub fn set_write_end(&mut self, write_end: &Arc<Pipe>) {
         self.write_end = Some(Arc::downgrade(write_end));
     }
-    pub fn write_byte(&mut self, byte: u8) {
-        self.status = RingBufferStatus::Normal;
-        self.arr[self.tail] = byte;
-        self.tail = (self.tail + 1) % RING_BUFFER_SIZE;
+    pub fn write_from(&mut self, src: &mut UserBufferIterator, count: usize) -> usize {
+        let to_write = count.min(self.available_write());
+        if to_write == 0 {
+            return 0;
+        }
+        let first = to_write.min(RING_BUFFER_SIZE - self.tail);
+        let copied_first = src.copy_to_slice(&mut self.arr[self.tail..self.tail + first]);
+        let mut total = copied_first;
+        if copied_first == first && to_write > first {
+            total += src.copy_to_slice(&mut self.arr[..to_write - first]);
+        }
+        self.tail = (self.tail + total) % RING_BUFFER_SIZE;
         if self.tail == self.head {
             self.status = RingBufferStatus::Full;
+        } else {
+            self.status = RingBufferStatus::Normal;
         }
+        total
     }
-    pub fn read_byte(&mut self) -> u8 {
-        self.status = RingBufferStatus::Normal;
-        let c = self.arr[self.head];
-        self.head = (self.head + 1) % RING_BUFFER_SIZE;
+    pub fn read_into(&mut self, dst: &mut UserBufferIterator, count: usize) -> usize {
+        let to_read = count.min(self.available_read());
+        if to_read == 0 {
+            return 0;
+        }
+        let first = to_read.min(RING_BUFFER_SIZE - self.head);
+        let copied_first = dst.copy_from_slice(&self.arr[self.head..self.head + first]);
+        let mut total = copied_first;
+        if copied_first == first && to_read > first {
+            total += dst.copy_from_slice(&self.arr[..to_read - first]);
+        }
+        self.head = (self.head + total) % RING_BUFFER_SIZE;
         if self.head == self.tail {
             self.status = RingBufferStatus::Empty;
+        } else {
+            self.status = RingBufferStatus::Normal;
         }
-        c
+        total
     }
     pub fn available_read(&self) -> usize {
         if self.status == RingBufferStatus::Empty {
@@ -123,12 +148,16 @@ impl Drop for Pipe {
     fn drop(&mut self) {
         // Each direction has one endpoint shared by dup, fork and in-flight I/O.
         // Its final drop means the peer can observe EOF or a broken pipe.
-        let ring = self.buffer.exclusive_access();
+        let mut ring = self.buffer.exclusive_access();
         if self.readable {
+            ring.write_gen = ring.write_gen.wrapping_add(1);
             ring.writers.wake_all();
         } else {
+            ring.read_gen = ring.read_gen.wrapping_add(1);
             ring.readers.wake_all();
         }
+        drop(ring);
+        crate::task::wake_poll_waiters();
     }
 }
 
@@ -186,6 +215,11 @@ impl File for Pipe {
         }
     }
 
+    fn poll_generations(&self) -> (u64, u64) {
+        let ring = self.buffer.exclusive_access();
+        (ring.read_gen, ring.write_gen)
+    }
+
     fn read(&self, buf: UserBuffer) -> usize {
         self.read_result(buf).max(0) as usize
     }
@@ -202,13 +236,14 @@ impl File for Pipe {
             let available = ring.available_read();
             let count = available.min(len);
             if count != 0 {
-                for slot in buf_iter.by_ref().take(count) {
-                    slot.write(ring.read_byte());
-                }
+                let read_count = ring.read_into(&mut buf_iter, count);
+                ring.write_gen = ring.write_gen.wrapping_add(1);
                 if available == RING_BUFFER_SIZE {
                     ring.writers.wake_all();
                 }
-                return count as isize;
+                drop(ring);
+                crate::task::wake_poll_waiters();
+                return read_count as isize;
             }
             if ring.all_write_ends_closed() {
                 return 0;
@@ -250,13 +285,14 @@ impl File for Pipe {
                 buf_iter = block_pipe_io(buf_iter);
                 continue;
             }
-            for slot in buf_iter.by_ref().take(count) {
-                ring.write_byte(slot.read());
-            }
-            write_size += count;
+            let written = ring.write_from(&mut buf_iter, count);
+            write_size += written;
+            ring.read_gen = ring.read_gen.wrapping_add(1);
             if available == RING_BUFFER_SIZE {
                 ring.readers.wake_all();
             }
+            drop(ring);
+            crate::task::wake_poll_waiters();
         }
         write_size as isize
     }

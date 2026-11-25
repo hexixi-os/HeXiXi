@@ -15,7 +15,10 @@ const EPOLL_CTL_DEL: usize = 2;
 const EPOLL_CTL_MOD: usize = 3;
 const EPOLLERR_HUP: u32 = 8 | 16;
 const EPOLLONESHOT: u32 = 1 << 30;
-const SUPPORTED_EVENTS: u32 = 0x2000 | 0x1ff | EPOLLONESHOT;
+const EPOLLET: u32 = 1 << 31;
+const IN_EVENTS: u32 = 1 | 8 | 16 | 0x40 | 0x2000;
+const OUT_EVENTS: u32 = 4 | 0x100;
+const SUPPORTED_EVENTS: u32 = 0x2000 | 0x1ff | EPOLLONESHOT | EPOLLET;
 const EVENT_SIZE: usize = 16;
 const MAX_WATCHES: usize = 1024;
 
@@ -25,6 +28,10 @@ struct Watch {
     events: u32,
     data: u64,
     enabled: bool,
+    edge_reported: bool,
+    last_events: u32,
+    last_in_gen: u64,
+    last_out_gen: u64,
 }
 
 pub struct Epoll {
@@ -32,13 +39,37 @@ pub struct Epoll {
 }
 
 impl Watch {
-    fn ready(&self) -> u32 {
+    fn probe(&self) -> (u32, u64, u64) {
         if !self.enabled {
-            return 0;
+            return (0, self.last_in_gen, self.last_out_gen);
         }
-        self.file.upgrade().map_or(0, |file| {
-            u32::from(poll_file(file.as_ref())) & (self.events | EPOLLERR_HUP)
+        self.file.upgrade().map_or((0, 0, 0), |file| {
+            let active = u32::from(poll_file(file.as_ref())) & (self.events | EPOLLERR_HUP);
+            let (in_gen, out_gen) = file.poll_generations();
+            (active, in_gen, out_gen)
         })
+    }
+
+    fn edge_ready(&self, active: u32, in_gen: u64, out_gen: u64) -> bool {
+        if active == 0 {
+            return false;
+        }
+        if self.events & EPOLLET == 0 {
+            return true;
+        }
+        !self.edge_reported
+            || (active & !self.last_events) != 0
+            || ((active & IN_EVENTS) != 0 && in_gen != self.last_in_gen)
+            || ((active & OUT_EVENTS) != 0 && out_gen != self.last_out_gen)
+    }
+
+    fn ready(&self) -> u32 {
+        let (active, in_gen, out_gen) = self.probe();
+        if self.edge_ready(active, in_gen, out_gen) {
+            active
+        } else {
+            0
+        }
     }
 }
 
@@ -85,6 +116,10 @@ impl Epoll {
             events,
             data,
             enabled: true,
+            edge_reported: false,
+            last_events: 0,
+            last_in_gen: 0,
+            last_out_gen: 0,
         };
         match op {
             EPOLL_CTL_ADD if existing.is_some() => Err(-17),
@@ -111,8 +146,15 @@ impl Epoll {
                 break;
             }
             let watch = watches.front_mut().unwrap();
-            let events = watch.ready();
-            if events != 0 {
+            let (active, in_gen, out_gen) = watch.probe();
+            if active == 0 {
+                if watch.events & EPOLLET != 0 {
+                    watch.edge_reported = false;
+                    watch.last_events = 0;
+                    watch.last_in_gen = in_gen;
+                    watch.last_out_gen = out_gen;
+                }
+            } else if watch.edge_ready(active, in_gen, out_gen) {
                 let address = pointer + written * EVENT_SIZE;
                 let buffer = match translated_byte_buffer(
                     token,
@@ -125,10 +167,16 @@ impl Epoll {
                     None => return Err(-14),
                 };
                 let mut event = [0; EVENT_SIZE];
-                event[..4].copy_from_slice(&events.to_ne_bytes());
+                event[..4].copy_from_slice(&active.to_ne_bytes());
                 event[8..].copy_from_slice(&watch.data.to_ne_bytes());
                 buffer.copy_from(&event);
                 written += 1;
+                if watch.events & EPOLLET != 0 {
+                    watch.edge_reported = true;
+                    watch.last_events = active;
+                    watch.last_in_gen = in_gen;
+                    watch.last_out_gen = out_gen;
+                }
                 if watch.events & EPOLLONESHOT != 0 {
                     watch.enabled = false;
                 }
@@ -190,15 +238,12 @@ pub(super) fn ctl([epfd, op, fd, pointer, ..]: [usize; 6]) -> isize {
 }
 
 pub(super) fn wait(
-    [fd, pointer, max, timeout, mask, _mask_size]: [usize; 6],
+    [fd, pointer, max, timeout, mask, mask_size]: [usize; 6],
     timespec: bool,
 ) -> isize {
     let result = (|| {
         if max == 0 || max > i32::MAX as usize / EVENT_SIZE {
             return Err(-22);
-        }
-        if mask != 0 {
-            return Err(-38);
         }
         if pointer == 0 || pointer.checked_add(max * EVENT_SIZE).is_none() {
             return Err(-14);
@@ -214,7 +259,9 @@ pub(super) fn wait(
         };
         with_io_file(file_by_fd(fd)?, |file| {
             let epoll = file.epoll().ok_or(-22isize)?;
-            poll_wait(deadline, || epoll.collect(pointer, max))
+            super::signal::with_signal_mask(mask, mask_size, || {
+                poll_wait(deadline, || epoll.collect(pointer, max))
+            })
         })
     })();
     result.map_or_else(|error| error, |count| count as isize)

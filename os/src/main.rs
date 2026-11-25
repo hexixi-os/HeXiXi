@@ -58,6 +58,10 @@ pub fn rust_main() -> ! {
     sync::enter_kernel();
     println!("[kernel] Hello, world!");
     let boot = arch::boot_info();
+    #[cfg(target_arch = "riscv64")]
+    if let Some(freq) = boot.timebase_freq {
+        arch::set_timer_frequency(freq);
+    }
     config::configure_legacy_oscomp_image(boot.legacy_oscomp_image);
     match boot.ram_end {
         Some(end) => {

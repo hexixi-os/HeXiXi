@@ -3,6 +3,8 @@
 #[derive(Default)]
 pub struct BootInfo {
     pub ram_end: Option<usize>,
+    #[cfg(target_arch = "riscv64")]
+    pub timebase_freq: Option<usize>,
     pub legacy_oscomp_image: bool,
     #[cfg(feature = "smp")]
     pub hart_mask: usize,
@@ -76,7 +78,6 @@ pub fn detect_boot_info() -> BootInfo {
     let mut node_is_memory = false;
     let mut node_is_chosen = false;
     let mut max_end = 0usize;
-    #[cfg(feature = "smp")]
     let mut cpus = false;
     #[cfg(feature = "smp")]
     let mut cpu = None;
@@ -103,11 +104,10 @@ pub fn detect_boot_info() -> BootInfo {
                 }
                 if depth == 2 {
                     node_is_chosen = name == "chosen";
+                    cpus = name == "cpus";
                 }
                 #[cfg(feature = "smp")]
-                if depth == 2 {
-                    cpus = name == "cpus";
-                } else if cpus && depth == 3 && name.starts_with("cpu@") {
+                if cpus && depth == 3 && name.starts_with("cpu@") {
                     cpu = Some((None, true));
                 }
             }
@@ -124,6 +124,7 @@ pub fn detect_boot_info() -> BootInfo {
                 if depth == 2 {
                     node_is_memory = false;
                     node_is_chosen = false;
+                    cpus = false;
                 }
                 depth = depth.saturating_sub(1);
             }
@@ -152,6 +153,16 @@ pub fn detect_boot_info() -> BootInfo {
                 if depth == 2 && node_is_chosen && pname == "bootargs" && len <= 4096 {
                     let args = unsafe { core::slice::from_raw_parts(value as *const u8, len) };
                     info.read_bootargs(args);
+                }
+                if depth == 2 && cpus && pname == "timebase-frequency" {
+                    let freq = match len {
+                        4 => read_be32(value) as usize,
+                        8 => read_be64(value) as usize,
+                        _ => 0,
+                    };
+                    if freq >= 1_000 {
+                        info.timebase_freq = Some(freq);
+                    }
                 }
                 #[cfg(feature = "smp")]
                 if depth == 3 {

@@ -32,6 +32,8 @@ struct UdpMember {
     receive_limit: usize,
     outgoing: VecDeque<Datagram>,
     outgoing_charge: usize,
+    in_gen: u64,
+    out_gen: u64,
 }
 
 impl UdpMember {
@@ -45,6 +47,8 @@ impl UdpMember {
             receive_limit: UDP_BUFFER,
             outgoing: VecDeque::new(),
             outgoing_charge: 0,
+            in_gen: 0,
+            out_gen: 0,
         }
     }
 }
@@ -149,6 +153,11 @@ impl Network {
         !self.udp_member(local, handle).packets.is_empty()
     }
 
+    pub fn udp_generations(&mut self, local: IpEndpoint, handle: SocketHandle) -> (u64, u64) {
+        let member = self.udp_member(local, handle);
+        (member.in_gen, member.out_gen)
+    }
+
     pub fn udp_writable(
         &mut self,
         local: IpEndpoint,
@@ -216,6 +225,7 @@ impl Network {
                     .find(|member| member.handle == handle)
                 {
                     member.outgoing_charge -= charge;
+                    member.out_gen = member.out_gen.wrapping_add(1);
                 }
             }
             let count = group.sockets.len();
@@ -234,7 +244,8 @@ impl Network {
         }
     }
 
-    pub fn dispatch_datagrams(&mut self) {
+    pub fn dispatch_datagrams(&mut self) -> bool {
+        let mut delivered = false;
         for group in &mut self.udp_groups {
             let socket = self.iface.get_socket::<UdpSocket>(group.wire);
             while let Ok((data, sender)) = socket.recv() {
@@ -255,9 +266,12 @@ impl Network {
                     {
                         member.queued_bytes += data.len();
                         member.packets.push_back((data.to_vec(), sender));
+                        member.in_gen = member.in_gen.wrapping_add(1);
+                        delivered = true;
                     }
                 }
             }
         }
+        delivered
     }
 }

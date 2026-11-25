@@ -61,6 +61,21 @@ user_integers! {
     usize => "ld", "sd";
 }
 
+unsafe impl UserValue for [usize; 2] {
+    #[inline]
+    unsafe fn load(src: *const Self) -> Self {
+        let p = src as *const usize;
+        [usize::load(p), usize::load(p.add(1))]
+    }
+
+    #[inline]
+    unsafe fn store(dst: *mut Self, value: Self) {
+        let p = dst as *mut usize;
+        usize::store(p, value[0]);
+        usize::store(p.add(1), value[1]);
+    }
+}
+
 /// Copy between physical byte ranges, either of which may be exposed to userspace.
 /// Both ranges must be valid for `len` bytes and may overlap.
 pub(crate) unsafe fn copy_live_bytes(src: *const u8, dst: *mut u8, len: usize) {

@@ -1,8 +1,6 @@
 use super::id::{try_kstack_alloc, RecycleAllocator};
 use super::manager::insert_into_pid2process;
-use super::TaskControlBlock;
-use super::{add_task, SignalFlags};
-use super::{pid_alloc, PidHandle};
+use super::{add_task, pid_alloc, PidHandle, SignalFlags, TaskControlBlock, WaitQueue};
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{DirectoryLocation, Executable, File, Stdin, Stdout};
 use crate::mm::{write_user, MemorySet, KERNEL_SPACE};
@@ -29,6 +27,7 @@ pub struct ProcessControlBlockInner {
     pub memory_set: MemorySet,
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
+    pub(crate) child_waiters: Arc<WaitQueue>,
     pub wait_status: i32,
     // Keep IDs reserved after the original group or session leader has exited.
     pub(crate) pgid: Arc<PidHandle>,
@@ -162,6 +161,7 @@ impl ProcessControlBlock {
                     memory_set,
                     parent: None,
                     children: Vec::new(),
+                    child_waiters: WaitQueue::new(),
                     wait_status: 0,
                     pgid: group_handle.clone(),
                     sid: group_handle,
@@ -482,6 +482,7 @@ impl ProcessControlBlock {
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
+                    child_waiters: WaitQueue::new(),
                     wait_status: 0,
                     pgid: parent.pgid.clone(),
                     sid: parent.sid.clone(),

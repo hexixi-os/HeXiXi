@@ -1,9 +1,12 @@
 mod device;
 mod socket;
 mod udp;
+mod unix;
 
 pub use socket::SocketFile;
-pub(crate) use socket::{wait_for_io, Kind, MSG_DONTWAIT, MSG_PEEK, MSG_TRUNC};
+pub use unix::{UnixAddress, UnixKind, UnixSocket};
+pub(crate) use socket::{wait_for_io_until, Kind, MSG_DONTWAIT, MSG_PEEK, MSG_TRUNC};
+pub(crate) use unix::unix_unlink;
 
 use crate::sync::UPSafeCell;
 use crate::timer;
@@ -53,11 +56,22 @@ pub(crate) fn init() {
         last_timer_poll: None,
         next_port: FIRST_EPHEMERAL,
         socket_count: 0,
+        listener_gen: 0,
     });
+}
+
+pub(crate) fn has_active_sockets() -> bool {
+    NETWORK
+        .exclusive_access()
+        .as_ref()
+        .map_or(false, |network| network.socket_count != 0 || !network.closing.is_empty())
 }
 
 pub(crate) fn poll() {
     if let Some(network) = NETWORK.exclusive_access().as_mut() {
+        if network.socket_count == 0 && network.closing.is_empty() {
+            return;
+        }
         let now = timer::get_time_ms();
         if network.last_timer_poll != Some(now) {
             network.last_timer_poll = Some(now);
@@ -71,6 +85,10 @@ struct TcpReceive {
     fin: bool,
     bytes: Vec<u8>,
     offset: usize,
+    in_gen: u64,
+    out_gen: u64,
+    prev_rx: usize,
+    prev_tx: usize,
 }
 
 struct Network {
@@ -83,6 +101,7 @@ struct Network {
     last_timer_poll: Option<usize>,
     next_port: u16,
     socket_count: usize,
+    listener_gen: u64,
 }
 
 fn tcp_socket(receive: usize, send: usize) -> TcpSocket<'static> {
@@ -100,15 +119,34 @@ fn arm_listener(socket: &mut TcpSocket, local: IpEndpoint) -> smoltcp::Result<()
 
 impl Network {
     fn poll(&mut self) {
+        if self.socket_count == 0 && self.closing.is_empty() {
+            return;
+        }
         let now = timer::get_time_ms();
-        self.refresh_listeners();
-        self.preserve_tcp_receive();
+        let mut changed = self.refresh_listeners();
+        changed |= self.preserve_tcp_receive();
         self.transmit_datagrams();
+        for (&handle, receive) in &mut self.tcp_receive {
+            let socket = self.iface.get_socket::<TcpSocket>(handle);
+            receive.prev_rx = socket.recv_queue();
+            receive.prev_tx = socket.send_queue();
+        }
         self.iface.device_mut().begin_poll();
-        let _ = self.iface.poll(Instant::from_millis(now as i64));
-        self.dispatch_datagrams();
-        self.refresh_listeners();
-        self.preserve_tcp_receive();
+        changed |= self.iface.poll(Instant::from_millis(now as i64)).unwrap_or(false);
+        for (&handle, receive) in &mut self.tcp_receive {
+            let socket = self.iface.get_socket::<TcpSocket>(handle);
+            if socket.recv_queue() > receive.prev_rx {
+                receive.in_gen = receive.in_gen.wrapping_add(1);
+                changed = true;
+            }
+            if socket.send_queue() < receive.prev_tx {
+                receive.out_gen = receive.out_gen.wrapping_add(1);
+                changed = true;
+            }
+        }
+        changed |= self.dispatch_datagrams();
+        changed |= self.refresh_listeners();
+        changed |= self.preserve_tcp_receive();
         let mut index = 0;
         while index < self.closing.len() {
             let (handle, deadline, reservation) = self.closing[index];
@@ -118,9 +156,13 @@ impl Network {
                     self.unreserve(Kind::Tcp, endpoint);
                 }
                 self.closing.swap_remove(index);
+                changed = true;
             } else {
                 index += 1;
             }
+        }
+        if changed {
+            crate::task::wake_poll_waiters();
         }
     }
 
@@ -130,22 +172,32 @@ impl Network {
         Ok(())
     }
 
-    fn refresh_listeners(&mut self) {
+    fn refresh_listeners(&mut self) -> bool {
+        let mut changed = false;
         for (&handle, &local) in &self.tcp_listeners {
             let socket = self.iface.get_socket::<TcpSocket>(handle);
             match socket.state() {
                 TcpState::Closed => {
                     let _ = arm_listener(socket, local);
                 }
-                TcpState::Established | TcpState::CloseWait => socket.set_timeout(None),
+                TcpState::Established | TcpState::CloseWait => {
+                    if socket.timeout().is_some() {
+                        socket.set_timeout(None);
+                        self.listener_gen = self.listener_gen.wrapping_add(1);
+                        changed = true;
+                    }
+                }
                 _ => {}
             }
         }
+        changed
     }
 
-    fn preserve_tcp_receive(&mut self) {
+    fn preserve_tcp_receive(&mut self) -> bool {
+        let mut changed = false;
         for (&handle, receive) in &mut self.tcp_receive {
             let socket = self.iface.get_socket::<TcpSocket>(handle);
+            let was_fin = receive.fin;
             match socket.state() {
                 TcpState::CloseWait => receive.fin = true,
                 TcpState::Closing | TcpState::LastAck | TcpState::TimeWait => {
@@ -165,7 +217,12 @@ impl Network {
                 }
                 _ => {}
             }
+            if !was_fin && receive.fin {
+                receive.in_gen = receive.in_gen.wrapping_add(1);
+                changed = true;
+            }
         }
+        changed
     }
 
     fn allocate(&mut self, kind: Kind, receive: usize, send: usize) -> Result<SocketHandle, isize> {
@@ -180,6 +237,9 @@ impl Network {
             )),
         };
         self.socket_count += 1;
+        if self.socket_count == 1 {
+            crate::timer::arm_within_ms(10);
+        }
         Ok(handle)
     }
 

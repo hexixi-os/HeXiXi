@@ -79,14 +79,40 @@ fn endpoint(port: u16) -> IpEndpoint {
 }
 
 pub(crate) fn wait_for_io() -> Result<(), isize> {
-    let now = timer::get_time_ms();
+    wait_for_io_until(None)
+}
+
+pub(crate) fn wait_for_io_until(deadline_ns: Option<usize>) -> Result<(), isize> {
+    let now_ms = timer::get_time_ms();
     let current = task::current_task().unwrap();
-    if crate::syscall::signal::interrupts_wait(&current, now) {
+    if crate::syscall::signal::interrupts_wait(&current, now_ms) {
+        crate::syscall::signal::check_alarm();
         return Err(-4);
     }
-    // VirtIO RX is serviced by polling. Sleep until the next poll attempt.
-    timer::add_timer(now.saturating_add(1), current);
+    if let Some(end_ns) = deadline_ns {
+        if timer::get_time_ns() >= end_ns {
+            return Ok(());
+        }
+    }
+    if !task::poll_waiters().register_current_interruptible() {
+        return Err(-4);
+    }
+    let wake_ms = if super::has_active_sockets() {
+        Some(now_ms.saturating_add(1))
+    } else {
+        deadline_ns.map(|end_ns| {
+            let end_ms = end_ns.saturating_add(999_999) / 1_000_000;
+            end_ms.max(now_ms.saturating_add(1))
+        })
+    };
+    if let Some(wake_ms) = wake_ms {
+        timer::add_timer(wake_ms, current.clone());
+    }
     task::block_current_and_run_next();
+    task::WaitQueue::cancel(&current);
+    if wake_ms.is_some() {
+        timer::remove_timer(current);
+    }
     task::check_kill_current();
     Ok(())
 }
@@ -693,6 +719,50 @@ impl SocketFile {
             _ => Err(-92),
         })
     }
+
+    pub(crate) fn tcp_info(&self) -> Result<[u8; 232], isize> {
+        if self.kind != Kind::Tcp {
+            return Err(-92); // ENOPROTOOPT
+        }
+        self.with_state(|net, state| {
+            let linux_state = match state.phase {
+                Phase::Listening => 10u8, // TCP_LISTEN
+                Phase::Fresh => 7u8,      // TCP_CLOSE
+                Phase::Connecting(_) => 2u8, // TCP_SYN_SENT
+                Phase::Failed(_) | Phase::Reset => 7u8, // TCP_CLOSE
+                Phase::Connected => match net.iface.get_socket::<TcpSocket>(state.handle).state() {
+                    TcpState::Established => 1,
+                    TcpState::SynSent => 2,
+                    TcpState::SynReceived => 3,
+                    TcpState::FinWait1 => 4,
+                    TcpState::FinWait2 => 5,
+                    TcpState::TimeWait => 6,
+                    TcpState::Closed => 7,
+                    TcpState::CloseWait => 8,
+                    TcpState::LastAck => 9,
+                    TcpState::Listen => 10,
+                    TcpState::Closing => 11,
+                },
+            };
+            let mut info = [0u8; 232];
+            info[0] = linux_state;
+            info[5] = 0x07; // TCPI_OPT_TIMESTAMPS | TCPI_OPT_SACK | TCPI_OPT_WSCALE
+            info[8..12].copy_from_slice(&200_000u32.to_ne_bytes()); // tcpi_rto (us)
+            info[12..16].copy_from_slice(&40_000u32.to_ne_bytes()); // tcpi_ato (us)
+            info[16..20].copy_from_slice(&1460u32.to_ne_bytes());   // tcpi_snd_mss
+            info[20..24].copy_from_slice(&1460u32.to_ne_bytes());   // tcpi_rcv_mss
+            info[60..64].copy_from_slice(&1500u32.to_ne_bytes());   // tcpi_pmtu
+            info[64..68].copy_from_slice(&(state.receive_limit as u32).to_ne_bytes()); // tcpi_rcv_ssthresh
+            info[68..72].copy_from_slice(&1_000u32.to_ne_bytes());  // tcpi_rtt (us)
+            info[72..76].copy_from_slice(&500u32.to_ne_bytes());    // tcpi_rttvar (us)
+            info[76..80].copy_from_slice(&0x7fff_ffffu32.to_ne_bytes()); // tcpi_snd_ssthresh
+            info[80..84].copy_from_slice(&10u32.to_ne_bytes());     // tcpi_snd_cwnd
+            info[84..88].copy_from_slice(&1460u32.to_ne_bytes());   // tcpi_advmss
+            info[88..92].copy_from_slice(&3u32.to_ne_bytes());      // tcpi_reordering
+            info[96..100].copy_from_slice(&(state.receive_limit as u32).to_ne_bytes()); // tcpi_rcv_space
+            Ok(info)
+        })
+    }
 }
 
 impl Drop for SocketFile {
@@ -841,6 +911,23 @@ impl File for SocketFile {
                 (if state.read_shutdown || ready { IN } else { 0 })
                     | (if writable { OUT } else { 0 })
             }
+        })
+    }
+
+    fn poll_generations(&self) -> (u64, u64) {
+        self.with_state(|net, state| match self.kind {
+            Kind::Tcp => match state.phase {
+                Phase::Connected => net
+                    .tcp_receive
+                    .get(&state.handle)
+                    .map_or((0, 0), |r| (r.in_gen, r.out_gen)),
+                Phase::Listening => (net.listener_gen, 0),
+                Phase::Failed(_) | Phase::Reset => (1, 1),
+                Phase::Fresh | Phase::Connecting(_) => (0, 0),
+            },
+            Kind::Udp => state
+                .bound
+                .map_or((0, 0), |local| net.udp_generations(local, state.handle)),
         })
     }
 }

@@ -30,6 +30,7 @@ pub(super) fn report_switch_stats() {
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
     idle_task_cx: TaskContext,
+    dispatch_ticks: usize,
 }
 
 impl Processor {
@@ -37,6 +38,7 @@ impl Processor {
         Self {
             current: None,
             idle_task_cx: TaskContext::zero_init(),
+            dispatch_ticks: 0,
         }
     }
     fn get_idle_task_cx_ptr(&mut self) -> *mut TaskContext {
@@ -84,8 +86,12 @@ pub fn run_tasks() -> ! {
             drop(task_inner);
             // release coming task TCB manually
             processor.current = Some(task);
+            processor.dispatch_ticks = crate::arch::read_ticks();
             // release processor manually
             drop(processor);
+            if !super::has_ready_task() && !crate::net::has_active_sockets() {
+                crate::timer::set_next_trigger();
+            }
             #[cfg(feature = "sched_switch_stats")]
             TASK_DISPATCHES.fetch_add(1, Ordering::Relaxed);
             unsafe {
@@ -129,6 +135,7 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
         .get_trap_cx()
 }
 
+#[allow(dead_code)]
 pub fn current_trap_cx_user_va() -> usize {
     current_task()
         .unwrap()
@@ -142,6 +149,12 @@ pub fn current_trap_cx_user_va() -> usize {
 pub fn current_kstack_top() -> usize {
     // panic 处理器会调用这里；没有当前任务时返回 0，避免二次 panic
     current_task().map(|t| t.kstack.get_top()).unwrap_or(0)
+}
+
+pub fn current_slice_elapsed() -> bool {
+    let dispatch = local_processor().exclusive_access().dispatch_ticks;
+    let min_slice = crate::arch::timer_frequency() / 200;
+    crate::arch::read_ticks().wrapping_sub(dispatch) >= min_slice
 }
 
 pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {

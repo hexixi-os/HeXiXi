@@ -91,6 +91,14 @@ pub(crate) fn interrupt_waiter(task: &Arc<TaskControlBlock>) {
     }
 }
 
+pub(crate) fn next_waiter_ms() -> Option<usize> {
+    WAITERS
+        .exclusive_access()
+        .iter()
+        .filter_map(|w| w.deadline.map(|ns| (ns + 999_999) / 1_000_000))
+        .min()
+}
+
 pub(crate) fn check_waiters() {
     let now = crate::timer::get_time_ns();
     let mut waiters = WAITERS.exclusive_access();
@@ -180,6 +188,10 @@ pub(super) fn sys_futex([address, op, value, arg4, address2, arg6]: [usize; 6]) 
                 deadline,
                 task: current_task().unwrap(),
             });
+            if let Some(end) = deadline {
+                let delta_ms = end.saturating_sub(crate::timer::get_time_ns()) / 1_000_000;
+                crate::timer::arm_within_ms(delta_ms.max(1));
+            }
             block_current_and_run_next();
             current_task()
                 .unwrap()

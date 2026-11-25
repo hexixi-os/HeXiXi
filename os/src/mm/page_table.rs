@@ -172,6 +172,7 @@ impl PageTable {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
     }
+    #[allow(dead_code)]
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
         self.find_pte(va.clone().floor()).map(|pte| {
             let aligned_pa: PhysAddr = pte.ppn().into();
@@ -239,31 +240,34 @@ fn checked_phys_addr(token: usize, va: usize, pa: PhysAddr) -> Option<PhysAddr> 
     }
 }
 
-fn ensure_user_page_mapped(table: &PageTable, va: usize, access: MapPermission) -> bool {
+fn resolve_user_page(table: &PageTable, va: usize, access: MapPermission) -> Option<PhysPageNum> {
     if va >= USER_END {
-        return false;
+        return None;
     }
     let vpn = VirtAddr::from(va).floor();
     if let Some(entry) = table.translate(vpn).filter(PageTableEntry::is_valid) {
         let required = PTEFlags::U | PTEFlags::from_bits(access.bits()).unwrap();
         if entry.flags().contains(required) {
-            return true;
+            return Some(entry.ppn());
         }
         if access != MapPermission::W || !entry.flags().contains(PTEFlags::U) {
-            return false;
+            return None;
         }
         // Kernel copyout may need the same COW fault as a user store.
     }
     if let Some(task) = crate::task::current_task() {
         if let Some(process) = task.process.upgrade() {
             if let Some(mut inner) = process.try_inner_exclusive_access() {
-                if inner.memory_set.token() == table.token() {
-                    return inner.memory_set.handle_page_fault(vpn, access) == PageFault::Resolved;
+                if inner.memory_set.token() == table.token()
+                    && inner.memory_set.handle_page_fault(vpn, access) == PageFault::Resolved
+                {
+                    crate::arch::local_flush_tlb_page(va);
+                    return table.translate(vpn).map(|e| e.ppn());
                 }
             }
         }
     }
-    false
+    None
 }
 
 pub fn translated_byte_buffer(
@@ -277,11 +281,8 @@ pub fn translated_byte_buffer(
     let end = start.checked_add(len)?;
     let mut buffers = Vec::new();
     while start < end {
-        if !ensure_user_page_mapped(&page_table, start, access) {
-            return None;
-        }
+        let ppn = resolve_user_page(&page_table, start, access)?;
         let va = VirtAddr::from(start);
-        let ppn = page_table.translate(va.floor())?.ppn();
         let pa = checked_phys_addr(token, start, ppn.into())?;
         let first = va.page_offset();
         let count = (end - start).min(PAGE_SIZE - first);
@@ -317,10 +318,9 @@ fn read_user_string<T: Default>(
     for _ in 0..PATH_MAX {
         let offset = va % PAGE_SIZE;
         if page_base == 0 || offset == 0 {
-            if !ensure_user_page_mapped(&page_table, va, MapPermission::R) {
+            let Some(ppn) = resolve_user_page(&page_table, va, MapPermission::R) else {
                 return Err((string, -14)); // EFAULT
-            }
-            let ppn = page_table.translate(VirtAddr::from(va).floor()).unwrap().ppn();
+            };
             page_base = match checked_phys_addr(token, va, ppn.into()) {
                 Some(pa) => pa.kernel_address(),
                 None => return Err((string, -14)),
@@ -343,10 +343,9 @@ fn typed_user_addr<T>(token: usize, va: usize, access: MapPermission) -> Option<
         return None;
     }
     let page_table = PageTable::from_token(token);
-    if !ensure_user_page_mapped(&page_table, va, access) {
-        return None;
-    }
-    checked_phys_addr(token, va, page_table.translate_va(VirtAddr::from(va))?)
+    let ppn = resolve_user_page(&page_table, va, access)?;
+    let pa = PhysAddr(usize::from(PhysAddr::from(ppn)) + va % PAGE_SIZE);
+    checked_phys_addr(token, va, pa)
 }
 
 pub(crate) fn futex_phys_addr(token: usize, va: usize) -> Option<PhysAddr> {
@@ -458,6 +457,7 @@ impl UserSlice {
         produce(unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) })
     }
 
+    #[cfg(feature = "smp")]
     fn copy_from(&self, src: &[u8]) {
         assert!(src.len() <= self.len);
         unsafe { copy_live_bytes(src.as_ptr(), self.ptr, src.len()) };
@@ -477,14 +477,24 @@ impl UserBuffer {
     }
 
     pub(crate) fn copy_from(&self, src: &[u8]) {
-        let mut remaining = src;
+        self.copy_from_two(src, &[]);
+    }
+
+    pub(crate) fn copy_from_two<'a>(&self, mut a: &'a [u8], mut b: &'a [u8]) {
         for buffer in &self.buffers {
-            if remaining.is_empty() {
+            let mut offset = 0;
+            while offset < buffer.len && (!a.is_empty() || !b.is_empty()) {
+                let src = if !a.is_empty() { &mut a } else { &mut b };
+                let take = src.len().min(buffer.len - offset);
+                unsafe {
+                    copy_live_bytes(src.as_ptr(), buffer.ptr.add(offset), take);
+                }
+                *src = &src[take..];
+                offset += take;
+            }
+            if a.is_empty() && b.is_empty() {
                 break;
             }
-            let (chunk, rest) = remaining.split_at(remaining.len().min(buffer.len()));
-            buffer.copy_from(chunk);
-            remaining = rest;
         }
     }
 
@@ -525,6 +535,50 @@ impl UserByte {
 
     pub(crate) fn write(self, byte: u8) {
         unsafe { u8::store(self.0, byte) };
+    }
+}
+
+impl UserBufferIterator {
+    pub(crate) fn copy_from_slice(&mut self, mut src: &[u8]) -> usize {
+        let total = src.len();
+        while !src.is_empty() {
+            let Some(buffer) = self.buffers.get(self.current_buffer) else {
+                break;
+            };
+            let avail = buffer.len - self.current_idx;
+            let n = src.len().min(avail);
+            unsafe {
+                copy_live_bytes(src.as_ptr(), buffer.ptr.add(self.current_idx), n);
+            }
+            src = &src[n..];
+            self.current_idx += n;
+            if self.current_idx == buffer.len {
+                self.current_buffer += 1;
+                self.current_idx = 0;
+            }
+        }
+        total - src.len()
+    }
+
+    pub(crate) fn copy_to_slice(&mut self, mut dst: &mut [u8]) -> usize {
+        let total = dst.len();
+        while !dst.is_empty() {
+            let Some(buffer) = self.buffers.get(self.current_buffer) else {
+                break;
+            };
+            let avail = buffer.len - self.current_idx;
+            let n = dst.len().min(avail);
+            unsafe {
+                copy_live_bytes(buffer.ptr.add(self.current_idx), dst.as_mut_ptr(), n);
+            }
+            dst = &mut dst[n..];
+            self.current_idx += n;
+            if self.current_idx == buffer.len {
+                self.current_buffer += 1;
+                self.current_idx = 0;
+            }
+        }
+        total - dst.len()
     }
 }
 

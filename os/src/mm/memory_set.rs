@@ -204,6 +204,9 @@ impl MemorySet {
             }
         }
         crate::arch::local_flush_tlb();
+        if permissions.contains(MapPermission::X) {
+            crate::arch::fence_icache();
+        }
         Ok(())
     }
 
@@ -218,6 +221,9 @@ impl MemorySet {
         let area = MapArea::new(start_va, end_va, MapType::Framed, permission);
         let data_opt = if data.is_empty() { None } else { Some(data) };
         self.push(area, data_opt);
+        if permission.contains(MapPermission::X) {
+            crate::arch::fence_icache();
+        }
         self.translate(start_va.floor()).map(|e| e.ppn())
     }
 
@@ -459,6 +465,16 @@ impl MemorySet {
     pub fn recycle_data_pages(&mut self) {
         self.vmas = VmaSpace::default();
         self.areas.clear();
+        #[cfg(target_arch = "loongarch64")]
+        crate::arch::local_flush_tlb();
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl Drop for MemorySet {
+    fn drop(&mut self) {
+        // Guard against reusing a freed root page table PPN with stale ASID-0 TLB entries.
+        crate::arch::local_flush_tlb();
     }
 }
 

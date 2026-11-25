@@ -2,9 +2,7 @@ mod context;
 
 use crate::arch::{self, TrapCause, REG_A0, REG_FP, REG_SP, REG_SYSCALL};
 use crate::syscall::syscall;
-use crate::task::{
-    check_signals_of_current, current_trap_cx, current_trap_cx_user_va, current_user_token,
-};
+use crate::task::{check_signals_of_current, current_trap_cx};
 use crate::timer::{check_timer, set_next_trigger};
 
 pub fn init() {
@@ -47,21 +45,28 @@ pub fn trap_handler() -> ! {
     match cause {
         TrapCause::Syscall => {
             // jump to next instruction anyway
-            let mut cx = current_trap_cx();
-            let syscall_pc = cx.sepc;
-            cx.sepc += 4;
-            // get system call return value
-            let id = cx.x[REG_SYSCALL];
-            let args = cx.x[REG_A0..REG_A0 + 6].try_into().unwrap();
+            let (id, args, syscall_pc) = {
+                let cx = current_trap_cx();
+                let syscall_pc = cx.sepc;
+                cx.sepc += 4;
+                // get system call return value
+                (
+                    cx.x[REG_SYSCALL],
+                    cx.x[REG_A0..REG_A0 + 6].try_into().unwrap(),
+                    syscall_pc,
+                )
+            };
             let result = syscall(id, args);
-            {
+            // cx is changed during sys_exec, so we have to fetch it again
+            let cx = {
                 let task = crate::task::current_task().unwrap();
                 let mut inner = task.inner_exclusive_access();
-                inner.user_io_frames.clear();
+                if !inner.user_io_frames.is_empty() {
+                    inner.user_io_frames.clear();
+                }
                 inner.user_io_file = None;
-            }
-            // cx is changed during sys_exec, so we have to call it again
-            cx = current_trap_cx();
+                inner.get_trap_cx()
+            };
             let replaced_context = matches!(
                 id,
                 crate::syscall::SYSCALL_RT_SIGRETURN | crate::syscall::SYSCALL_EXEC
@@ -104,37 +109,43 @@ pub fn trap_handler() -> ! {
         #[cfg(target_arch = "loongarch64")]
         TrapCause::FloatingPoint => handle_user_fault(cause, pc, 8, 1),
         TrapCause::Timer => {
-            set_next_trigger();
             check_timer();
-            // 时间片轮转：每次时钟中断让出 CPU。
-            // 之前只在系统调用/阻塞点调度，纯用户态死循环（lmbench 的 benchmp
-            // select(0) 轮询、hackbench 压测）会把其它进程饿死。
-            crate::task::suspend_current_and_run_next();
+            set_next_trigger();
+            // 时间片轮转：仅在就绪队列有其它可运行任务且当前任务已运行足够时间片时让出 CPU，
+            // 避免单任务基准测试空切产生抖动，也避免刚切入的子任务在残余 tick 上立刻被抢占。
+            if crate::task::has_ready_task() && crate::task::current_slice_elapsed() {
+                crate::task::suspend_current_and_run_next();
+            }
         }
         TrapCause::Unknown(raw) => {
             panic!("Unsupported trap {:#x}, stval = {:#x}!", raw, address);
         }
     }
-    crate::syscall::signal::deliver_signal(restart);
-    // check signals
-    if let Some((errno, msg)) = check_signals_of_current() {
-        println!("[kernel] {}", msg);
-        crate::task::exit_current_by_signal(-errno);
+    if crate::syscall::signal::deliver_signal(restart) {
+        if let Some((errno, msg)) = check_signals_of_current() {
+            println!("[kernel] {}", msg);
+            crate::task::exit_current_by_signal(-errno);
+        }
     }
     trap_return();
 }
 
 #[no_mangle]
 pub fn trap_return() -> ! {
-    let trap_cx_user_va = current_trap_cx_user_va();
-    let user_token = current_user_token();
     let task = crate::task::current_task().unwrap();
-    let child_tid = task.inner_exclusive_access().set_child_tid.take();
+    let user_token = task.get_user_token();
+    let (trap_cx, trap_cx_user_va, child_tid) = {
+        let mut inner = task.inner_exclusive_access();
+        let trap_cx = inner.get_trap_cx();
+        let trap_cx_user_va = inner.res.as_ref().unwrap().trap_cx_user_va();
+        let child_tid = inner.set_child_tid.take();
+        (trap_cx, trap_cx_user_va, child_tid)
+    };
     if let Some(address) = child_tid {
         let _ = crate::mm::try_write_user(user_token, address as *mut i32, task.linux_tid() as i32);
     }
     drop(task);
-    unsafe { arch::return_to_user(current_trap_cx(), trap_cx_user_va, user_token) }
+    unsafe { arch::return_to_user(trap_cx, trap_cx_user_va, user_token) }
 }
 
 #[no_mangle]

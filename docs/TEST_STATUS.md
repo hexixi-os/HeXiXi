@@ -28,7 +28,8 @@ RISC-V64 和 LoongArch64 均以单核、1 GiB 和每组 120 s 运行原盘。两
 ### 网络测例（`iperf` / `netperf`）
 
 - **Netperf 2.7.0**：使用独立 EXT4 盘（含按架构静态构建的 `netperf` / `netserver`），RISC-V64 与 LoongArch64 单核均 **5/5**（UDP/TCP stream、RR、CRR）。
-- **原盘 iperf3**：TCP/UDP 基础、5 路并行与反向模式均已跑通。原盘采样 LoongArch64 双库 6/6，RISC-V64 musl 5/6、glibc 6/6（原版脚本在 `iperf3 -D` 后无等待，偶发 `ECONNREFUSED`；增加 1 s 间隔对照测试双架构均 6/6）。`TCP_INFO` 待实现。
+- **原盘 iperf3**：已补齐 `TCP_INFO`，TCP/UDP 基础、5 路并行与反向模式在 RISC-V64 与 LoongArch64 双库（`iperf-musl` / `iperf-glibc`）原盘复测均稳定 **6/6**（120 s `--strict` 正常退出，0 次内核 panic）。
+- **原盘 lmbench**：已补齐 `AF_UNIX`（`SOCK_STREAM` / `SOCK_DGRAM` / `SOCK_SEQPACKET`）、`socketpair`、`EPOLLET`、`epoll_pwait` 临时信号掩码、`SIGSEGV` 用户态恢复与 `mmap`/`munmap` 地址空间回收。全部 26 项原盘子测例及 `lat_unix` / `bw_unix` 在双架构双库下均 0 挂死、0 panic 跑通（`ENOUGH=5000` 固定采样下 RV64 双库约 71 s、LA64 双库约 68 s 完整退出；macOS Docker Desktop 虚拟化宿主因时钟抖动 >0.25% 触发 `compute_enough` 回退 `SHORT=1s`，默认 120 s 门限内原盘未改镜像部分完成）。
 
 ## 2. 专项回归覆盖
 
@@ -36,7 +37,7 @@ RISC-V64 和 LoongArch64 均以单核、1 GiB 和每组 120 s 运行原盘。两
 |---|---|
 | `test_exec_entry.sh` | 双架构（含 RV64 双核）：内嵌 runner 组选择、ELF 初始栈/寄存器、RISC-V `clone` 子栈指针 |
 | `test_vfs_abi.sh` | 双架构（含 RV64 双核）：符号链接、UTF-8 路径、`mount`/`umount2`/`statfs`、`/proc/self`、`/dev/{random,urandom,zero}`、`/lib64`、`/dev/shm` 跨进程共享 `futex` 与 `clear_child_tid` |
-| `test_net_abi.sh` | 双架构（含 RV64 双核）：无网卡 IPv4 TCP/UDP 回环、半关闭、非阻塞、`ppoll`/`epoll` 与 `--virtio` 宿主↔客机 TCP 回显 |
+| `test_net_abi.sh` | 双架构（含 RV64 双核）：无网卡 IPv4 TCP/UDP 回环、`TCP_INFO`、`AF_UNIX`（流式/数据报/顺序包、路径与抽象命名空间、`socketpair`、`SO_PEERCRED`）、半关闭、非阻塞、`ppoll`/`epoll`（含 `EPOLLET` 与 `epoll_pwait` 临时信号掩码）及 `--virtio` 宿主↔客机 TCP 回显 |
 | `test_persistent_fs.sh` | 双架构（含 RV64 双核，含 `PAGE_CACHE_POLICY=none`）：EasyFS 数据盘 4 次重启回归、`fsync`/`msync`、盘上 ELF 执行、空白/只读盘错误处理与只读根盘哈希校验 |
 | `test_smp.sh` | RV64 双核：`getcpu`/`sched_getaffinity`、跨核 CoW、共享文件截断 `SIGBUS`、超容量跨核管道逐字节校验 |
 | `test_pipe_wait.sh` | RV64 单核与双核、LoongArch64 单核均通过空管道等待、满管道释放空间、多读者唤醒、EOF、`EPIPE`、`SIGKILL`、线程组退出及 `SIGALRM`。原 `run_pipe_test` 在 RV64 单核与双核各通过 1,000 轮 |

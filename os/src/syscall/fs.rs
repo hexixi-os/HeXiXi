@@ -509,7 +509,11 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: usize) -> isize {
             if raw.ends_with('/') {
                 fs::require_directory(&path)?;
             }
-            fs::unlink(&path, remove_directory)
+            fs::unlink(&path, remove_directory)?;
+            if !remove_directory {
+                crate::net::unix_unlink(&path);
+            }
+            Ok(())
         })
         .err()
         .unwrap_or(0)
@@ -856,11 +860,12 @@ pub(super) fn poll_deadline(pointer: usize) -> Result<Option<usize>, isize> {
 
 pub(super) fn poll_wait(deadline: Option<usize>, mut scan: impl FnMut() -> Result<usize, isize>) -> Result<usize, isize> {
     loop {
+        crate::net::poll();
         let ready = scan()?;
         if ready != 0 || deadline.map_or(false, |end| crate::timer::get_time_ns() >= end) {
             return Ok(ready);
         }
-        crate::net::wait_for_io()?;
+        crate::net::wait_for_io_until(deadline)?;
     }
 }
 
@@ -870,33 +875,34 @@ pub(super) fn poll_file(file: &dyn fs::File) -> u16 {
     ready | ((ready & (1 | 4)) << 6)
 }
 
-pub fn sys_ppoll([fds, nfds, timeout, mask, _mask_size, _]: [usize; 6]) -> isize {
+pub fn sys_ppoll([fds, nfds, timeout, mask, mask_size, _]: [usize; 6]) -> isize {
     use crate::mm::{try_read_user, try_write_user};
     const POLLERR: u16 = 8;
     const POLLHUP: u16 = 16;
     const POLLNVAL: u16 = 32;
     if nfds > current_process().inner_exclusive_access().nofile_limit { return -22; }
-    if mask != 0 { return -38; }
     if nfds.checked_mul(8).and_then(|len| fds.checked_add(len)).is_none() { return -14; }
     let result = (|| {
         let deadline = poll_deadline(timeout)?;
         let token = current_user_token();
-        poll_wait(deadline, || {
-            let mut ready = 0;
-            for i in 0..nfds {
-                let base = fds + i * 8;
-                let fd = try_read_user(token, base as *const i32).ok_or(-14isize)?;
-                let events = try_read_user(token, (base + 4) as *const u16).ok_or(-14isize)?;
-                let returned = if fd < 0 {
-                    0
-                } else {
-                    file_by_fd(fd as usize)
-                        .map_or(POLLNVAL, |file| poll_file(file.as_ref()) & (events | POLLERR | POLLHUP))
-                };
-                try_write_user(token, (base + 6) as *mut u16, returned).ok_or(-14isize)?;
-                ready += (returned != 0) as usize;
-            }
-            Ok(ready)
+        super::signal::with_signal_mask(mask, mask_size, || {
+            poll_wait(deadline, || {
+                let mut ready = 0;
+                for i in 0..nfds {
+                    let base = fds + i * 8;
+                    let fd = try_read_user(token, base as *const i32).ok_or(-14isize)?;
+                    let events = try_read_user(token, (base + 4) as *const u16).ok_or(-14isize)?;
+                    let returned = if fd < 0 {
+                        0
+                    } else {
+                        file_by_fd(fd as usize)
+                            .map_or(POLLNVAL, |file| poll_file(file.as_ref()) & (events | POLLERR | POLLHUP))
+                    };
+                    try_write_user(token, (base + 6) as *mut u16, returned).ok_or(-14isize)?;
+                    ready += (returned != 0) as usize;
+                }
+                Ok(ready)
+            })
         })
     })();
     result.map_or_else(|error| error, |ready| ready as isize)

@@ -24,6 +24,7 @@ const SYSCALL_SENDFILE: usize = 71;
 const SYSCALL_LSEEK: usize = 62;
 const SYSCALL_FUTEX: usize = 98;
 const SYSCALL_SOCKET: usize = 198;
+const SYSCALL_SOCKETPAIR: usize = 199;
 const SYSCALL_BIND: usize = 200;
 const SYSCALL_LISTEN: usize = 201;
 const SYSCALL_ACCEPT: usize = 202;
@@ -194,7 +195,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     crate::task::check_kill_current();
     LAST_SYSCALL.store(syscall_id, core::sync::atomic::Ordering::Relaxed);
     {
-        let i = LAST_SYSCALL_IDX.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 8;
+        let i = (LAST_SYSCALL_IDX.load(core::sync::atomic::Ordering::Relaxed) + 1) & 7;
+        LAST_SYSCALL_IDX.store(i, core::sync::atomic::Ordering::Relaxed);
         LAST_SYSCALLS[i].store(syscall_id, core::sync::atomic::Ordering::Relaxed);
     }
     match syscall_id {
@@ -229,9 +231,11 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[2] as *mut u8,
             args[3] as *mut u8,
             args[4] as *const u8,
+            args[5],
         ),
         SYSCALL_PPOLL => sys_ppoll(args),
         SYSCALL_SOCKET => net::socket(args),
+        SYSCALL_SOCKETPAIR => net::socketpair(args),
         SYSCALL_BIND => net::bind(args),
         SYSCALL_LISTEN => net::listen(args),
         SYSCALL_ACCEPT => net::accept([args[0], args[1], args[2], 0, 0, 0]),

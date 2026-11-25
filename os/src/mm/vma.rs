@@ -338,6 +338,9 @@ impl VmaSpace {
             return PageFault::Invalid;
         }
         self.pages.insert(vpn, page);
+        if permissions.contains(MapPermission::X) {
+            crate::arch::fence_icache();
+        }
         PageFault::Resolved
     }
 

@@ -11,6 +11,7 @@ use crate::board::CLOCK_FREQ;
 use crate::config::TRAMPOLINE;
 use crate::trap::TrapContext;
 use core::arch::{asm, global_asm};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use riscv::register::{
     mtvec::TrapMode,
     satp,
@@ -125,6 +126,12 @@ pub fn local_flush_tlb_page(va: usize) {
     }
 }
 
+pub fn fence_icache() {
+    unsafe {
+        asm!("fence.i");
+    }
+}
+
 pub fn activate_kernel_table(token: usize) {
     satp::write(token);
     local_flush_tlb();
@@ -139,12 +146,20 @@ pub fn frame_pointer() -> usize {
     fp
 }
 
+static TIMER_FREQ: AtomicUsize = AtomicUsize::new(CLOCK_FREQ);
+
+pub fn set_timer_frequency(freq: usize) {
+    if freq >= 1_000 {
+        TIMER_FREQ.store(freq, Ordering::Relaxed);
+    }
+}
+
 pub fn read_ticks() -> usize {
     time::read()
 }
 
 pub fn timer_frequency() -> usize {
-    CLOCK_FREQ
+    TIMER_FREQ.load(Ordering::Relaxed)
 }
 
 pub fn enable_timer_interrupt() {
@@ -191,7 +206,6 @@ pub unsafe fn return_to_user(context: *mut TrapContext, context_va: usize, token
     let restore_va = __restore as usize - __alltraps as usize + TRAMPOLINE;
     crate::sync::leave_kernel();
     asm!(
-        "fence.i",
         "jr {restore_va}",
         restore_va = in(reg) restore_va,
         in("a0") context_va,

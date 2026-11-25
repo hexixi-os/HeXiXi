@@ -81,6 +81,17 @@ impl ResidentPage {
             || access != MapPermission::W
             || !permissions.contains(MapPermission::W)
         {
+            if permissions.contains(access)
+                && (access != MapPermission::W || !self.copy_on_write)
+                && table.translate(vpn).map_or(false, |entry| {
+                    entry.is_valid()
+                        && entry
+                            .flags()
+                            .contains(PTEFlags::U | PTEFlags::from_bits(access.bits()).unwrap())
+                })
+            {
+                return PageFault::Resolved;
+            }
             return PageFault::Invalid;
         }
         let retired = match self.make_writable() {

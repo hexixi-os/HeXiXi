@@ -2,10 +2,23 @@ use super::{current_task, manager::wake_blocked_task, TaskControlBlock};
 use crate::sync::UPSafeCell;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
+use lazy_static::*;
 
 /// Condition checks, registration, blocking and wakeups are serialized by the kernel lock.
 pub(crate) struct WaitQueue {
     waiters: UPSafeCell<VecDeque<Weak<TaskControlBlock>>>,
+}
+
+lazy_static! {
+    static ref POLL_WAITERS: Arc<WaitQueue> = WaitQueue::new();
+}
+
+pub(crate) fn poll_waiters() -> &'static Arc<WaitQueue> {
+    &POLL_WAITERS
+}
+
+pub(crate) fn wake_poll_waiters() {
+    POLL_WAITERS.wake_all();
 }
 
 impl WaitQueue {

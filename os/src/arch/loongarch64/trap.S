@@ -39,10 +39,13 @@ __loongarch_user_trap:
 
     .globl __loongarch_restore
 __loongarch_restore:
+    csrrd $t0, 0x19
+    beq $t0, $a1, 1f
     csrwr $a1, 0x19             # PGDL; PGDH still maps kernel stacks.
     dbar 0
     invtlb 0, $zero, $zero
     ibar 0
+1:
     move $sp, $a0
     csrwr $a0, 0x30
     la.pcrel $t0, __loongarch_user_trap

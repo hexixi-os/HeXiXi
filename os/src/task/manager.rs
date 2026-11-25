@@ -39,6 +39,21 @@ impl TaskManager {
                 self.ready_queue.remove(id);
             }
     }
+    pub fn has_ready(&self) -> bool {
+        #[cfg(feature = "smp")]
+        {
+            let hart = crate::arch::hart_id();
+            self.ready_queue.iter().any(|task| {
+                task.process
+                    .upgrade()
+                    .map_or(false, |process| process.affinity_hart() == hart)
+            })
+        }
+        #[cfg(not(feature = "smp"))]
+        {
+            !self.ready_queue.is_empty()
+        }
+    }
 }
 
 lazy_static! {
@@ -50,6 +65,7 @@ lazy_static! {
 
 pub fn add_task(task: Arc<TaskControlBlock>) {
     TASK_MANAGER.exclusive_access().add(task);
+    crate::timer::arm_within_ms(10);
 }
 
 pub fn remove_task(task: Arc<TaskControlBlock>) {
@@ -68,6 +84,10 @@ pub(crate) fn wake_blocked_task(task: Arc<TaskControlBlock>) {
 
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     TASK_MANAGER.exclusive_access().fetch()
+}
+
+pub fn has_ready_task() -> bool {
+    TASK_MANAGER.exclusive_access().has_ready()
 }
 
 pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {

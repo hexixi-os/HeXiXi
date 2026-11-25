@@ -101,8 +101,14 @@ pub fn sys_setitimer(which: usize, new: *const u8, _old: *mut u8) -> isize {
         let deadline = crate::timer::get_time_ms().saturating_add(duration);
         inner.alarm_deadline = deadline;
         ALARMS.exclusive_access().insert((deadline, pid), Arc::downgrade(&process));
+        drop(inner);
+        crate::timer::arm_within_ms(duration);
     }
     0
+}
+
+pub(crate) fn next_alarm_ms() -> Option<usize> {
+    ALARMS.exclusive_access().keys().next().map(|&(deadline, _)| deadline)
 }
 
 pub(crate) fn cancel_alarm(pid: usize, inner: &mut ProcessControlBlockInner) {
@@ -293,11 +299,15 @@ fn set_job_state(process: &ProcessControlBlock, stopped: bool, signo: usize) {
         inner.parent.as_ref().and_then(Weak::upgrade)
     };
     if let Some(parent) = parent {
-        let mut inner = parent.inner_exclusive_access();
-        if inner.signal_actions[16].flags & SA_NOCLDSTOP == 0 {
-            let code = if stopped { 5 } else { 6 }; // CLD_STOPPED / CLD_CONTINUED
-            queue_process_signal(&mut inner, SignalInfo::child(process.getpid(), code, signo as i32));
-        }
+        let waiters = {
+            let mut inner = parent.inner_exclusive_access();
+            if inner.signal_actions[16].flags & SA_NOCLDSTOP == 0 {
+                let code = if stopped { 5 } else { 6 }; // CLD_STOPPED / CLD_CONTINUED
+                queue_process_signal(&mut inner, SignalInfo::child(process.getpid(), code, signo as i32));
+            }
+            inner.child_waiters.clone()
+        };
+        waiters.wake_all();
     }
 }
 
@@ -490,6 +500,22 @@ fn terminating_default(signo: usize) -> bool {
     !matches!(signo, 17..=23 | 28)
 }
 
+pub(crate) fn check_stop_or_fatal_current() {
+    let task = current_task().unwrap();
+    let process = task.process.upgrade().unwrap();
+    let fast_clear = {
+        let inner = process.inner_exclusive_access();
+        let thread = task.inner_exclusive_access();
+        !inner.job_stopped
+            && ((thread.pending_signals | inner.signal_pending) & !thread.signal_mask) == 0
+    };
+    drop((process, task));
+    if !fast_clear {
+        park_while_stopped();
+        check_fatal_current();
+    }
+}
+
 pub(crate) fn park_while_stopped() {
     while current_process().inner_exclusive_access().job_stopped {
         current_task().unwrap().inner_exclusive_access().job_parked = true;
@@ -511,7 +537,49 @@ impl Restart {
     }
 }
 
-pub(crate) fn deliver_signal(restart: Option<Restart>) {
+pub(crate) fn with_signal_mask<T>(
+    mask_ptr: usize,
+    mask_size: usize,
+    f: impl FnOnce() -> Result<T, isize>,
+) -> Result<T, isize> {
+    if mask_ptr == 0 {
+        return f();
+    }
+    if mask_size != core::mem::size_of::<u64>() {
+        return Err(-22);
+    }
+    let token = current_user_token();
+    let new_mask = try_read_user(token, mask_ptr as *const u64).ok_or(-14isize)? & !UNBLOCKABLE;
+    let task = current_task().unwrap();
+    let old_mask = {
+        let mut thread = task.inner_exclusive_access();
+        let old = thread.signal_mask;
+        thread.saved_signal_mask = Some(old);
+        thread.signal_mask = new_mask;
+        old
+    };
+    let result = f();
+    if result.as_ref().err() != Some(&-4) {
+        let mut thread = task.inner_exclusive_access();
+        thread.signal_mask = thread.saved_signal_mask.take().unwrap_or(old_mask);
+    }
+    result
+}
+
+pub(crate) fn deliver_signal(restart: Option<Restart>) -> bool {
+    if restart.is_none() {
+        let task = current_task().unwrap();
+        let process = task.process.upgrade().unwrap();
+        let process_inner = process.inner_exclusive_access();
+        let thread = task.inner_exclusive_access();
+        if !process_inner.job_stopped
+            && process_inner.signal_pending == 0
+            && thread.pending_signals == 0
+            && thread.saved_signal_mask.is_none()
+        {
+            return !process_inner.signals.is_empty();
+        }
+    }
     loop {
         park_while_stopped();
         check_fatal_current();
@@ -519,20 +587,27 @@ pub(crate) fn deliver_signal(restart: Option<Restart>) {
         let task = current_task().unwrap();
         let mut process_inner = process.inner_exclusive_access();
         let mut thread = task.inner_exclusive_access();
-        let mask = thread.signal_mask;
-        let Some(info) = take_signal(&mut process_inner, &mut thread, !mask) else {
+        let active_mask = thread.signal_mask;
+        let Some(info) = take_signal(&mut process_inner, &mut thread, !active_mask) else {
+            if let Some(saved) = thread.saved_signal_mask.take() {
+                thread.signal_mask = saved;
+            }
             // A different thread may have accepted the process-directed signal.
             if let Some(restart) = restart { restart.apply(); }
-            return;
+            return !process_inner.signals.is_empty();
         };
         let action = process_inner.signal_actions[info.signo - 1];
-        if action.handler > 1 {
+        let restore_mask = if action.handler > 1 {
+            let base_mask = thread.saved_signal_mask.take().unwrap_or(active_mask);
             let self_mask = if action.flags & SA_NODEFER == 0 { signal_bit(info.signo) } else { 0 };
-            thread.signal_mask |= (action.mask | self_mask) & !UNBLOCKABLE;
+            thread.signal_mask = (base_mask | action.mask | self_mask) & !UNBLOCKABLE;
             if action.flags & SA_RESETHAND != 0 {
                 process_inner.signal_actions[info.signo - 1] = SignalAction::default();
             }
-        }
+            base_mask
+        } else {
+            active_mask
+        };
         drop(thread);
         drop(process_inner);
         drop(task);
@@ -547,9 +622,9 @@ pub(crate) fn deliver_signal(restart: Option<Restart>) {
         if action.flags & SA_RESTART != 0 {
             if let Some(restart) = restart { restart.apply(); }
         }
-        if frame::install(action, info, mask).is_none() {
+        if frame::install(action, info, restore_mask).is_none() {
             crate::task::exit_current_by_signal(11);
         }
-        return;
+        return true;
     }
 }

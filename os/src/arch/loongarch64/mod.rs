@@ -152,6 +152,12 @@ pub fn local_flush_tlb_page(va: usize) {
     }
 }
 
+pub fn fence_icache() {
+    unsafe {
+        asm!("ibar 0");
+    }
+}
+
 pub fn activate_kernel_table(token: usize) {
     unsafe {
         // 4 KiB pages and three 9-bit directory/page indexes.
@@ -190,7 +196,14 @@ pub fn read_ticks() -> usize {
     ticks
 }
 
+static TIMER_FREQ: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
 pub fn timer_frequency() -> usize {
+    let cached = TIMER_FREQ.load(core::sync::atomic::Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
     let crystal: usize;
     let scale: usize;
     unsafe {
@@ -198,7 +211,9 @@ pub fn timer_frequency() -> usize {
              crystal = out(reg) crystal, scale = out(reg) scale,
              cfg4 = in(reg) 4usize, cfg5 = in(reg) 5usize);
     }
-    crystal * (scale & 0xffff) / ((scale >> 16) & 0xffff)
+    let freq = crystal * (scale & 0xffff) / ((scale >> 16) & 0xffff);
+    TIMER_FREQ.store(freq, core::sync::atomic::Ordering::Relaxed);
+    freq
 }
 
 pub fn set_timer(deadline: usize) {

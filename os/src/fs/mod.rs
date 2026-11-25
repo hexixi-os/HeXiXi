@@ -43,11 +43,14 @@ pub trait File: Send + Sync {
     fn socket(&self) -> Option<&crate::net::SocketFile> {
         None
     }
+    fn unix_socket(&self) -> Option<&crate::net::UnixSocket> {
+        None
+    }
     fn epoll(&self) -> Option<&crate::syscall::epoll::Epoll> {
         None
     }
     fn epollable(&self) -> bool {
-        self.socket().is_some()
+        self.socket().is_some() || self.unix_socket().is_some()
     }
     fn status_flags(&self) -> u32 {
         self.path_flags().unwrap_or(0)
@@ -56,6 +59,10 @@ pub trait File: Send + Sync {
     fn poll_events(&self) -> u16 {
         ((self.readable() && self.poll_readable()) as u16) |
             (((self.writable() && self.poll_writable()) as u16) << 2)
+    }
+    /// Monotonic (inbound, outbound) readiness event counters for EPOLLET.
+    fn poll_generations(&self) -> (u64, u64) {
+        (0, 0)
     }
     fn space_usage(&self) -> Option<(easy_fs::SpaceUsage, bool)> {
         None
