@@ -45,6 +45,7 @@ pub struct PipeRingBuffer {
     head: usize,
     tail: usize,
     status: RingBufferStatus,
+    read_end: Option<Weak<Pipe>>,
     write_end: Option<Weak<Pipe>>,
 }
 
@@ -55,6 +56,7 @@ impl PipeRingBuffer {
             head: 0,
             tail: 0,
             status: RingBufferStatus::Empty,
+            read_end: None,
             write_end: None,
         }
     }
@@ -104,7 +106,10 @@ pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
     let buffer = Arc::new(unsafe { UPSafeCell::new(PipeRingBuffer::new()) });
     let read_end = Arc::new(Pipe::read_end_with_buffer(buffer.clone()));
     let write_end = Arc::new(Pipe::write_end_with_buffer(buffer.clone()));
-    buffer.exclusive_access().set_write_end(&write_end);
+    let mut ring = buffer.exclusive_access();
+    ring.read_end = Some(Arc::downgrade(&read_end));
+    ring.set_write_end(&write_end);
+    drop(ring);
     (read_end, write_end)
 }
 
@@ -124,6 +129,19 @@ impl File for Pipe {
     fn poll_writable(&self) -> bool {
         self.buffer.exclusive_access().available_write() > 0
     }
+    fn epollable(&self) -> bool { true }
+
+    fn poll_events(&self) -> u16 {
+        let ring = self.buffer.exclusive_access();
+        if self.readable {
+            (if ring.available_read() != 0 { 1 } else { 0 }) |
+                (if ring.all_write_ends_closed() { 16 } else { 0 })
+        } else {
+            (if ring.available_write() != 0 { 4 } else { 0 }) |
+                (if ring.read_end.as_ref().unwrap().strong_count() == 0 { 8 } else { 0 })
+        }
+    }
+
     fn read(&self, buf: UserBuffer) -> usize {
         assert!(self.readable());
         let mut buf_iter = buf.into_iter();

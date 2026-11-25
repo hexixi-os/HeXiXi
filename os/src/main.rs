@@ -4,7 +4,7 @@
 #![feature(alloc_error_handler)]
 #![cfg_attr(feature = "smp", feature(asm_const))]
 
-#[cfg(all(feature = "smp", not(all(target_arch = "riscv64", feature = "board_qemu")),))]
+#[cfg(all(feature = "smp", not(target_arch = "riscv64")))]
 compile_error!("SMP is supported on RISC-V QEMU virt");
 
 extern crate alloc;
@@ -33,6 +33,7 @@ mod fork_stats;
 mod fs;
 mod lang_items;
 mod mm;
+mod net;
 mod sync;
 mod syscall;
 mod task;
@@ -45,8 +46,9 @@ fn clear_bss() {
         fn ebss();
     }
     unsafe {
-        core::slice::from_raw_parts_mut(sbss as usize as *mut u8, ebss as usize - sbss as usize)
-            .fill(0);
+        let start = sbss as *const () as usize;
+        let end = ebss as *const () as usize;
+        core::slice::from_raw_parts_mut(start as *mut u8, end - start).fill(0);
     }
 }
 
@@ -79,6 +81,7 @@ pub fn rust_main() -> ! {
         fs::list_apps();
     }
     fs::init_runtime_dirs();
+    net::init();
     task::add_initproc(boot.oscomp_group());
     task::run_tasks()
 }

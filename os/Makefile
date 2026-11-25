@@ -12,7 +12,7 @@ OBJCOPY := rust-objcopy --binary-architecture=riscv64
 DISASM ?= -x
 TEST ?=
 
-FEATURES := board_qemu
+FEATURES :=
 ifeq ($(SMP),1)
 FEATURES += smp
 endif

@@ -1,3 +1,7 @@
+const SYSCALL_EPOLL_CREATE1: usize = 20;
+const SYSCALL_EPOLL_CTL: usize = 21;
+const SYSCALL_EPOLL_PWAIT: usize = 22;
+const SYSCALL_EPOLL_PWAIT2: usize = 441;
 const SYSCALL_GETCWD: usize = 17;
 const SYSCALL_UMOUNT2: usize = 39;
 const SYSCALL_MOUNT: usize = 40;
@@ -19,6 +23,19 @@ const SYSCALL_IOCTL: usize = 29;
 const SYSCALL_SENDFILE: usize = 71;
 const SYSCALL_LSEEK: usize = 62;
 const SYSCALL_FUTEX: usize = 98;
+const SYSCALL_SOCKET: usize = 198;
+const SYSCALL_BIND: usize = 200;
+const SYSCALL_LISTEN: usize = 201;
+const SYSCALL_ACCEPT: usize = 202;
+const SYSCALL_CONNECT: usize = 203;
+const SYSCALL_GETSOCKNAME: usize = 204;
+const SYSCALL_GETPEERNAME: usize = 205;
+const SYSCALL_SENDTO: usize = 206;
+const SYSCALL_RECVFROM: usize = 207;
+const SYSCALL_SETSOCKOPT: usize = 208;
+const SYSCALL_GETSOCKOPT: usize = 209;
+const SYSCALL_SHUTDOWN: usize = 210;
+const SYSCALL_ACCEPT4: usize = 242;
 const SYSCALL_CLONE: usize = 220;
 const SYSCALL_READV: usize = 65;
 const SYSCALL_RENAMEAT2: usize = 276;
@@ -52,8 +69,10 @@ const SYSCALL_TGKILL: usize = 131;
 const SYSCALL_RT_TGSIGQUEUEINFO: usize = 240;
 const SYSCALL_NEWFSTATAT: usize = 79;
 const SYSCALL_STATX: usize = 291;
-const SYSCALL_FSYNC: usize = 81;
-const SYSCALL_FDATASYNC: usize = 82;
+const SYSCALL_SYNC: usize = 81;
+const SYSCALL_FSYNC: usize = 82;
+const SYSCALL_FDATASYNC: usize = 83;
+const SYSCALL_SYNCFS: usize = 267;
 const SYSCALL_SIGACTION: usize = 134;
 const SYSCALL_SIGPROCMASK: usize = 135;
 const SYSCALL_SETPRIORITY: usize = 141;
@@ -118,8 +137,10 @@ const SYSCALL_CONDVAR_CREATE: usize = 1030;
 const SYSCALL_CONDVAR_SIGNAL: usize = 1031;
 const SYSCALL_CONDVAR_WAIT: usize = 1032;
 
+pub(crate) mod epoll;
 mod fs;
 pub(crate) mod futex;
+mod net;
 mod process;
 pub mod signal;
 mod sync;
@@ -161,6 +182,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         LAST_SYSCALLS[i].store(syscall_id, core::sync::atomic::Ordering::Relaxed);
     }
     match syscall_id {
+        SYSCALL_EPOLL_CREATE1 => epoll::create(args),
+        SYSCALL_EPOLL_CTL => epoll::ctl(args),
+        SYSCALL_EPOLL_PWAIT | SYSCALL_EPOLL_PWAIT2 => epoll::wait(args, syscall_id == SYSCALL_EPOLL_PWAIT2),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1], args[2]),
         SYSCALL_UTIMENSAT => sys_utimensat(args[1] as *const u8),
         SYSCALL_RENAMEAT | SYSCALL_RENAMEAT2 => sys_renameat(
@@ -190,7 +214,20 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[3] as *mut u8,
             args[4] as *const u8,
         ),
-        SYSCALL_PPOLL => sys_ppoll(args[0] as *mut u8, args[1]),
+        SYSCALL_PPOLL => sys_ppoll(args),
+        SYSCALL_SOCKET => net::socket(args),
+        SYSCALL_BIND => net::bind(args),
+        SYSCALL_LISTEN => net::listen(args),
+        SYSCALL_ACCEPT => net::accept([args[0], args[1], args[2], 0, 0, 0]),
+        SYSCALL_ACCEPT4 => net::accept(args),
+        SYSCALL_CONNECT => net::connect(args),
+        SYSCALL_GETSOCKNAME => net::get_name(args, false),
+        SYSCALL_GETPEERNAME => net::get_name(args, true),
+        SYSCALL_SENDTO => net::send_to(args),
+        SYSCALL_RECVFROM => net::receive_from(args),
+        SYSCALL_SETSOCKOPT => net::set_option(args),
+        SYSCALL_GETSOCKOPT => net::get_option(args),
+        SYSCALL_SHUTDOWN => net::shutdown(args),
         SYSCALL_MADVISE | SYSCALL_SET_ROBUST_LIST | SYSCALL_SIGALTSTACK => 0,
         SYSCALL_GET_ROBUST_LIST => 0,
         SYSCALL_GETRUSAGE => sys_getrusage(args[1] as *mut u8),
@@ -238,7 +275,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_STATX => sys_statx(
             args[0] as isize, args[1] as *const u8, args[2], args[3] as u32, args[4] as *mut u8,
         ),
-        SYSCALL_FSYNC | SYSCALL_FDATASYNC => 0,
+        SYSCALL_SYNC => crate::fs::sync_mounts().err().unwrap_or(0),
+        SYSCALL_FSYNC | SYSCALL_FDATASYNC | SYSCALL_SYNCFS => {
+            sys_fsync(args[0], syscall_id == SYSCALL_SYNCFS)
+        }
         SYSCALL_SIGACTION => signal::sys_rt_sigaction(args[0], args[1], args[2], args[3]),
         SYSCALL_SIGPROCMASK => signal::sys_rt_sigprocmask(args[0], args[1], args[2], args[3]),
         SYSCALL_SETPRIORITY => 0,

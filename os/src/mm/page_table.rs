@@ -134,7 +134,6 @@ impl PageTable {
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
         true
     }
-    #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
         let pte = self.find_pte(vpn).unwrap();
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
@@ -203,7 +202,7 @@ fn phys_addr_sane(pa: usize) -> bool {
     extern "C" {
         fn ekernel();
     }
-    let start = PhysAddr::from(ekernel as usize).0;
+    let start = PhysAddr::from(ekernel as *const () as usize).0;
     let end = crate::mm::ram_end();
     pa >= start && pa < end
 }

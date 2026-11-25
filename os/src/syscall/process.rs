@@ -413,9 +413,16 @@ pub fn sys_msync(addr: usize, len: usize, flags: usize) -> isize {
         Some(range) => range,
         None => return -22,
     };
-    // Shared file mappings and ordinary I/O already access the same volatile data pages.
-    current_process().inner_exclusive_access().memory_set
-        .check_user_range(&range, MapPermission::empty()).err().unwrap_or(0)
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let result = inner.memory_set.check_user_range(&range, MapPermission::empty()).and_then(|()| {
+        if flags & MS_SYNC != 0 && range.start < range.end {
+            inner.memory_set.sync_mapped_files(&range)
+        } else {
+            Ok(())
+        }
+    });
+    result.err().unwrap_or(0)
 }
 
 /// sched_getparam(123)：写一个 4 字节的 sched_priority

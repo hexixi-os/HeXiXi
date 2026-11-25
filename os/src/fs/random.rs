@@ -45,6 +45,10 @@ impl File for RandomFile {
         0o20666
     }
 
+    fn device_numbers(&self) -> Option<(u32, u32)> {
+        Some((1, (self.0 - 298) as u32))
+    }
+
     fn stat_identity(&self) -> Option<(u64, u64)> {
         Some((DEV_DEVICE, self.0))
     }

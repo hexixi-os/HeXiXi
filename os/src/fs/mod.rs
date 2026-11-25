@@ -6,6 +6,7 @@ pub mod mount;
 mod overlay;
 pub(crate) mod page_cache;
 mod pipe;
+mod persistent;
 mod procfs;
 pub mod random;
 mod stdio;
@@ -35,6 +36,35 @@ pub trait File: Send + Sync {
     fn writable(&self) -> bool;
     fn read(&self, buf: UserBuffer) -> usize;
     fn write(&self, buf: UserBuffer) -> isize;
+    fn read_result(&self, buf: UserBuffer) -> isize {
+        self.read(buf) as isize
+    }
+    fn socket(&self) -> Option<&crate::net::SocketFile> {
+        None
+    }
+    fn epoll(&self) -> Option<&crate::syscall::epoll::Epoll> {
+        None
+    }
+    fn epollable(&self) -> bool {
+        self.socket().is_some()
+    }
+    fn status_flags(&self) -> u32 {
+        self.path_flags().unwrap_or(0)
+    }
+    fn set_status_flags(&self, _flags: u32) {}
+    fn poll_events(&self) -> u16 {
+        ((self.readable() && self.poll_readable()) as u16) |
+            (((self.writable() && self.poll_writable()) as u16) << 2)
+    }
+    fn space_usage(&self) -> Option<(easy_fs::SpaceUsage, bool)> {
+        None
+    }
+    fn sync_range(&self, _offset: usize, _length: usize) -> Result<(), isize> {
+        Ok(())
+    }
+    fn sync_fs(&self) -> Result<(), isize> {
+        self.sync_range(0, usize::MAX)
+    }
     fn directory(&self) -> Option<&DirectoryFile> {
         None
     }
@@ -58,6 +88,9 @@ pub trait File: Send + Sync {
         None
     }
     fn stat_identity(&self) -> Option<(u64, u64)> {
+        None
+    }
+    fn device_numbers(&self) -> Option<(u32, u32)> {
         None
     }
     fn mapping_size(&self) -> Option<usize> {
@@ -128,8 +161,14 @@ impl File for PathFile {
     fn stat_identity(&self) -> Option<(u64, u64)> {
         self.0.stat_identity()
     }
+    fn device_numbers(&self) -> Option<(u32, u32)> {
+        self.0.device_numbers()
+    }
     fn link_count(&self) -> u32 {
         self.0.link_count()
+    }
+    fn space_usage(&self) -> Option<(easy_fs::SpaceUsage, bool)> {
+        self.0.space_usage()
     }
     fn size(&self) -> usize {
         self.0.size()
@@ -166,6 +205,9 @@ impl File for NullFile {
     fn stat_identity(&self) -> Option<(u64, u64)> {
         Some((DEV_DEVICE, 301))
     }
+    fn device_numbers(&self) -> Option<(u32, u32)> {
+        Some((1, 3))
+    }
     fn readable(&self) -> bool {
         true
     }
@@ -198,6 +240,9 @@ impl File for ZeroFile {
     }
     fn stat_identity(&self) -> Option<(u64, u64)> {
         Some((DEV_DEVICE, 302))
+    }
+    fn device_numbers(&self) -> Option<(u32, u32)> {
+        Some((1, 5))
     }
     fn readable(&self) -> bool {
         true
@@ -308,6 +353,7 @@ pub fn path_is_directory(name: &str) -> Result<bool, isize> {
                     Some(OverlayEntry::Whiteout) | None => Err(-2),
                 };
             }
+            MountBackend::Persistent(fs) => return fs.is_directory(rel),
             MountBackend::RootOverlay => {}
         }
     }
@@ -352,6 +398,7 @@ pub fn directory_is_live(directory: &DirectoryLocation) -> bool {
         }),
         DirectoryIdentity::Lower => overlay_get(&path).is_none() && !lower_ancestor_is_hidden(&path),
         DirectoryIdentity::Upper(opened) => opened.is_live(),
+        DirectoryIdentity::Persistent(_, node) => node.linked(),
     }
 }
 
@@ -385,6 +432,7 @@ pub fn working_directory(name: &str) -> Result<DirectoryLocation, isize> {
                     }
                 }
             }
+            MountBackend::Persistent(fs) => fs.directory(rel, name)?,
             MountBackend::RootOverlay => {
                 if is_root_path(name) {
                     DirectoryIdentity::Permanent
@@ -480,7 +528,7 @@ pub fn open_dyn(name: &str, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sy
         }
         if let Some((mount, _)) = resolve_mount(name) {
             return match mount.backend {
-                MountBackend::Procfs | MountBackend::Devfs => Err(-95),
+                MountBackend::Procfs | MountBackend::Devfs | MountBackend::Persistent(_) => Err(-95),
                 MountBackend::Memfs(fs) => open_overlay(fs.new_file(None, false)?, flags),
                 MountBackend::RootOverlay => open_overlay(overlay_new_file(None, false)?, flags),
             };
@@ -526,6 +574,7 @@ pub fn open_dyn(name: &str, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sy
             MountBackend::Memfs(fs) => {
                 return open_memfs(&fs, name, rel, flags);
             }
+            MountBackend::Persistent(fs) => return fs.open(rel, name, flags),
             MountBackend::RootOverlay => {}
         }
     }
@@ -710,6 +759,7 @@ pub fn find_symlink(name: &str) -> Result<Option<Arc<dyn File + Send + Sync>>, i
                     _ => None,
                 });
             }
+            MountBackend::Persistent(_) => return Ok(None),
             MountBackend::RootOverlay => {}
         }
     }
@@ -751,6 +801,7 @@ pub fn symlink(name: &str, target: Vec<u8>) -> Result<(), isize> {
                 }
                 return fs.symlink(rel, target);
             }
+            MountBackend::Persistent(_) => return Err(-95),
             MountBackend::RootOverlay => {}
         }
     }
@@ -813,6 +864,7 @@ pub fn mkdir(name: &str) -> Result<(), isize> {
                 }
                 return fs.mkdir(rel);
             }
+            MountBackend::Persistent(fs) => return fs.mkdir(rel),
             MountBackend::RootOverlay => {}
         }
     }
@@ -859,6 +911,7 @@ pub fn unlink(name: &str, remove_directory: bool) -> Result<(), isize> {
                 }
                 return fs.unlink(rel, false, is_directory);
             }
+            MountBackend::Persistent(fs) => return fs.unlink(rel, remove_directory),
             MountBackend::RootOverlay => {}
         }
     }
@@ -947,6 +1000,12 @@ pub fn rename_overlay(old: &str, new: &str, no_replace: bool) -> Result<(), isiz
         return Err(-21);
     }
 
+    if let MountBackend::Persistent(backend) = &old_mount.backend {
+        if mount::has_descendant_mount(old) || mount::has_descendant_mount(new) {
+            return Err(-16);
+        }
+        return backend.rename(old_rel, new_rel, old, new, no_replace);
+    }
     if let MountBackend::Memfs(memfs) = old_mount.backend {
         let source = memfs.get(old_rel).ok_or(-2isize)?;
         if let (OverlayEntry::Symlink(source_link), Some(OverlayEntry::Symlink(target_link))) =
@@ -1000,6 +1059,17 @@ pub fn rename_overlay(old: &str, new: &str, no_replace: bool) -> Result<(), isiz
         link.detach();
     }
     Ok(())
+}
+
+pub(crate) fn sync_mounts() -> Result<(), isize> {
+    persistent::PersistentFs::sync_active()
+}
+
+pub(crate) fn space_usage(path: &str) -> Option<(easy_fs::SpaceUsage, bool)> {
+    match resolve_mount(path)?.0.backend {
+        MountBackend::Persistent(fs) => Some((fs.space_usage(), fs.readonly())),
+        _ => None,
+    }
 }
 
 pub fn statfs_magic(path: &str) -> u64 {
@@ -1181,6 +1251,11 @@ pub fn list_dir_path(name: &str) -> Vec<(String, u32, u8)> {
                 entries.extend(fs.children(rel).into_iter().filter_map(|(child, entry)| {
                     entry.dirent().map(|(ino, file_type)| (child, ino, file_type))
                 }));
+                merge_child_mounts(name, &mut entries);
+                return entries;
+            }
+            MountBackend::Persistent(fs) => {
+                let mut entries = fs.entries(rel);
                 merge_child_mounts(name, &mut entries);
                 return entries;
             }

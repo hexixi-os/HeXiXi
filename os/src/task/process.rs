@@ -70,7 +70,6 @@ impl ProcessControlBlockInner {
         }
     }
 
-    #[allow(unused)]
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
     }
@@ -193,7 +192,7 @@ impl ProcessControlBlock {
             initial_sp,
             KERNEL_SPACE.exclusive_access().token(),
             kstack_top,
-            trap_handler as usize,
+            trap_handler as *const () as usize,
         );
         // add main thread to the process
         let mut process_inner = process.inner_exclusive_access();
@@ -407,7 +406,7 @@ impl ProcessControlBlock {
             user_sp,
             KERNEL_SPACE.exclusive_access().token(),
             task.kstack.get_top(),
-            trap_handler as usize,
+            trap_handler as *const () as usize,
         );
         Ok(())
     }

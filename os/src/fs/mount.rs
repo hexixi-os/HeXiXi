@@ -1,4 +1,4 @@
-use super::overlay::MemFs;
+use super::{overlay::MemFs, persistent::{self, PersistentFs}};
 use crate::sync::UPSafeCell;
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::fmt::Write;
@@ -22,6 +22,7 @@ pub(super) enum MountBackend {
     Procfs,
     Devfs,
     Memfs(Arc<MemFs>),
+    Persistent(Arc<PersistentFs>),
 }
 
 #[derive(Clone)]
@@ -41,6 +42,7 @@ impl MountEntry {
             MountBackend::Procfs => PROC_MAGIC,
             MountBackend::Devfs => TMPFS_MAGIC,
             MountBackend::Memfs(fs) => fs.magic(),
+            MountBackend::Persistent(_) => persistent::MAGIC,
         }
     }
 }
@@ -118,6 +120,12 @@ pub(super) fn is_mount_point(path: &str) -> bool {
         .any(|entry| entry.target == path)
 }
 
+pub(super) fn has_descendant_mount(path: &str) -> bool {
+    MOUNTS.exclusive_access().iter().any(|entry| {
+        entry.target.strip_prefix(path).map_or(false, |remaining| remaining.starts_with('/'))
+    })
+}
+
 pub(super) fn mount_tmpfs_at_boot(target: &str) {
     if is_mount_point(target) {
         return;
@@ -153,6 +161,7 @@ pub(super) fn child_mounts(dir: &str) -> Vec<(String, u32)> {
                 MountBackend::Procfs => 99,
                 MountBackend::Devfs => 300,
                 MountBackend::Memfs(fs) => fs.root_ino(),
+                MountBackend::Persistent(fs) => fs.root_ino(),
             };
             if let Some(existing) = out.iter_mut().find(|(existing, _)| existing == name) {
                 existing.1 = ino;
@@ -173,11 +182,8 @@ pub(super) fn mounts_snapshot() -> Vec<u8> {
         } else {
             alloc::format!("/{}", entry.target)
         };
-        let _ = writeln!(
-            text,
-            "{} {} {} rw,relatime 0 0",
-            entry.source, target, entry.fstype
-        );
+        let access = if matches!(&entry.backend, MountBackend::Persistent(fs) if fs.readonly()) { "ro" } else { "rw" };
+        let _ = writeln!(text, "{} {} {} {},relatime 0 0", entry.source, target, entry.fstype, access);
     }
     text.into_bytes()
 }
@@ -185,19 +191,24 @@ pub(super) fn mounts_snapshot() -> Vec<u8> {
 pub(super) fn magic_for_dev(dev: u64) -> Option<u64> {
     MOUNTS.exclusive_access().iter().find_map(|entry| match &entry.backend {
         MountBackend::Memfs(fs) if fs.dev() == dev => Some(fs.magic()),
+        MountBackend::Persistent(fs) if fs.dev() == dev => Some(persistent::MAGIC),
         _ => None,
     })
 }
 
-pub fn mount_fs(source: &str, target: &str, fstype: &str, _flags: usize) -> Result<(), isize> {
+pub fn mount_fs(source: &str, target: &str, fstype: &str, flags: usize) -> Result<(), isize> {
     if !super::has_ext4() {
-        return Ok(());
+        return if fstype == "easyfs" { Err(-19) } else { Ok(()) };
     }
-    if !(crate::config::legacy_oscomp_image() && super::is_legacy_basic_mnt(target)) {
+    if fstype == "easyfs" && (target.is_empty() || is_mount_point(target)) { return Err(-16); }
+    if fstype == "easyfs"
+        || !(crate::config::legacy_oscomp_image() && super::is_legacy_basic_mnt(target))
+    {
         super::require_directory(target)?;
     }
     let source = if source.is_empty() { "none" } else { source };
     let backend = match fstype {
+        "easyfs" => MountBackend::Persistent(PersistentFs::mount(source, flags)?),
         "tmpfs" | "ramfs" => MountBackend::Memfs(MemFs::new_mountable(target, TMPFS_MAGIC)?),
         "vfat" | "msdos" => MountBackend::Memfs(MemFs::new_mountable(target, MSDOS_MAGIC)?),
         "ext4" | "ext2" => MountBackend::Memfs(MemFs::new_mountable(target, EXT4_MAGIC)?),
@@ -250,10 +261,16 @@ pub fn umount_fs(target: &str, flags: usize) -> Result<(), isize> {
     }
     let dev = match &entry.backend {
         MountBackend::Memfs(fs) => Some(fs.dev()),
+        MountBackend::Persistent(fs) => Some(fs.dev()),
         _ => None,
     };
     if flags & MNT_DETACH == 0 && crate::task::mount_is_busy(target, dev) {
         return Err(-16); // EBUSY
+    }
+    if let MountBackend::Persistent(fs) = &entry.backend {
+        if flags & (MNT_FORCE | MNT_DETACH | MNT_EXPIRE) != 0 { return Err(-22); }
+        if has_descendant_mount(target) { return Err(-16); }
+        fs.sync()?;
     }
     let removed = {
         let mut mounts = MOUNTS.exclusive_access();

@@ -2,18 +2,20 @@ use super::{get_block_cache, BlockDevice, BLOCK_SZ};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter, Result};
+use core::ops::Range;
 
 const EFS_MAGIC: u32 = 0x3b800001;
 const INODE_DIRECT_COUNT: usize = 28;
-const NAME_LENGTH_LIMIT: usize = 27;
+pub const NAME_LENGTH_LIMIT: usize = 27;
 const INODE_INDIRECT1_COUNT: usize = BLOCK_SZ / 4;
 const INODE_INDIRECT2_COUNT: usize = INODE_INDIRECT1_COUNT * INODE_INDIRECT1_COUNT;
 const DIRECT_BOUND: usize = INODE_DIRECT_COUNT;
 const INDIRECT1_BOUND: usize = DIRECT_BOUND + INODE_INDIRECT1_COUNT;
-#[allow(unused)]
 const INDIRECT2_BOUND: usize = INDIRECT1_BOUND + INODE_INDIRECT2_COUNT;
+pub const MAX_FILE_SIZE: usize = INDIRECT2_BOUND * BLOCK_SZ;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct SuperBlock {
     magic: u32,
     pub total_blocks: u32,
@@ -58,7 +60,7 @@ impl SuperBlock {
     }
 }
 
-#[derive(PartialEq)]
+#[repr(u8)]
 pub enum DiskInodeType {
     File,
     Directory,
@@ -68,12 +70,13 @@ type IndirectBlock = [u32; BLOCK_SZ / 4];
 type DataBlock = [u8; BLOCK_SZ];
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct DiskInode {
     pub size: u32,
     pub direct: [u32; INODE_DIRECT_COUNT],
     pub indirect1: u32,
     pub indirect2: u32,
-    type_: DiskInodeType,
+    type_: u8,
 }
 
 impl DiskInode {
@@ -83,21 +86,71 @@ impl DiskInode {
         self.direct.iter_mut().for_each(|v| *v = 0);
         self.indirect1 = 0;
         self.indirect2 = 0;
-        self.type_ = type_;
+        self.type_ = type_ as u8;
     }
     pub fn is_dir(&self) -> bool {
-        self.type_ == DiskInodeType::Directory
+        self.type_ == DiskInodeType::Directory as u8
     }
-    #[allow(unused)]
     pub fn is_file(&self) -> bool {
-        self.type_ == DiskInodeType::File
+        self.type_ == DiskInodeType::File as u8
+    }
+
+    pub fn has_valid_blocks(
+        &self,
+        data_area: Range<u32>,
+        block_device: &Arc<dyn BlockDevice>,
+    ) -> bool {
+        let blocks = self.data_blocks() as usize;
+        let valid_entries = |entries: &[u32]| entries.iter().all(|id| data_area.contains(id));
+        if !valid_entries(&self.direct[..blocks.min(INODE_DIRECT_COUNT)]) {
+            return false;
+        }
+        if blocks > INODE_DIRECT_COUNT {
+            if !data_area.contains(&self.indirect1) {
+                return false;
+            }
+            let entries = (blocks - INODE_DIRECT_COUNT).min(INODE_INDIRECT1_COUNT);
+            let valid = get_block_cache(self.indirect1 as usize, Arc::clone(block_device))
+                .lock()
+                .read(0, |block: &IndirectBlock| valid_entries(&block[..entries]));
+            if !valid {
+                return false;
+            }
+        }
+        if blocks > INDIRECT1_BOUND {
+            if !data_area.contains(&self.indirect2) {
+                return false;
+            }
+            let indirect2: IndirectBlock =
+                get_block_cache(self.indirect2 as usize, Arc::clone(block_device))
+                    .lock()
+                    .read(0, |block: &IndirectBlock| *block);
+            let mut remaining = blocks - INDIRECT1_BOUND;
+            for block_id in indirect2
+                .iter()
+                .take((remaining + INODE_INDIRECT1_COUNT - 1) / INODE_INDIRECT1_COUNT)
+            {
+                if !data_area.contains(block_id) {
+                    return false;
+                }
+                let entries = remaining.min(INODE_INDIRECT1_COUNT);
+                let valid = get_block_cache(*block_id as usize, Arc::clone(block_device))
+                    .lock()
+                    .read(0, |block: &IndirectBlock| valid_entries(&block[..entries]));
+                if !valid {
+                    return false;
+                }
+                remaining -= entries;
+            }
+        }
+        true
     }
     /// Return block number correspond to size.
     pub fn data_blocks(&self) -> u32 {
         Self::_data_blocks(self.size)
     }
     fn _data_blocks(size: u32) -> u32 {
-        (size + BLOCK_SZ as u32 - 1) / BLOCK_SZ as u32
+        size / BLOCK_SZ as u32 + u32::from(size % BLOCK_SZ as u32 != 0)
     }
     /// Return number of blocks needed include indirect1/2.
     pub fn total_blocks(size: u32) -> u32 {
@@ -217,80 +270,61 @@ impl DiskInode {
             });
     }
 
-    /// Clear size to zero and return blocks that should be deallocated.
-    ///
-    /// We will clear the block contents to zero later.
-    pub fn clear_size(&mut self, block_device: &Arc<dyn BlockDevice>) -> Vec<u32> {
-        let mut v: Vec<u32> = Vec::new();
-        let mut data_blocks = self.data_blocks() as usize;
-        self.size = 0;
-        let mut current_blocks = 0usize;
-        // direct
-        while current_blocks < data_blocks.min(INODE_DIRECT_COUNT) {
-            v.push(self.direct[current_blocks]);
-            self.direct[current_blocks] = 0;
-            current_blocks += 1;
-        }
-        // indirect1 block
-        if data_blocks > INODE_DIRECT_COUNT {
-            v.push(self.indirect1);
-            data_blocks -= INODE_DIRECT_COUNT;
-            current_blocks = 0;
-        } else {
-            return v;
-        }
-        // indirect1
-        get_block_cache(self.indirect1 as usize, Arc::clone(block_device))
-            .lock()
-            .modify(0, |indirect1: &mut IndirectBlock| {
-                while current_blocks < data_blocks.min(INODE_INDIRECT1_COUNT) {
-                    v.push(indirect1[current_blocks]);
-                    //indirect1[current_blocks] = 0;
-                    current_blocks += 1;
+    /// Shrink the inode and return data and index blocks that are no longer referenced.
+    pub fn shrink_size(&mut self, size: u32, block_device: &Arc<dyn BlockDevice>) -> Vec<u32> {
+        use core::mem::replace;
+
+        let old_blocks = self.data_blocks() as usize;
+        let new_blocks = Self::_data_blocks(size) as usize;
+        let mut freed = Vec::new();
+        for index in (new_blocks..old_blocks).rev() {
+            if index < INODE_DIRECT_COUNT {
+                freed.push(replace(&mut self.direct[index], 0));
+            } else if index < INDIRECT1_BOUND {
+                let slot = index - INODE_DIRECT_COUNT;
+                let data = get_block_cache(self.indirect1 as usize, Arc::clone(block_device))
+                    .lock()
+                    .modify(0, |block: &mut IndirectBlock| replace(&mut block[slot], 0));
+                freed.push(data);
+                if slot == 0 {
+                    freed.push(replace(&mut self.indirect1, 0));
                 }
-            });
-        self.indirect1 = 0;
-        // indirect2 block
-        if data_blocks > INODE_INDIRECT1_COUNT {
-            v.push(self.indirect2);
-            data_blocks -= INODE_INDIRECT1_COUNT;
-        } else {
-            return v;
-        }
-        // indirect2
-        assert!(data_blocks <= INODE_INDIRECT2_COUNT);
-        let a1 = data_blocks / INODE_INDIRECT1_COUNT;
-        let b1 = data_blocks % INODE_INDIRECT1_COUNT;
-        get_block_cache(self.indirect2 as usize, Arc::clone(block_device))
-            .lock()
-            .modify(0, |indirect2: &mut IndirectBlock| {
-                // full indirect1 blocks
-                for entry in indirect2.iter_mut().take(a1) {
-                    v.push(*entry);
-                    get_block_cache(*entry as usize, Arc::clone(block_device))
+            } else {
+                let relative = index - INDIRECT1_BOUND;
+                let outer = relative / INODE_INDIRECT1_COUNT;
+                let inner = relative % INODE_INDIRECT1_COUNT;
+                let table = get_block_cache(self.indirect2 as usize, Arc::clone(block_device));
+                let leaf = if inner == 0 {
+                    table
                         .lock()
-                        .modify(0, |indirect1: &mut IndirectBlock| {
-                            for entry in indirect1.iter() {
-                                v.push(*entry);
-                            }
-                        });
+                        .modify(0, |block: &mut IndirectBlock| replace(&mut block[outer], 0))
+                } else {
+                    table.lock().read(0, |block: &IndirectBlock| block[outer])
+                };
+                let data = get_block_cache(leaf as usize, Arc::clone(block_device))
+                    .lock()
+                    .modify(0, |block: &mut IndirectBlock| replace(&mut block[inner], 0));
+                freed.push(data);
+                if inner == 0 {
+                    freed.push(leaf);
+                    if outer == 0 {
+                        freed.push(replace(&mut self.indirect2, 0));
+                    }
                 }
-                // last indirect1 block
-                if b1 > 0 {
-                    v.push(indirect2[a1]);
-                    get_block_cache(indirect2[a1] as usize, Arc::clone(block_device))
-                        .lock()
-                        .modify(0, |indirect1: &mut IndirectBlock| {
-                            for entry in indirect1.iter().take(b1) {
-                                v.push(*entry);
-                            }
-                        });
-                    //indirect2[a1] = 0;
-                }
-            });
-        self.indirect2 = 0;
-        v
+            }
+        }
+
+        let tail = size as usize % BLOCK_SZ;
+        if tail != 0 {
+            let block = self.get_block_id((new_blocks - 1) as u32, block_device);
+            get_block_cache(block as usize, Arc::clone(block_device))
+                .lock()
+                .modify(0, |block: &mut DataBlock| block[tail..].fill(0));
+        }
+        self.size = size;
+        freed
     }
+
     pub fn read_at(
         &self,
         offset: usize,
@@ -298,7 +332,7 @@ impl DiskInode {
         block_device: &Arc<dyn BlockDevice>,
     ) -> usize {
         let mut start = offset;
-        let end = (offset + buf.len()).min(self.size as usize);
+        let end = offset.saturating_add(buf.len()).min(self.size as usize);
         if start >= end {
             return 0;
         }
@@ -338,8 +372,10 @@ impl DiskInode {
         block_device: &Arc<dyn BlockDevice>,
     ) -> usize {
         let mut start = offset;
-        let end = (offset + buf.len()).min(self.size as usize);
-        assert!(start <= end);
+        let end = offset.saturating_add(buf.len()).min(self.size as usize);
+        if start >= end {
+            return 0;
+        }
         let mut start_block = start / BLOCK_SZ;
         let mut write_size = 0usize;
         loop {
@@ -394,14 +430,14 @@ impl DirEntry {
         }
     }
     pub fn as_bytes(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self as *const _ as usize as *const u8, DIRENT_SZ) }
+        unsafe { core::slice::from_raw_parts((self as *const Self).cast::<u8>(), DIRENT_SZ) }
     }
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self as *mut _ as usize as *mut u8, DIRENT_SZ) }
+        unsafe { core::slice::from_raw_parts_mut((self as *mut Self).cast::<u8>(), DIRENT_SZ) }
     }
-    pub fn name(&self) -> &str {
-        let len = (0usize..).find(|i| self.name[*i] == 0).unwrap();
-        core::str::from_utf8(&self.name[..len]).unwrap()
+    pub fn name(&self) -> Option<&str> {
+        let len = self.name.iter().position(|&byte| byte == 0)?;
+        core::str::from_utf8(&self.name[..len]).ok()
     }
     pub fn inode_number(&self) -> u32 {
         self.inode_number

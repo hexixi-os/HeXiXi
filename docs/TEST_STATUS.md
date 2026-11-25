@@ -1,53 +1,58 @@
 # 测试状态
 
-记录 PR-17～PR-18 的双架构原盘复测与专项回归覆盖。原盘复测使用 QEMU 8.2.2 和显式 `--legacy-image` 模式；专项回归同时在 QEMU 10.1.0 下通过验证。
+以下记录当前双架构官方原盘复测（QEMU 8.2.2，`--legacy-image`）与专项回归结果。
 
-## 1. 官方 2025 初赛原盘 `basic`
+## 1. 官方 2025 初赛原盘
+
+### `basic` 组
 
 | 平台与模式 | `basic-musl` | `basic-glibc` | 备注 |
 |---|---:|---:|---|
-| RISC-V64 单核 | **102/102** | **102/102** | 两组脚本均正常退出，`--strict` 通过 |
-| RISC-V64 双核（`SMP=1`，5 次） | 98/102 | 98/102 | 十组脚本均正常退出，失分集中在 `test_pipe` 串口输出交错 |
-| LoongArch64 单核 | **102/102** | **102/102** | 两组脚本均正常退出，`--strict` 通过 |
+| RISC-V64 单核 | **102/102** | **102/102** | 正常退出，`--strict` 通过 |
+| RISC-V64 双核（`SMP=1`，5 次） | 98/102 | 98/102 | 正常退出，失分集中在 `test_pipe` 串口交错 |
+| LoongArch64 单核 | **102/102** | **102/102** | 正常退出，`--strict` 通过 |
+
+### 完整 24 项矩阵（单核 1 GiB，每组 120 s，0 次内核 panic）
+
+复跑命令见 [对接官方评测](oscomp-evaluation.md#3-完整-24-项评测矩阵)。
+
+| 架构 | 正常退出 | 脚本异常 | 超时 | 备注 |
+|---|---:|---:|---:|---|
+| RISC-V64 | 18 | 0 | 6 | `lua` 双库 9/9；超时组为双库 `busybox` / `lmbench` / `ltp` |
+| LoongArch64 | 17 | 0 | 7 | `lua` 双库 9/9；超时组另含 `libcbench-musl` |
+
+### 网络测例（`iperf` / `netperf`）
+
+- **Netperf 2.7.0**：使用独立 EXT4 盘（含按架构静态构建的 `netperf` / `netserver`），RISC-V64 与 LoongArch64 单核均 **5/5**（UDP/TCP stream、RR、CRR）。
+- **原盘 iperf3**：TCP/UDP 基础、5 路并行与反向模式均已跑通。原盘采样 LoongArch64 双库 6/6，RISC-V64 musl 5/6、glibc 6/6（原版脚本在 `iperf3 -D` 后无等待，偶发 `ECONNREFUSED`；增加 1 s 间隔对照测试双架构均 6/6）。`TCP_INFO` 待实现。
 
 ## 2. 专项回归覆盖
 
 | 专项 | 覆盖范围 |
 |---|---|
-| `test_exec_entry.sh` | RISC-V64 单核/双核与 LoongArch64 单核，覆盖内嵌 runner 的组选择、Linux ELF 初始寄存器和参数栈、RISC-V `clone` 子栈指针 |
-| `test_vfs_abi.sh` | RISC-V64 单核/双核与 LoongArch64 单核，覆盖 EXT4/Overlay/`tmpfs` 符号链接、UTF-8 路径、`mount`/`umount2`（含 `MNT_DETACH` 与 `EBUSY`）、`statfs`/`fstatfs`、`/proc/self`、`/dev/{random,urandom,zero}`、`getrandom`、`/lib64` 兼容链接及 `/dev/shm` 跨进程异址共享 `futex` 与 `clear_child_tid` |
-| `test_smp.sh` | 核对 `getcpu` / `sched_getaffinity`、跨核 CoW 与共享文件截断 `SIGBUS`。跨 hart 管道用例传输超过环形缓冲区容量的数据，逐字节检查内容及 EOF |
-| `test_loongarch_boot.sh` | LoongArch64 ELF 直启、VirtIO PCI 只读 EXT4、用户态执行与 `clone` TLS/child TID |
-| `test_overlay_fs.sh` | 768 MiB 下 100 MiB 顺序写、>2 GiB 稀疏写、预算上限与回收、`MAP_SHARED` + `truncate`/`SIGBUS`、重命名与 `O_TMPFILE`；下层 EXT4 SHA-256 不变 |
-| `test_pthread_abi.sh` | 动态 musl 1.2.0 / glibc 2.31 各 16×8 并发线程（mutex/condvar/TLS/TID/信号/futex/`exit_group`）及动态 glibc BusyBox |
-| `test_elf_dynamic.sh` | musl PIE、glibc PIE 与高地址非 PIE 经 `PT_INTERP` 动态装载、堆扩缩与异常解释器处理 |
-| `test_elf_demand.sh` | 按需 ELF 加载与共享页缓存，覆盖非页对齐段、BSS、`mprotect` 与异常 ELF |
-| `test_fork_cow.sh` | `fork` 写时复制、父子隔离、`MAP_SHARED`、内存不足回滚与 128 MiB 下 40 MiB 驻留 `fork→exec` |
-| `test_mmap_vma.sh` & `test_basic_abi.sh` | 六参数 `mmap`、局部 `munmap`/`mprotect`、`MAP_FIXED`、跨 EOF `SIGBUS` 与基础文件/目录/进程 ABI |
-| `test_ext4.sh` | 宿主侧跨块组、稀疏洞、未写入 extent、索引 extent 树与页缓存复用/淘汰 |
-| easy-fs `usertests` | 单核与双核均跑完 29 项正常用例、8 项预期失败用例及 1,000 轮管道测试 |
+| `test_exec_entry.sh` | 双架构（含 RV64 双核）：内嵌 runner 组选择、ELF 初始栈/寄存器、RISC-V `clone` 子栈指针 |
+| `test_vfs_abi.sh` | 双架构（含 RV64 双核）：符号链接、UTF-8 路径、`mount`/`umount2`/`statfs`、`/proc/self`、`/dev/{random,urandom,zero}`、`/lib64`、`/dev/shm` 跨进程共享 `futex` 与 `clear_child_tid` |
+| `test_net_abi.sh` | 双架构（含 RV64 双核）：无网卡 IPv4 TCP/UDP 回环、半关闭、非阻塞、`ppoll`/`epoll` 与 `--virtio` 宿主↔客机 TCP 回显 |
+| `test_persistent_fs.sh` | 双架构（含 RV64 双核，含 `PAGE_CACHE_POLICY=none`）：EasyFS 数据盘 4 次重启回归、`fsync`/`msync`、盘上 ELF 执行、空白/只读盘错误处理与只读根盘哈希校验 |
+| `test_smp.sh` | RV64 双核：`getcpu`/`sched_getaffinity`、跨核 CoW、共享文件截断 `SIGBUS`、超容量跨核管道逐字节校验 |
+| `test_loongarch_boot.sh` | LoongArch64 ELF 直启、VirtIO PCI 只读 EXT4 与 `clone` TLS/child TID |
+| `test_overlay_fs.sh` | 768 MiB 下 100 MiB 顺序写、>2 GiB 稀疏写、预算回收、`MAP_SHARED`+`truncate`/`SIGBUS`、`O_TMPFILE`；下层 EXT4 只读不变 |
+| `test_pthread_abi.sh` | 动态 musl / glibc 各 16×8 并发线程及动态 glibc BusyBox |
+| `test_elf_dynamic.sh` / `test_elf_demand.sh` | musl/glibc PIE 与高地址非 PIE `PT_INTERP` 动态装载、按需加载、共享页缓存与 `mprotect` |
+| `test_fork_cow.sh` / `test_mmap_vma.sh` / `test_basic_abi.sh` | `fork` CoW、六参数 `mmap`/VMA 拆分、`MAP_FIXED`、跨 EOF `SIGBUS` 与基础 ABI |
+| `test_ext4.sh` & EasyFS 宿主测试 | EXT4 宿主测例 + `easy-fs` 宿主测试 9/9（空间统计、满盘回滚、重命名、截断与盘间缓存隔离） |
+| easy-fs `usertests` | RV64 单核/双核：29 正常用例 + 8 预期失败用例 + 1,000 轮管道测试全部通过 |
 
-## 3. 关键性能基准
+## 3. 关键性能基准（RISC-V64 单核）
 
-### ELF 按需装载冷启动（8 MiB 文件段 / 32 MiB 内存段，256 MiB 单核，5 次中位数）
+| 场景 | 基线 | 当前 |
+|---|---|---|
+| ELF 按需冷启动（8 MiB 文件 / 32 MiB 内存，256 MiB RAM，5 次中位数） | 8,475 帧 / 16,412 扇区 / 2,124.1 ms | **268 帧 / 28 扇区 / 3.3 ms** |
+| `fork→exec` CoW（40 MiB 私有驻留页，256 MiB RAM，5 次中位数） | 复制 10,504 页 / 峰值 +41.2 MiB / 153.0 ms | **复制 1 页 / 峰值 +1.1 MiB / 12.2 ms** |
 
-| 指标（至首次用户系统调用） | 全量预加载基线 | 当前按需装载 |
-|---|---:|---:|
-| 物理帧分配次数 | 8,475 | **268** |
-| EXT4 扇区读取（512 B） | 16,412 | **28** |
-| 耗时 | 2,124.1 ms | **3.3 ms** |
+### 页缓存策略对照（128 MiB 单核，32 MiB EXT4，3 次中位数，512 B 扇区读）
 
-### `fork→exec` 写时复制（40 MiB 私有驻留页，256 MiB 单核，5 次中位数）
-
-| 指标 | 全量复制基线 | 当前 CoW |
-|---|---:|---:|
-| 复制物理页 | 10,504 | **1** |
-| 额外峰值物理帧 | 10,540（41.2 MiB） | **277（1.1 MiB）** |
-| `fork` / `fork→exec` 耗时 | 51.0 ms / 153.0 ms | **6.8 ms / 12.2 ms** |
-
-### 页缓存策略对照（128 MiB 单核，32 MiB EXT4，3 次中位数）
-
-| 负载 | `none` 扇区 | `lru`（默认）扇区 | `adaptive` 扇区 |
+| 负载 | `none` | `lru`（默认） | `adaptive` |
 |---|---:|---:|---:|
 | 32 页热点 + 顺序扫描 | 25,600 | 25,600（热点未命中 96） | **21,616**（未命中 0） |
 | 128 页热点 + 顺序扫描 | 28,672 | 28,672（热点未命中 384） | **23,920**（未命中 0） |
@@ -55,23 +60,4 @@
 | `revisit`（满缓存后重读 128 页×3） | 5,120 | **3,072** | 4,040 |
 | BusyBox 启动 8 次 | 1,192 | **239** | **239** |
 
-> 考虑满缓存后短扫描的重读成本，默认采用 `lru`；可通过 `PAGE_CACHE_POLICY=adaptive|none` 切换，`/proc/page_cache` 提供只读统计快照。
-
-## 4. 官方 24 项矩阵基线与待解决问题
-
-PR-17 单核复测使用 1 GiB，每组 120 s，两个架构均未记录内核 panic。复跑命令见 [对接官方评测](oscomp-evaluation.md#3-完整-24-项评测矩阵)。
-
-| 架构 | 正常退出 | 脚本异常 | 超时 |
-|---|---:|---:|---:|
-| RISC-V64 | 18 | 0 | 6 |
-| LoongArch64 | 17 | 0 | 7 |
-
-两架构 `lua-musl` 和 `lua-glibc` 均为 `9/9`。超时组仍包括两个架构的 musl/glibc `busybox`、`lmbench` 与 `ltp`，以及 LoongArch64 的 `libcbench-musl`。iperf 子用例仍失败。
-
-PR-11 历史基线（单核 1 GiB、每组 120 s，0 次内核 panic）：
-
-| 状态 | 测试组 | 主要原因 / 观察 |
-|---|---|---|
-| 满分 | `basic`（musl/glibc 均 102/102） | glibc 外层 BusyBox 在结束标记后触发用户态取指缺页退出 139 |
-| 部分运行 / 超时 | `busybox`、`lmbench`、`ltp`、`libcbench`、`unixbench`、`cyclictest` | 缺少部分工具/接口、动态库路径未部署或单核超时 |
-| 0 分 / 不可用 | `lua`、`libctest`、`iozone`、`iperf`、`netperf` | 原盘脚本 shebang/路径缺失、动态链接器 `/lib` 缺失、无网卡与 TCP/IP 栈 |
+> 默认采用 `lru`；可通过 `PAGE_CACHE_POLICY=adaptive|none` 切换，`/proc/page_cache` 提供统计快照。

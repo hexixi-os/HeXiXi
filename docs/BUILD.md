@@ -48,7 +48,7 @@ git-fetch-with-cli = true
 sparse-registry = true
 ```
 
-仓库提交了 `os/`、`user/`、`easy-fs-fuse/` 三个 `Cargo.lock` 以锁定旧版 nightly 兼容的依赖，修改依赖时请同步更新 lockfile。
+仓库提交了 `os/`、`user/`、`easy-fs/`、`easy-fs-fuse/` 的 `Cargo.lock`。修改依赖时请同步更新对应的 lockfile。
 
 ## 2. 构建内核
 
@@ -99,7 +99,44 @@ qemu-system-riscv64 -machine virt -m 256M -nographic -bios default \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 ```
 
-## 4. 常见问题
+## 4. EasyFS 持久化数据盘
+
+评测根盘沿用只读 EXT4 和内存 Overlay。下面的 `easy-fs-fuse` 命令会在临时目录准备一块空 EasyFS 数据盘。
+
+```bash
+data_dir=$(mktemp -d)
+mkdir -p "$data_dir/empty"
+(cd easy-fs-fuse && cargo +stable run --locked --release -- -s "$data_dir/empty/" -t "$data_dir/")
+```
+
+在原有 QEMU 启动参数中加入第二块盘，并在后续启动时复用同一个 `fs.img`。如果原命令用全局 `-snapshot` 保护评测盘，改为在根盘的 `-drive` 参数中设置 `readonly=on`，让数据盘写入落到镜像文件。
+
+```bash
+# RISC-V64，使用根盘 virtio-mmio-bus.0 之外的空闲槽位
+-drive "file=$data_dir/fs.img,if=none,format=raw,id=x1" \
+-device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
+
+# LoongArch64，在根盘之后添加第二个现代 VirtIO PCI 块设备
+-drive "file=$data_dir/fs.img,if=none,format=raw,id=x1" \
+-device virtio-blk-pci,drive=x1,disable-legacy=on,romfile=
+```
+
+在客机中，用 `mkdir` 创建挂载目录，用 `mount` 接入数据盘。
+
+```sh
+mkdir -p /persist
+mount -t easyfs /dev/vdb /persist
+```
+
+EasyFS 支持普通文件和目录、`rename` / `unlink`、`fsync` / `fdatasync` / `syncfs`、`MAP_SHARED` 映射的 `msync(MS_SYNC)`，也可执行盘上的 ELF。持久化依靠显式同步。单个路径分量最多 27 字节，单文件最多 8,468,480 字节。EasyFS 无日志和自动回写，数据盘后端暂不支持可写 EXT4 镜像。
+
+在仓库根目录运行双架构回归，可以验证写入、重启后读取，以及空白盘和只读盘的挂载行为。
+
+```bash
+bash tools/oscomp/test_persistent_fs.sh all /tmp/hexixi-persistent-fs
+```
+
+## 5. 常见问题
 
 | 现象 | 原因与处理 |
 |---|---|

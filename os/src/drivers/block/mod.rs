@@ -1,8 +1,10 @@
+mod secondary;
 #[cfg(target_arch = "riscv64")]
 mod virtio_blk;
 #[cfg(target_arch = "loongarch64")]
 mod virtio_pci;
 
+pub use secondary::{secondary_disk, SecondaryDisk};
 #[cfg(target_arch = "riscv64")]
 pub use virtio_blk::VirtIOBlock;
 #[cfg(target_arch = "loongarch64")]

@@ -36,7 +36,7 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         new_task_res.ustack_top(),
         kernel_token(),
         new_task.kstack.get_top(),
-        trap_handler as usize,
+        trap_handler as *const () as usize,
     );
     (*new_task_trap_cx).x[crate::arch::REG_A0] = arg;
     new_task_tid as isize

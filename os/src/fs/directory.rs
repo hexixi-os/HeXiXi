@@ -1,5 +1,6 @@
 use super::{
     overlay::{directory_identity, OverlayDirectory},
+    persistent::{PersistentFs, PersistentNode},
     File,
 };
 use crate::mm::UserBuffer;
@@ -13,6 +14,7 @@ pub(super) enum DirectoryIdentity {
     Lower,
     Upper(Arc<OverlayDirectory>),
     Proc(Weak<crate::task::ProcessControlBlock>),
+    Persistent(Arc<PersistentFs>, Arc<PersistentNode>),
 }
 
 #[derive(Clone)]
@@ -28,7 +30,7 @@ impl DirectoryLocation {
 
     pub(super) fn new(path: &str, identity: DirectoryIdentity) -> Self {
         Self {
-            path: if matches!(identity, DirectoryIdentity::Upper(_)) {
+            path: if matches!(identity, DirectoryIdentity::Upper(_) | DirectoryIdentity::Persistent(_, _)) {
                 String::new()
             } else {
                 String::from(path)
@@ -40,6 +42,7 @@ impl DirectoryLocation {
     pub fn path(&self) -> Cow<'_, str> {
         match &self.identity {
             DirectoryIdentity::Upper(dir) => Cow::Owned(dir.full_path()),
+            DirectoryIdentity::Persistent(_, node) => Cow::Owned(node.path()),
             _ => Cow::Borrowed(&self.path),
         }
     }
@@ -96,6 +99,7 @@ impl File for DirectoryFile {
     fn stat_identity(&self) -> Option<(u64, u64)> {
         match &self.location.identity {
             DirectoryIdentity::Upper(dir) => Some(directory_identity(dir)),
+            DirectoryIdentity::Persistent(_, node) => Some(node.identity()),
             _ => None,
         }
     }
@@ -106,6 +110,18 @@ impl File for DirectoryFile {
 
     fn size(&self) -> usize {
         4096
+    }
+
+    fn space_usage(&self) -> Option<(easy_fs::SpaceUsage, bool)> {
+        match &self.location.identity {
+            DirectoryIdentity::Persistent(fs, _) => Some((fs.space_usage(), fs.readonly())),
+            _ => None,
+        }
+    }
+
+    fn sync_range(&self, _offset: usize, _length: usize) -> Result<(), isize> {
+        if let DirectoryIdentity::Persistent(fs, _) = &self.location.identity { fs.sync()?; }
+        Ok(())
     }
 
     fn seek_to(&self, position: isize) -> isize {

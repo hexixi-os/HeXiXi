@@ -120,6 +120,10 @@ impl MemorySet {
         }
     }
 
+    pub(crate) fn sync_mapped_files(&self, range: &Range<VirtPageNum>) -> Result<(), isize> {
+        self.vmas.sync_files(range)
+    }
+
     pub fn insert_vma(&mut self, range: Range<VirtPageNum>, permissions: MapPermission, backing: VmaBacking) {
         self.vmas.insert(range, permissions, backing);
     }

@@ -1,10 +1,17 @@
 use crate::config::PAGE_SIZE;
 use crate::mm::{frame_alloc, FrameTracker};
 use crate::sync::UPSafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use alloc::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
 };
+
+static NEXT_FS_ID: AtomicUsize = AtomicUsize::new(1);
+
+pub(super) fn new_fs_id() -> usize {
+    NEXT_FS_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 pub(super) const CAPACITY: usize = 256;
 const HISTORY_LIMIT: usize = CAPACITY * 2;
@@ -311,6 +318,23 @@ pub(super) fn get_or_load(
         Some(CACHE.exclusive_access().as_mut().unwrap().admit(key, frame))
     } else {
         Some(frame)
+    }
+}
+
+pub(super) fn existing(key: FilePageKey) -> Option<Arc<FrameTracker>> {
+    CACHE.exclusive_access().as_ref()?.entries.get(&key).map(|entry| entry.frame.clone())
+}
+
+pub(super) fn contains(key: FilePageKey) -> bool {
+    CACHE.exclusive_access().as_ref().map_or(false, |cache| cache.entries.contains_key(&key))
+}
+
+pub(super) fn discard_inode_pages(fs: usize, inode: u32, first: u64) {
+    if let Some(cache) = CACHE.exclusive_access().as_mut() {
+        let retained = |key: &FilePageKey| key.fs != fs || key.inode != inode || key.index < first;
+        cache.entries.retain(|key, _| retained(key));
+        cache.history.entries.retain(|key, _| retained(key));
+        cache.history.order.retain(|(key, _)| retained(key));
     }
 }
 

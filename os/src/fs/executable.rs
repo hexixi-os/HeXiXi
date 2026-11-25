@@ -1,17 +1,19 @@
 use super::{
     ext4::Ext4File, lower_inode,
     mount::{resolve_mount, MountBackend},
-    open_file, overlay::FileData, overlay_get, OpenFlags, OverlayEntry, EXT4,
+    open_file, overlay::FileData, overlay_get, persistent::PersistentExecutable, OpenFlags, OverlayEntry, EXT4,
 };
 use crate::mm::FrameTracker;
 use alloc::{sync::Arc, vec::Vec};
 
 /// File contents pinned to the object opened by exec, independent of its directory entry.
 pub enum Executable {
+    #[cfg_attr(not(feature = "oscomp_runner"), allow(dead_code))]
     Embedded(&'static [u8]),
     Snapshot(Vec<u8>),
     Overlay(FileData),
     Disk(Ext4File),
+    Persistent(PersistentExecutable),
 }
 
 impl Executable {
@@ -21,6 +23,7 @@ impl Executable {
             Self::Snapshot(data) => data.len(),
             Self::Overlay(data) => data.len,
             Self::Disk(file) => file.len(),
+            Self::Persistent(file) => file.len(),
         }
     }
 
@@ -30,6 +33,7 @@ impl Executable {
             Self::Snapshot(data) => data.as_slice(),
             Self::Overlay(data) => return data.read_at(offset, buffer),
             Self::Disk(file) => return file.read_at(offset, buffer),
+            Self::Persistent(file) => return file.read_at(offset, buffer),
         };
         let count = data.len().saturating_sub(offset).min(buffer.len());
         if count != 0 {
@@ -38,9 +42,14 @@ impl Executable {
         count
     }
 
+    pub(crate) fn device_id(&self) -> Option<u64> {
+        match self { Self::Persistent(file) => Some(file.dev()), _ => None }
+    }
+
     pub(crate) fn cached_page(&self, offset: usize) -> Option<Arc<FrameTracker>> {
         match self {
             Self::Disk(file) => file.cached_page(offset),
+            Self::Persistent(file) => file.cached_page(offset),
             _ => None,
         }
     }
@@ -63,6 +72,7 @@ pub fn open_executable(name: &str) -> Result<Executable, isize> {
                     Some(OverlayEntry::Whiteout) | None => Err(-2),
                 };
             }
+            MountBackend::Persistent(fs) => return fs.executable(rel, name).map(Executable::Persistent),
             MountBackend::RootOverlay => {}
         }
     }

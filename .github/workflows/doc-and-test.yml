@@ -40,6 +40,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends qemu-system-misc e2fsprogs
           mkdir -p "$RUNNER_TEMP/hexixi-logs"
           printf 'WORK=%s/hexixi-logs\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Run EasyFS host tests
+        if: matrix.arch == 'riscv64' && matrix.harts == 1
+        working-directory: easy-fs
+        run: cargo +stable test
       - name: Build RISC-V64 kernel and fixtures
         if: matrix.arch == 'riscv64'
         run: |
@@ -48,7 +52,8 @@ jobs:
           if [ "$QEMU_SMP" = 2 ]; then smp=1; fi
           make all SMP="$smp" KERNEL_OUT="$WORK/kernel-rv"
           (cd user && cargo build --locked --release \
-            --bin basic_abi_test --bin elf_demand_test --bin smp_test --bin vfs_abi_test)
+            --bin basic_abi_test --bin elf_demand_test --bin smp_test --bin vfs_abi_test \
+            --bin net_abi_test --bin persist_abi_test)
       - name: Run RISC-V64 regression tests
         if: matrix.arch == 'riscv64'
         env:
@@ -57,6 +62,9 @@ jobs:
           python3 -B -m unittest discover -s tools/oscomp/tests -v
           bash tools/oscomp/test_exec_entry.sh riscv64 "$WORK/exec-entry.log"
           bash tools/oscomp/test_vfs_abi.sh riscv64 "$WORK/vfs-abi.log"
+          bash tools/oscomp/test_persistent_fs.sh riscv64 "$WORK"
+          bash tools/oscomp/test_net_abi.sh riscv64 "$WORK/net-abi.log"
+          bash tools/oscomp/test_net_abi.sh --virtio riscv64 "$WORK/net-virtio.log"
           if [ "$QEMU_SMP" = 2 ]; then
             bash tools/oscomp/test_smp.sh "$WORK/smp.log"
           else
@@ -71,9 +79,12 @@ jobs:
         run: |
           make kernel-la LA_KERNEL_OUT="$KERNEL"
           (cd user && RUSTC_BOOTSTRAP=user_lib cargo +1.98.1 build --locked --release \
-            --target loongarch64-unknown-none-softfloat --bin hello_world --bin vfs_abi_test)
+            --target loongarch64-unknown-none-softfloat --bin hello_world --bin vfs_abi_test \
+            --bin net_abi_test --bin persist_abi_test)
           bash tools/oscomp/test_exec_entry.sh loongarch64 "$WORK/exec-entry.log"
           bash tools/oscomp/test_vfs_abi.sh loongarch64 "$WORK/vfs-abi.log"
+          bash tools/oscomp/test_persistent_fs.sh loongarch64 "$WORK"
+          bash tools/oscomp/test_net_abi.sh --virtio loongarch64 "$WORK/net-virtio.log"
           bash tools/oscomp/test_loongarch_boot.sh "$WORK/loongarch-boot.log"
       - uses: actions/upload-artifact@v4
         if: always()

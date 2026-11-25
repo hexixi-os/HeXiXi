@@ -171,7 +171,8 @@ def run_group(args, name, run, kernel):
                 "-bios", "default", "-append", bootargs,
                 "-snapshot", "-drive", drive(args.image, "x0"),
                 "-device", "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
-                "-device", "virtio-net-device,netdev=net", "-netdev", "user,id=net",
+                "-nic", "none", "-device", "virtio-net-device,netdev=net",
+                "-netdev", "user,id=net,restrict=on",
                 "-rtc", "base=utc", "-drive", drive(scratch.name, "x1"),
                 "-device", "virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1",
             ])
@@ -183,6 +184,8 @@ def run_group(args, name, run, kernel):
                 "-drive", drive(args.image, "x0") + ",readonly=on",
                 "-device", "virtio-blk-pci,drive=x0,disable-legacy=on,romfile=",
                 "-nic", "none", "-monitor", "none",
+                "-device", "virtio-net-pci,netdev=net,disable-legacy=on,romfile=",
+                "-netdev", "user,id=net,restrict=on",
             ])
         result_path = directory / "result.json"
         result = {"group": name, "qemu_command": command, "timeout_seconds": args.timeout}

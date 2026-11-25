@@ -160,7 +160,7 @@ pub fn activate_kernel_table(token: usize) {
             high = inout(reg) token => _,
             walk = inout(reg) PWCL => _,
             size = inout(reg) 12usize => _,
-            refill = inout(reg) (__loongarch_refill as usize & PA_MASK) => _,
+            refill = inout(reg) (__loongarch_refill as *const () as usize & PA_MASK) => _,
         );
     }
     flush_tlb();
@@ -223,7 +223,7 @@ extern "C" {
 
 pub fn install_kernel_trap() {
     unsafe {
-        asm!("csrwr {}, 0xc", inout(reg) __loongarch_kernel_trap as usize => _);
+        asm!("csrwr {}, 0xc", inout(reg) __loongarch_kernel_trap as *const () as usize => _);
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::fs::{self, make_pipe, OpenFlags};
 use crate::mm::{
-    read_user, translated_byte_buffer, translated_path, write_user, MapPermission, UserBuffer,
+    read_user, translated_byte_buffer, translated_path, MapPermission, UserBuffer,
 };
 use crate::task::{current_process, current_user_token};
 use alloc::{string::String, sync::Arc};
@@ -9,7 +9,7 @@ const AT_FDCWD: isize = -100;
 const AT_EMPTY_PATH: usize = 0x1000;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 
-fn with_io_file<T>(file: Arc<dyn fs::File>, operation: impl FnOnce(&dyn fs::File) -> T) -> T {
+pub(super) fn with_io_file<T>(file: Arc<dyn fs::File>, operation: impl FnOnce(&dyn fs::File) -> T) -> T {
     let pointer = Arc::as_ptr(&file);
     crate::task::current_task().unwrap().inner_exclusive_access().user_io_file = Some(file);
     // The task pins the file through the syscall. If the thread group exits,
@@ -63,7 +63,7 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
         drop(inner);
         drop(process);
         match translated_byte_buffer(token, buf, len, MapPermission::W) {
-            Some(buffers) => with_io_file(file, |file| file.read(UserBuffer::new(buffers)) as isize),
+            Some(buffers) => with_io_file(file, |file| file.read_result(UserBuffer::new(buffers))),
             None => -14,
         }
     } else {
@@ -416,9 +416,16 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: usize) -> isize {
         .unwrap_or(0)
 }
 
-fn file_by_fd(fd: usize) -> Result<Arc<dyn fs::File + Send + Sync>, isize> {
+pub(super) fn file_by_fd(fd: usize) -> Result<Arc<dyn fs::File + Send + Sync>, isize> {
     current_process().inner_exclusive_access().fd_table.get(fd)
         .and_then(Option::as_ref).cloned().ok_or(-9)
+}
+
+pub fn sys_fsync(fd: usize, filesystem: bool) -> isize {
+    file_by_fd(fd).and_then(|file| {
+        if file.path_only() { return Err(-9); }
+        if filesystem { file.sync_fs() } else { file.sync_range(0, usize::MAX) }
+    }).err().unwrap_or(0)
 }
 
 pub fn sys_fstat(fd: usize, st: *mut u8) -> isize {
@@ -543,6 +550,11 @@ fn write_stat(st: *mut u8, file: &dyn fs::File, fallback_inode: u64) -> isize {
     buf[8..16].copy_from_slice(&inode.to_le_bytes());
     buf[16..20].copy_from_slice(&u32::from(file.mode()).to_le_bytes());
     buf[20..24].copy_from_slice(&file.link_count().to_le_bytes());
+    if let Some((major, minor)) = file.device_numbers() {
+        let rdev = (u64::from(major & 0xfff) << 8) | u64::from(minor & 0xff) |
+            (u64::from(major & !0xfff) << 32) | (u64::from(minor & !0xff) << 12);
+        buf[32..40].copy_from_slice(&rdev.to_le_bytes());
+    }
     buf[48..56].copy_from_slice(&(file.size() as u64).to_le_bytes());
     buf[56..60].copy_from_slice(&4096u32.to_le_bytes());
     write_stat_bytes(st, &buf)
@@ -614,6 +626,10 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: usize, mask: u32, st: *mu
     buf[28..30].copy_from_slice(&file.mode().to_le_bytes());
     buf[32..40].copy_from_slice(&inode.to_le_bytes());
     buf[40..48].copy_from_slice(&(file.size() as u64).to_le_bytes());
+    if let Some((rdev_major, rdev_minor)) = file.device_numbers() {
+        buf[128..132].copy_from_slice(&rdev_major.to_le_bytes());
+        buf[132..136].copy_from_slice(&rdev_minor.to_le_bytes());
+    }
     buf[136..140].copy_from_slice(&major.to_le_bytes());
     buf[140..144].copy_from_slice(&minor.to_le_bytes());
     write_stat_bytes(st, &buf)
@@ -651,6 +667,7 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_GETFD: usize = 1;
     const F_SETFD: usize = 2;
     const F_GETFL: usize = 3;
+    const F_SETFL: usize = 4;
     const F_DUPFD_CLOEXEC: usize = 1030;
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
@@ -695,20 +712,73 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
         }
         F_GETFL => inner.fd_table.get(fd).and_then(Option::as_ref)
-            .map_or(-9, |file| file.path_flags().unwrap_or(0) as isize),
+            .map_or(-9, |file| file.status_flags() as isize),
+        F_SETFL => inner.fd_table.get(fd).and_then(Option::as_ref).map_or(-9, |file| {
+            file.set_status_flags(arg as u32);
+            0
+        }),
         _ => 0,
     }
 }
 
-/// ppoll(73)：内核没有真正的 poll，这里把所有 fd 都标记为可读
-pub fn sys_ppoll(fds: *mut u8, nfds: usize) -> isize {
+pub(super) fn poll_deadline(pointer: usize) -> Result<Option<usize>, isize> {
+    use crate::mm::try_read_user;
+    if pointer == 0 { return Ok(None); }
     let token = current_user_token();
-    for i in 0..nfds {
-        let base = fds as usize + i * 8;
-        let events = read_user(token, (base + 4) as *const u16);
-        write_user(token, (base + 6) as *mut u16, events | 0x1); // POLLIN
+    let seconds = try_read_user(token, pointer as *const i64).ok_or(-14isize)?;
+    let nanos_ptr = pointer.checked_add(8).ok_or(-14isize)?;
+    let nanos = try_read_user(token, nanos_ptr as *const i64).ok_or(-14isize)?;
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) { return Err(-22); }
+    let duration = (seconds as usize).saturating_mul(1_000_000_000).saturating_add(nanos as usize);
+    Ok(Some(crate::timer::get_time_ns().saturating_add(duration)))
+}
+
+pub(super) fn poll_wait(deadline: Option<usize>, mut scan: impl FnMut() -> Result<usize, isize>) -> Result<usize, isize> {
+    loop {
+        let ready = scan()?;
+        if ready != 0 || deadline.map_or(false, |end| crate::timer::get_time_ns() >= end) {
+            return Ok(ready);
+        }
+        crate::net::wait_for_io()?;
     }
-    nfds as isize
+}
+
+pub(super) fn poll_file(file: &dyn fs::File) -> u16 {
+    let ready = file.poll_events();
+    // POLLRDNORM and POLLWRNORM are aliases for normal read/write readiness.
+    ready | ((ready & (1 | 4)) << 6)
+}
+
+pub fn sys_ppoll([fds, nfds, timeout, mask, _mask_size, _]: [usize; 6]) -> isize {
+    use crate::mm::{try_read_user, try_write_user};
+    const POLLERR: u16 = 8;
+    const POLLHUP: u16 = 16;
+    const POLLNVAL: u16 = 32;
+    if nfds > current_process().inner_exclusive_access().nofile_limit { return -22; }
+    if mask != 0 { return -38; }
+    if nfds.checked_mul(8).and_then(|len| fds.checked_add(len)).is_none() { return -14; }
+    let result = (|| {
+        let deadline = poll_deadline(timeout)?;
+        let token = current_user_token();
+        poll_wait(deadline, || {
+            let mut ready = 0;
+            for i in 0..nfds {
+                let base = fds + i * 8;
+                let fd = try_read_user(token, base as *const i32).ok_or(-14isize)?;
+                let events = try_read_user(token, (base + 4) as *const u16).ok_or(-14isize)?;
+                let returned = if fd < 0 {
+                    0
+                } else {
+                    file_by_fd(fd as usize)
+                        .map_or(POLLNVAL, |file| poll_file(file.as_ref()) & (events | POLLERR | POLLHUP))
+                };
+                try_write_user(token, (base + 6) as *mut u16, returned).ok_or(-14isize)?;
+                ready += (returned != 0) as usize;
+            }
+            Ok(ready)
+        })
+    })();
+    result.map_or_else(|error| error, |ready| ready as isize)
 }
 
 /// sendfile(71)：暂不支持，返回 ENOSYS（busybox 会自动回退到 read/write）
@@ -735,18 +805,17 @@ pub fn sys_utimensat(path: *const u8) -> isize {
         .unwrap_or(0)
 }
 
-fn write_statfs(buf: *mut u8, magic: u64) -> isize {
+fn write_statfs(buf: *mut u8, magic: u64, usage: Option<(easy_fs::SpaceUsage, bool)>) -> isize {
+    let (block_size, used, name_max, readonly) = match usage {
+        Some((usage, readonly)) => (easy_fs::BLOCK_SZ as u64, usage, easy_fs::NAME_LENGTH_LIMIT as u64, readonly),
+        None => (4096, easy_fs::SpaceUsage { blocks: 16384, free_blocks: 12000, inodes: 4096, free_inodes: 3000 }, 255, false),
+    };
     let mut b = [0u8; 120];
-    // f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_namelen, f_frsize
-    b[0..8].copy_from_slice(&magic.to_le_bytes());
-    b[8..16].copy_from_slice(&4096u64.to_le_bytes());
-    b[16..24].copy_from_slice(&16384u64.to_le_bytes());
-    b[24..32].copy_from_slice(&12000u64.to_le_bytes());
-    b[32..40].copy_from_slice(&12000u64.to_le_bytes());
-    b[40..48].copy_from_slice(&4096u64.to_le_bytes());
-    b[48..56].copy_from_slice(&3000u64.to_le_bytes());
-    b[64..72].copy_from_slice(&255u64.to_le_bytes());
-    b[72..80].copy_from_slice(&4096u64.to_le_bytes());
+    let values = [magic, block_size, used.blocks, used.free_blocks, used.free_blocks,
+        used.inodes, used.free_inodes, 0, name_max, block_size, u64::from(readonly)];
+    for (slot, value) in b.chunks_exact_mut(8).zip(values) {
+        slot.copy_from_slice(&value.to_le_bytes());
+    }
     write_stat_bytes(buf, &b)
 }
 
@@ -759,10 +828,10 @@ pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {
         } else if !fs::exists(&resolved) {
             return Err(-2);
         }
-        Ok(fs::statfs_magic(&resolved))
+        Ok((fs::statfs_magic(&resolved), fs::space_usage(&resolved)))
     })();
     match result {
-        Ok(magic) => write_statfs(buf, magic),
+        Ok((magic, usage)) => write_statfs(buf, magic, usage),
         Err(errno) => errno,
     }
 }
@@ -779,7 +848,7 @@ pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> isize {
     } else {
         fs::mount::EXT4_MAGIC
     };
-    write_statfs(buf, magic)
+    write_statfs(buf, magic, file.space_usage())
 }
 
 /// lseek(62)：支持 SEEK_SET(0) / SEEK_CUR(1) / SEEK_END(2)
@@ -829,7 +898,7 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
                 None => return -14,
             }
         }
-        with_io_file(file, |file| file.read(UserBuffer::new(buffers)) as isize)
+        with_io_file(file, |file| file.read_result(UserBuffer::new(buffers)))
     } else {
         -1
     }

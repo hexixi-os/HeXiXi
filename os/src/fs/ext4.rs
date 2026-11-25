@@ -20,7 +20,6 @@ const EXTENT_MAGIC: u16 = 0xF30A;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 const SECTOR_SIZE: usize = 512;
 const LOOKUP_CACHE_CAPACITY: usize = 128;
-static NEXT_FS_ID: AtomicUsize = AtomicUsize::new(1);
 static SECTORS_READ: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn sectors_read() -> usize {
@@ -117,7 +116,7 @@ impl Ext4Fs {
             32
         };
         Some(Self {
-            id: NEXT_FS_ID.fetch_add(1, Ordering::Relaxed),
+            id: super::page_cache::new_fs_id(),
             block_size,
             inode_size,
             inode_count,

@@ -3,7 +3,9 @@ target = "riscv64gc-unknown-none-elf"
 
 [target.riscv64gc-unknown-none-elf]
 rustflags = [
-    "-Clink-arg=-Tsrc/linker.ld", "-Cforce-frame-pointers=yes"
+    "-Clink-arg=-Tsrc/linker.ld", "-Cforce-frame-pointers=yes",
+    # virtio-drivers 0.7.0 needs the let-else feature gate on the pinned nightly.
+    "-Zcrate-attr=feature(let_else)",
 ]
 
 [target.loongarch64-unknown-none-softfloat]

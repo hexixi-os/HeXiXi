@@ -211,8 +211,21 @@ impl VmaSpace {
             VmaBacking::File { file, .. } => {
                 file.stat_identity().map_or(false, |(file_dev, _)| file_dev == dev)
             }
+            VmaBacking::Executable { image, .. } => image.source().device_id() == Some(dev),
             _ => false,
         })
+    }
+
+    pub(super) fn sync_files(&self, range: &Range<VirtPageNum>) -> Result<(), isize> {
+        for (&start, area) in self.areas.range(..range.end) {
+            if area.end <= range.start { continue; }
+            if let VmaBacking::File { file, offset, shared: true } = &area.backing {
+                let low = start.max(range.start);
+                let high = area.end.min(range.end);
+                file.sync_range(offset + (low.0 - start.0) * PAGE_SIZE, (high.0 - low.0) * PAGE_SIZE)?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn is_shared_at(&self, vpn: VirtPageNum) -> bool {
