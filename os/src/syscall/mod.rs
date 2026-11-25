@@ -4,6 +4,8 @@ const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_GETDENTS64: usize = 61;
 const SYSCALL_MKDIRAT: usize = 34;
 const SYSCALL_UNLINKAT: usize = 35;
+const SYSCALL_SYMLINKAT: usize = 36;
+const SYSCALL_READLINKAT: usize = 78;
 const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_TRUNCATE: usize = 45;
@@ -165,7 +167,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[0] as isize, args[1] as *const u8, args[2] as isize, args[3] as *const u8,
             if syscall_id == SYSCALL_RENAMEAT2 { args[4] } else { 0 },
         ),
-        SYSCALL_STATFS | SYSCALL_FSTATFS => sys_statfs(args[1] as *mut u8),
+        SYSCALL_STATFS => sys_statfs(args[0] as *const u8, args[1] as *mut u8),
+        SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut u8),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as isize),
         SYSCALL_TRUNCATE => sys_truncate(args[0] as *const u8, args[1] as isize),
         SYSCALL_IOCTL => sys_ioctl(),
@@ -191,7 +194,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_MADVISE | SYSCALL_SET_ROBUST_LIST | SYSCALL_SIGALTSTACK => 0,
         SYSCALL_GET_ROBUST_LIST => 0,
         SYSCALL_GETRUSAGE => sys_getrusage(args[1] as *mut u8),
-        SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1]),
+        SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2] as u32),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2]),
         SYSCALL_RT_SIGTIMEDWAIT => sys_rt_sigtimedwait(
@@ -244,11 +247,18 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_DUP_LEGACY => sys_dup(args[0]),
         SYSCALL_DUP => sys_dup3(args[0], args[1], args[2] as u32),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
-        SYSCALL_MOUNT => sys_mount_stub(),
-        SYSCALL_UMOUNT2 => sys_mount_stub(),
+        SYSCALL_MOUNT => sys_mount(
+            args[0] as *const u8,
+            args[1] as *const u8,
+            args[2] as *const u8,
+            args[3],
+        ),
+        SYSCALL_UMOUNT2 => sys_umount2(args[0] as *const u8, args[1]),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
         SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2]),
+        SYSCALL_SYMLINKAT => sys_symlinkat(args[0] as *const u8, args[1] as isize, args[2] as *const u8),
+        SYSCALL_READLINKAT => sys_readlinkat(args[0] as isize, args[1] as *const u8, args[2] as *mut u8, args[3]),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut u8),
         SYSCALL_OPEN => sys_openat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),

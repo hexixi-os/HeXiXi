@@ -8,6 +8,7 @@ use crate::drivers::block::BLOCK_DEVICE;
 use crate::fs::File;
 use crate::mm::{FrameTracker, UserBuffer};
 use crate::sync::UPSafeCell;
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::string::String;
 use alloc::vec;
@@ -18,6 +19,7 @@ pub const EXT4_MAGIC: u16 = 0xEF53;
 const EXTENT_MAGIC: u16 = 0xF30A;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 const SECTOR_SIZE: usize = 512;
+const LOOKUP_CACHE_CAPACITY: usize = 128;
 static NEXT_FS_ID: AtomicUsize = AtomicUsize::new(1);
 static SECTORS_READ: AtomicUsize = AtomicUsize::new(0);
 
@@ -50,12 +52,15 @@ fn read_at(mut offset: u64, mut buf: &mut [u8]) {
     }
 }
 
+#[derive(Clone)]
 pub struct Inode {
     pub ino: u32,
     pub mode: u16,
     pub size: u64,
     pub blocks: [u8; 60],
     pub flags: u32,
+    pub link_count: u16,
+    inline_symlink: bool,
 }
 
 impl Inode {
@@ -64,6 +69,9 @@ impl Inode {
     }
     pub fn is_file(&self) -> bool {
         self.mode & 0xF000 == 0x8000
+    }
+    pub fn is_symlink(&self) -> bool {
+        self.mode & 0xF000 == 0xA000
     }
 }
 
@@ -77,6 +85,7 @@ pub struct Ext4Fs {
     /// 块组描述符表的起始字节偏移与单个描述符大小
     group_desc_offset: u64,
     group_desc_size: usize,
+    lookup_cache: UPSafeCell<VecDeque<(u32, String, Inode)>>,
 }
 
 enum BlockMapping {
@@ -116,6 +125,7 @@ impl Ext4Fs {
             // 块组描述符表紧跟在超级块所在块之后：(first_data_block + 1) 号块
             group_desc_offset: (first_data_block + 1) * block_size as u64,
             group_desc_size: desc_size,
+            lookup_cache: unsafe { UPSafeCell::new(VecDeque::new()) },
         })
     }
 
@@ -154,12 +164,17 @@ impl Ext4Fs {
         let mut blocks = [0u8; 60];
         blocks.copy_from_slice(&b[40..100]);
         let size = le32(&b, 4) as u64 | ((le32(&b, 108) as u64) << 32);
+        let sectors = u64::from(le32(&b, 28)) | (u64::from(le16(&b, 116)) << 32);
+        let external_xattr = le32(&b, 104) != 0 || le16(&b, 118) != 0;
+        let xattr_sectors = if external_xattr { self.block_size as u64 / 512 } else { 0 };
         Some(Inode {
             ino,
             mode: le16(&b, 0),
             size,
             blocks,
             flags: le32(&b, 32),
+            link_count: le16(&b, 26),
+            inline_symlink: sectors == xattr_sectors,
         })
     }
 
@@ -247,6 +262,23 @@ impl Ext4Fs {
         out
     }
 
+    pub(super) fn read_symlink(&self, inode: &Inode) -> Result<Vec<u8>, isize> {
+        if !(1..4096).contains(&inode.size) {
+            return Err(-5);
+        }
+        let size = inode.size as usize;
+        let target = if inode.inline_symlink {
+            inode.blocks.get(..size).ok_or(-5isize)?.to_vec()
+        } else {
+            self.read_file(inode)
+        };
+        if target.contains(&0) { Err(-5) } else { Ok(target) }
+    }
+
+    pub(super) fn inode_identity(&self, inode: &Inode) -> (u64, u64) {
+        (self.id as u64, u64::from(inode.ino))
+    }
+
     fn file_page(&self, inode: &Inode, index: u64, access: Access) -> Option<Arc<FrameTracker>> {
         let key = FilePageKey {
             fs: self.id,
@@ -316,16 +348,31 @@ impl Ext4Fs {
 
     /// 按路径查找（仅支持绝对路径，逐级目录）
     pub fn lookup(&self, path: &str) -> Option<Inode> {
-        let mut cur = self.inode(2)?;
+        let mut cur = self.lookup_cached(0, "", || self.inode(2))?;
         for part in path.split('/').filter(|s| !s.is_empty()) {
             if !cur.is_dir() {
                 return None;
             }
-            let entries = self.list_dir(&cur);
-            let (_, ino, _) = entries.iter().find(|(n, _, _)| n == part)?;
-            cur = self.inode(*ino)?;
+            cur = self.lookup_cached(cur.ino, part, || {
+                let entries = self.list_dir(&cur);
+                let (_, ino, _) = entries.iter().find(|(name, _, _)| name == part)?;
+                self.inode(*ino)
+            })?;
         }
         Some(cur)
+    }
+
+    fn lookup_cached(&self, parent: u32, name: &str, load: impl FnOnce() -> Option<Inode>) -> Option<Inode> {
+        let mut cache = self.lookup_cache.exclusive_access();
+        if let Some((_, _, inode)) = cache.iter().find(|(dir, child, _)| *dir == parent && child == name) {
+            return Some(inode.clone());
+        }
+        let inode = load()?;
+        if cache.len() == LOOKUP_CACHE_CAPACITY {
+            cache.pop_front();
+        }
+        cache.push_back((parent, String::from(name), inode.clone()));
+        Some(inode)
     }
 }
 
@@ -394,7 +441,7 @@ impl Ext4File {
 
 impl File for Ext4File {
     fn stat_identity(&self) -> Option<(u64, u64)> {
-        Some((self.fs.id as u64, self.inode.ino as u64))
+        Some(self.fs.inode_identity(&self.inode))
     }
 
     fn readable(&self) -> bool {

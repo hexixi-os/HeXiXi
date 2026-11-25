@@ -9,6 +9,7 @@ use crate::mm::{write_user, MemorySet, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use alloc::collections::BTreeSet;
@@ -39,6 +40,8 @@ pub struct ProcessControlBlockInner {
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
     /// 当前工作目录
     pub cwd: DirectoryLocation,
+    pub executable: Option<String>,
+    pub cmdline: Option<Arc<[u8]>>,
     /// 堆起始（可增长下界）
     pub brk_base: usize,
     /// 当前 program break
@@ -122,7 +125,7 @@ impl ProcessControlBlock {
         self.inner.try_exclusive_access()
     }
 
-    pub fn new(source: Executable) -> Arc<Self> {
+    pub fn new(source: Executable, executable: Option<&str>) -> Arc<Self> {
         let (memory_set, elf) = MemorySet::from_elf(source).expect("invalid initial executable");
         // allocate a pid
         let pid_handle = pid_alloc();
@@ -153,6 +156,8 @@ impl ProcessControlBlock {
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
                     cwd: DirectoryLocation::root(),
+                    executable: executable.map(String::from),
+                    cmdline: None,
                     brk_base: 0,
                     brk: 0,
                     mmap_top: 0x1000_0000,
@@ -202,9 +207,11 @@ impl ProcessControlBlock {
 
     #[cfg(feature = "oscomp_runner")]
     pub(super) fn set_initial_args(&self, args: &[&str]) {
-        let inner = self.inner_exclusive_access();
+        let mut inner = self.inner_exclusive_access();
         let token = inner.get_user_token();
         let task = inner.get_task(0);
+        inner.cmdline = Some(args.iter().flat_map(|arg| arg.bytes().chain(core::iter::once(0)))
+            .take(PAGE_SIZE).collect::<Vec<_>>().into());
         drop(inner);
         let inner = task.inner_exclusive_access();
         let stack_top = inner.res.as_ref().unwrap().ustack_top();
@@ -285,6 +292,9 @@ impl ProcessControlBlock {
             pinner.brk_base = heap_base;
             pinner.brk = heap_base;
             pinner.mmap_top = 0x1000_0000;
+            pinner.executable = Some(String::from(path));
+            pinner.cmdline = Some(args.iter().flat_map(|arg| arg.iter().copied().chain(core::iter::once(0)))
+                .take(PAGE_SIZE).collect::<Vec<_>>().into());
             pinner.legacy_thread_exit = true;
             for fd in core::mem::take(&mut pinner.close_on_exec) {
                 pinner.fd_table[fd] = None;
@@ -451,6 +461,8 @@ impl ProcessControlBlock {
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
                     cwd: parent.cwd.clone(),
+                    executable: parent.executable.clone(),
+                    cmdline: parent.cmdline.clone(),
                     brk_base: 0,
                     brk: 0,
                     mmap_top: 0x1000_0000,

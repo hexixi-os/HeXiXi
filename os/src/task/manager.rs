@@ -65,6 +65,10 @@ pub fn pid2process(pid: usize) -> Option<Arc<ProcessControlBlock>> {
     map.get(&pid).map(Arc::clone)
 }
 
+pub(crate) fn process_ids() -> alloc::vec::Vec<usize> {
+    PID2PCB.exclusive_access().keys().copied().collect()
+}
+
 pub fn tid2task(tid: usize) -> Option<Arc<TaskControlBlock>> {
     PID2PCB.exclusive_access().values().find_map(|process| {
         process.inner_exclusive_access().tasks.iter().flatten()
@@ -89,4 +93,41 @@ pub(crate) fn invalidate_file_pages(identity: (u64, u64), first_invalid: usize) 
     for process in PID2PCB.exclusive_access().values() {
         process.inner_exclusive_access().memory_set.invalidate_file_pages(identity, first_invalid);
     }
+}
+
+fn path_within_mount(path: &str, target: &str) -> bool {
+    path == target
+        || path
+            .strip_prefix(target)
+            .map_or(false, |rest| rest.starts_with('/'))
+}
+
+pub(crate) fn mount_is_busy(target: &str, dev: Option<u64>) -> bool {
+    for process in PID2PCB.exclusive_access().values() {
+        let inner = process.inner_exclusive_access();
+        if inner.is_zombie {
+            continue;
+        }
+        if path_within_mount(&inner.cwd.path(), target) {
+            return true;
+        }
+        if let Some(dev) = dev {
+            if inner.memory_set.has_device_mapping(dev) {
+                return true;
+            }
+        }
+        for file in inner.fd_table.iter().flatten() {
+            if let Some(dev) = dev {
+                if file.stat_identity().map_or(false, |(file_dev, _)| file_dev == dev) {
+                    return true;
+                }
+            }
+            if let Some(directory) = file.directory() {
+                if path_within_mount(&directory.location().path(), target) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }

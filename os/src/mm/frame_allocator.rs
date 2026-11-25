@@ -160,3 +160,8 @@ pub fn frame_dealloc(ppn: PhysPageNum) {
     #[cfg(feature = "elf_startup_stats")]
     crate::fork_stats::on_frame_free();
 }
+
+pub(crate) fn free_frame_count() -> usize {
+    let allocator = FRAME_ALLOCATOR.exclusive_access();
+    allocator.end - allocator.current + allocator.recycled.len()
+}

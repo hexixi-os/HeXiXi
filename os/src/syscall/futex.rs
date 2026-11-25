@@ -1,12 +1,17 @@
-use crate::mm::try_read_user;
+use crate::mm::{futex_phys_addr, try_read_user, UserValue, VirtAddr};
 use crate::sync::UPSafeCell;
 use crate::task::{
-    add_task, block_current_and_run_next, current_task, current_user_token, TaskControlBlock,
+    add_task, block_current_and_run_next, current_process, current_task, current_user_token,
+    TaskControlBlock,
 };
 use alloc::{collections::VecDeque, sync::Arc};
 use lazy_static::lazy_static;
 
-type Key = (usize, usize);
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum Key {
+    Private { token: usize, address: usize },
+    Shared { phys: usize },
+}
 
 struct Waiter {
     key: Key,
@@ -17,6 +22,23 @@ struct Waiter {
 
 lazy_static! {
     static ref WAITERS: UPSafeCell<VecDeque<Waiter>> = unsafe { UPSafeCell::new(VecDeque::new()) };
+}
+
+fn is_shared_mapping(token: usize, address: usize) -> bool {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    inner.memory_set.token() == token && inner.memory_set.is_shared_at(VirtAddr::from(address).floor())
+}
+
+fn resolve_futex_word(token: usize, address: usize, private: bool) -> Option<(Key, u32)> {
+    let pa = futex_phys_addr(token, address)?;
+    let word = unsafe { u32::load(pa.kernel_address() as *const u32) };
+    let key = if !private && is_shared_mapping(token, address) {
+        Key::Shared { phys: pa.0 }
+    } else {
+        Key::Private { token, address }
+    };
+    Some((key, word))
 }
 
 fn resume(waiter: Waiter, result: isize) {
@@ -40,12 +62,20 @@ fn wake_matching(waiters: &mut VecDeque<Waiter>, key: Key, count: usize, bits: u
 }
 
 pub(crate) fn wake_one(token: usize, address: usize) {
-    wake_matching(
-        &mut WAITERS.exclusive_access(),
-        (token, address),
-        1,
-        u32::MAX,
-    );
+    let shared_key = (!is_shared_mapping(token, address))
+        .then_some(())
+        .map_or_else(
+            || futex_phys_addr(token, address).map(|pa| Key::Shared { phys: pa.0 }),
+            |()| None,
+        );
+    let private_key = Key::Private { token, address };
+    let mut waiters = WAITERS.exclusive_access();
+    if let Some(shared) = shared_key {
+        if wake_matching(&mut waiters, shared, 1, u32::MAX) > 0 {
+            return;
+        }
+    }
+    wake_matching(&mut waiters, private_key, 1, u32::MAX);
 }
 
 pub(crate) fn remove_task(task: &Arc<TaskControlBlock>) {
@@ -98,8 +128,10 @@ pub(super) fn sys_futex([address, op, value, arg4, address2, arg6]: [usize; 6]) 
     const CMP_REQUEUE: usize = 4;
     const WAIT_BITSET: usize = 9;
     const WAKE_BITSET: usize = 10;
+    const PRIVATE_FLAG: usize = 128;
     const CLOCK_REALTIME: usize = 256;
-    let command = op & !384; // Strip FUTEX_PRIVATE_FLAG and FUTEX_CLOCK_REALTIME.
+    let private = op & PRIVATE_FLAG != 0;
+    let command = op & !(PRIVATE_FLAG | CLOCK_REALTIME);
     if op & CLOCK_REALTIME != 0 && command != WAIT_BITSET {
         return -38;
     }
@@ -107,7 +139,6 @@ pub(super) fn sys_futex([address, op, value, arg4, address2, arg6]: [usize; 6]) 
         return -22;
     }
     let token = current_user_token();
-    let key = (token, address);
     let bits = if matches!(command, WAIT_BITSET | WAKE_BITSET) {
         arg6 as u32
     } else {
@@ -118,8 +149,8 @@ pub(super) fn sys_futex([address, op, value, arg4, address2, arg6]: [usize; 6]) 
     }
     match command {
         WAIT | WAIT_BITSET => {
-            let word = match try_read_user(token, address as *const u32) {
-                Some(word) => word,
+            let (key, word) = match resolve_futex_word(token, address, private) {
+                Some(resolved) => resolved,
                 None => return -14,
             };
             if word != value as u32 {
@@ -135,8 +166,7 @@ pub(super) fn sys_futex([address, op, value, arg4, address2, arg6]: [usize; 6]) 
             if super::signal::alarm_interrupts() {
                 return -4;
             }
-            // On one hart with interrupts masked in the kernel, no task can
-            // modify the word or wake this waiter before it blocks.
+            // Kernel entry is serialized and interrupts stay masked, so no wake can slip in before blocking.
             WAITERS.exclusive_access().push_back(Waiter {
                 key,
                 bits,
@@ -157,26 +187,32 @@ pub(super) fn sys_futex([address, op, value, arg4, address2, arg6]: [usize; 6]) 
             {
                 return -22;
             }
-            let word = match try_read_user(token, address as *const u32) {
-                Some(word) => word,
+            let (key, word) = match resolve_futex_word(token, address, private) {
+                Some(resolved) => resolved,
                 None => return -14,
             };
             if command == CMP_REQUEUE && word != arg6 as u32 {
                 return -11;
             }
-            if requeue && try_read_user(token, address2 as *const u32).is_none() {
-                return -14;
-            }
+            let target_key = if requeue {
+                match resolve_futex_word(token, address2, private) {
+                    Some((key2, _)) if key2 == key => return -22,
+                    Some((key2, _)) => Some(key2),
+                    None => return -14,
+                }
+            } else {
+                None
+            };
             let mut waiters = WAITERS.exclusive_access();
             let woken = wake_matching(&mut waiters, key, count as usize, bits);
             let mut moved = 0;
-            if requeue {
+            if let Some(key2) = target_key {
                 for waiter in waiters
                     .iter_mut()
                     .filter(|waiter| waiter.key == key)
                     .take(arg4 as u32 as usize)
                 {
-                    waiter.key = (token, address2);
+                    waiter.key = key2;
                     moved += 1;
                 }
             }

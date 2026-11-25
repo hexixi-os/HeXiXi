@@ -2,7 +2,7 @@ mod sbi;
 #[cfg(feature = "smp")]
 mod smp;
 #[cfg(feature = "smp")]
-pub(crate) use smp::{boot as boot_smp, next_hart, MAX_HARTS};
+pub(crate) use smp::{boot as boot_smp, next_hart, online_hart_mask, MAX_HARTS};
 
 pub use sbi::{console_getchar, console_putchar, set_timer, shutdown};
 

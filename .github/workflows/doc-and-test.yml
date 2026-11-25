@@ -1,4 +1,4 @@
-name: Build Kernel
+name: Build and Test Kernel
 
 on: [push, pull_request]
 
@@ -6,18 +6,77 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-riscv64:
-    runs-on: ubuntu-latest
+  qemu:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            harts: 1
+          - arch: riscv64
+            harts: 2
+          - arch: loongarch64
+            harts: 1
+    name: ${{ matrix.arch }} / ${{ matrix.harts }} hart(s)
+    env:
+      QEMU_SMP: ${{ matrix.harts }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly-2022-08-05
+      - if: matrix.arch == 'riscv64'
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2022-08-05
           components: rust-src, llvm-tools-preview
           targets: riscv64gc-unknown-none-elf
-      - name: Check RISC-V64 single-core & SMP
+      - if: matrix.arch == 'loongarch64'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          targets: loongarch64-unknown-none-softfloat
+      - name: Install QEMU and EXT4 tools
         run: |
-          cd user && cargo build --release --bin oscomp_runner
-          cd ../os && cp src/linker-qemu.ld src/linker.ld
-          cargo build --release --features "board_qemu oscomp_runner"
-          cargo build --release --features "board_qemu oscomp_runner smp"
-          rm -f src/linker.ld
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-misc e2fsprogs
+          mkdir -p "$RUNNER_TEMP/hexixi-logs"
+          printf 'WORK=%s/hexixi-logs\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Build RISC-V64 kernel and fixtures
+        if: matrix.arch == 'riscv64'
+        run: |
+          cargo +stable install cargo-binutils --version 0.3.3 --locked
+          smp=0
+          if [ "$QEMU_SMP" = 2 ]; then smp=1; fi
+          make all SMP="$smp" KERNEL_OUT="$WORK/kernel-rv"
+          (cd user && cargo build --locked --release \
+            --bin basic_abi_test --bin elf_demand_test --bin smp_test --bin vfs_abi_test)
+      - name: Run RISC-V64 regression tests
+        if: matrix.arch == 'riscv64'
+        env:
+          KERNEL: ${{ runner.temp }}/hexixi-logs/kernel-rv
+        run: |
+          python3 -B -m unittest discover -s tools/oscomp/tests -v
+          bash tools/oscomp/test_exec_entry.sh riscv64 "$WORK/exec-entry.log"
+          bash tools/oscomp/test_vfs_abi.sh riscv64 "$WORK/vfs-abi.log"
+          if [ "$QEMU_SMP" = 2 ]; then
+            bash tools/oscomp/test_smp.sh "$WORK/smp.log"
+          else
+            bash tools/oscomp/test_ext4.sh
+            bash tools/oscomp/test_basic_abi.sh "$WORK/basic-abi.log"
+            bash tools/oscomp/test_elf_demand.sh "$WORK/elf-demand.log"
+          fi
+      - name: Build and run LoongArch64 regression tests
+        if: matrix.arch == 'loongarch64'
+        env:
+          KERNEL: ${{ runner.temp }}/hexixi-logs/kernel-la
+        run: |
+          make kernel-la LA_KERNEL_OUT="$KERNEL"
+          (cd user && RUSTC_BOOTSTRAP=user_lib cargo +1.98.1 build --locked --release \
+            --target loongarch64-unknown-none-softfloat --bin hello_world --bin vfs_abi_test)
+          bash tools/oscomp/test_exec_entry.sh loongarch64 "$WORK/exec-entry.log"
+          bash tools/oscomp/test_vfs_abi.sh loongarch64 "$WORK/vfs-abi.log"
+          bash tools/oscomp/test_loongarch_boot.sh "$WORK/loongarch-boot.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qemu-${{ matrix.arch }}-${{ matrix.harts }}
+          path: ${{ runner.temp }}/hexixi-logs/*.log

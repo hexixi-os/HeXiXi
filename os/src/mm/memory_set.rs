@@ -139,6 +139,14 @@ impl MemorySet {
         })
     }
 
+    pub(crate) fn has_device_mapping(&self, dev: u64) -> bool {
+        self.vmas.has_device_mapping(dev)
+    }
+
+    pub(crate) fn is_shared_at(&self, vpn: VirtPageNum) -> bool {
+        self.vmas.is_shared_at(vpn)
+    }
+
     pub fn munmap(&mut self, range: Range<VirtPageNum>) -> Result<(), isize> {
         // ELF segments and task resources follow their existing allocation lifecycle.
         if self.framed_overlap_end(&range).is_some() || self.vmas.overlaps_executable(&range) {

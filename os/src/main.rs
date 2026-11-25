@@ -78,6 +78,7 @@ pub fn rust_main() -> ! {
     if !is_ext4 {
         fs::list_apps();
     }
+    fs::init_runtime_dirs();
     task::add_initproc(boot.oscomp_group());
     task::run_tasks()
 }

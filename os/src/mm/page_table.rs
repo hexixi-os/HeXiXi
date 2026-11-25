@@ -298,8 +298,7 @@ pub fn translated_byte_buffer(
 
 /// Require a NUL terminator before returning a path to a filesystem operation.
 pub fn translated_path(token: usize, ptr: *const u8) -> Result<String, isize> {
-    read_user_string(token, ptr, |s: &mut String, byte| s.push(char::from(byte)))
-        .map_err(|(_, errno)| errno)
+    String::from_utf8(translated_c_bytes(token, ptr)?).map_err(|_| -84)
 }
 
 pub(crate) fn translated_c_bytes(token: usize, ptr: *const u8) -> Result<Vec<u8>, isize> {
@@ -349,6 +348,10 @@ fn typed_user_addr<T>(token: usize, va: usize, access: MapPermission) -> Option<
         return None;
     }
     checked_phys_addr(token, va, page_table.translate_va(VirtAddr::from(va))?)
+}
+
+pub(crate) fn futex_phys_addr(token: usize, va: usize) -> Option<PhysAddr> {
+    typed_user_addr::<u32>(token, va, MapPermission::R)
 }
 
 pub(crate) fn read_user<T: UserValue>(token: usize, ptr: *const T) -> T {

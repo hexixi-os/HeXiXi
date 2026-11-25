@@ -206,6 +206,19 @@ impl VmaSpace {
             .any(|(_, area)| matches!(area.backing, VmaBacking::Executable { .. }))
     }
 
+    pub(super) fn has_device_mapping(&self, dev: u64) -> bool {
+        self.areas.values().any(|area| match &area.backing {
+            VmaBacking::File { file, .. } => {
+                file.stat_identity().map_or(false, |(file_dev, _)| file_dev == dev)
+            }
+            _ => false,
+        })
+    }
+
+    pub(super) fn is_shared_at(&self, vpn: VirtPageNum) -> bool {
+        Self::covering(&self.areas, vpn).map_or(false, |(_, area)| area.backing.is_shared())
+    }
+
     fn split(&mut self, vpn: VirtPageNum) {
         if let Some((start, area)) = Self::covering(&self.areas, vpn) {
             if start < vpn {

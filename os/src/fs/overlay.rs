@@ -1,4 +1,4 @@
-use super::{ext4::Ext4File, File, OpenFlags};
+use super::{ext4::Ext4File, symlink::Symlink, File, OpenFlags};
 use crate::config::PAGE_SIZE;
 use crate::mm::{
     copy_live_bytes, frame_alloc_charged, ram_end, zero_live_bytes, FrameTracker, UserBuffer,
@@ -8,7 +8,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 
 pub(super) type OverlayData = Arc<UPSafeCell<OverlayContents>>;
@@ -16,7 +16,10 @@ const MAX_DATA_PAGES: usize = 128 * 1024 * 1024 / PAGE_SIZE;
 const MAX_ENTRIES: usize = 16_384;
 const MAX_PATH_BYTES: usize = 2 * 1024 * 1024;
 static OVERLAY_INODES: AtomicUsize = AtomicUsize::new(0);
-const OVERLAY_DEVICE: u64 = 1 << 32;
+static SYMLINK_BYTES: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_PATH_BYTES: AtomicUsize = AtomicUsize::new(0);
+pub(super) const OVERLAY_DEVICE: u64 = 1 << 32;
+static NEXT_DEVICE: AtomicU64 = AtomicU64::new(2);
 static OVERLAY_PAGES: AtomicUsize = AtomicUsize::new(0);
 static NEXT_INODE: AtomicUsize = AtomicUsize::new(2);
 
@@ -25,16 +28,42 @@ fn data_page_limit() -> usize {
     MAX_DATA_PAGES.min(ram_pages / 4)
 }
 
+fn next_device() -> u64 {
+    NEXT_DEVICE.fetch_add(1, Ordering::Relaxed) << 32
+}
+
 pub(super) struct OverlayDirectory {
+    dev: u64,
+    mount_prefix: String,
+    mounted: Arc<AtomicBool>,
+    detached: AtomicBool,
     pub(super) path: UPSafeCell<String>,
     pub(super) ino: u32,
-    _charge: InodeCharge,
+    _charge: Option<InodeCharge>,
+}
+
+impl OverlayDirectory {
+    pub(super) fn full_path(&self) -> String {
+        let rel = self.path.exclusive_access();
+        if self.mount_prefix.is_empty() {
+            rel.clone()
+        } else if rel.is_empty() {
+            self.mount_prefix.clone()
+        } else {
+            alloc::format!("{}/{}", self.mount_prefix, rel.as_str())
+        }
+    }
+
+    pub(super) fn is_live(&self) -> bool {
+        !self.detached.load(Ordering::Relaxed) && self.mounted.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Clone)]
 pub(super) enum OverlayEntry {
     File(OverlayData),
     Directory(Arc<OverlayDirectory>),
+    Symlink(Arc<Symlink>),
     Whiteout,
 }
 
@@ -43,13 +72,14 @@ impl OverlayEntry {
         match self {
             Self::File(data) => Some((data.exclusive_access().ino, 1)),
             Self::Directory(dir) => Some((dir.ino, 2)),
+            Self::Symlink(link) => link.stat_identity().map(|(_, ino)| (ino as u32, 7)),
             Self::Whiteout => None,
         }
     }
 }
 
 pub(super) fn directory_identity(dir: &OverlayDirectory) -> (u64, u64) {
-    (OVERLAY_DEVICE, u64::from(dir.ino))
+    (dir.dev, u64::from(dir.ino))
 }
 
 fn next_inode() -> u32 {
@@ -57,6 +87,33 @@ fn next_inode() -> u32 {
 }
 
 struct InodeCharge;
+
+pub(super) struct SymlinkCharge {
+    bytes: usize,
+    _inode: InodeCharge,
+}
+
+impl SymlinkCharge {
+    pub(super) fn new(bytes: usize) -> Result<Self, isize> {
+        let inode = InodeCharge::new()?;
+        SYMLINK_BYTES
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes)
+                    .filter(|&total| total <= MAX_PATH_BYTES)
+            })
+            .map_err(|_| -28isize)?;
+        Ok(Self {
+            bytes,
+            _inode: inode,
+        })
+    }
+}
+
+impl Drop for SymlinkCharge {
+    fn drop(&mut self) {
+        SYMLINK_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
 
 impl InodeCharge {
     fn new() -> Result<Self, isize> {
@@ -83,7 +140,10 @@ struct Namespace {
 
 impl Namespace {
     fn check_capacity(&self, count: usize, bytes: usize) -> Result<(), isize> {
-        if count > MAX_ENTRIES || bytes > MAX_PATH_BYTES {
+        let other_bytes = TOTAL_PATH_BYTES
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.path_bytes);
+        if count > MAX_ENTRIES || other_bytes.saturating_add(bytes) > MAX_PATH_BYTES {
             Err(-28)
         } else {
             Ok(())
@@ -101,6 +161,7 @@ impl Namespace {
     fn remove(&mut self, path: &str) -> Option<OverlayEntry> {
         let entry = self.entries.remove(path)?;
         self.path_bytes -= path.len();
+        TOTAL_PATH_BYTES.fetch_sub(path.len(), Ordering::Relaxed);
         Some(entry)
     }
 
@@ -109,35 +170,282 @@ impl Namespace {
         let previous = self.entries.insert(path, entry);
         if previous.is_none() {
             self.path_bytes += bytes;
+            TOTAL_PATH_BYTES.fetch_add(bytes, Ordering::Relaxed);
         }
         previous
+    }
+
+    fn clear(&mut self) -> Vec<OverlayEntry> {
+        let bytes = core::mem::replace(&mut self.path_bytes, 0);
+        if bytes != 0 {
+            TOTAL_PATH_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+        }
+        core::mem::take(&mut self.entries)
+            .into_values()
+            .collect()
+    }
+}
+
+impl Drop for Namespace {
+    fn drop(&mut self) {
+        let bytes = core::mem::replace(&mut self.path_bytes, 0);
+        if bytes != 0 {
+            TOTAL_PATH_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(super) struct MemFs {
+    dev: u64,
+    magic: u64,
+    mount_prefix: String,
+    mounted: Arc<AtomicBool>,
+    root: Arc<OverlayDirectory>,
+    entries: UPSafeCell<Namespace>,
+}
+
+impl MemFs {
+    fn new_root_overlay() -> Self {
+        let mounted = Arc::new(AtomicBool::new(true));
+        let root = Arc::new(OverlayDirectory {
+            dev: OVERLAY_DEVICE,
+            mount_prefix: String::new(),
+            mounted: Arc::clone(&mounted),
+            detached: AtomicBool::new(false),
+            path: unsafe { UPSafeCell::new(String::new()) },
+            ino: 1,
+            _charge: None,
+        });
+        Self {
+            dev: OVERLAY_DEVICE,
+            magic: 0xef53,
+            mount_prefix: String::new(),
+            mounted,
+            root,
+            entries: unsafe { UPSafeCell::new(Namespace::default()) },
+        }
+    }
+
+    pub(super) fn new_mountable(mount_prefix: &str, magic: u64) -> Result<Arc<Self>, isize> {
+        let charge = InodeCharge::new()?;
+        let dev = next_device();
+        let mounted = Arc::new(AtomicBool::new(true));
+        let root = Arc::new(OverlayDirectory {
+            dev,
+            mount_prefix: String::from(mount_prefix),
+            mounted: Arc::clone(&mounted),
+            detached: AtomicBool::new(false),
+            path: unsafe { UPSafeCell::new(String::new()) },
+            ino: next_inode(),
+            _charge: Some(charge),
+        });
+        Ok(Arc::new(Self {
+            dev,
+            magic,
+            mount_prefix: String::from(mount_prefix),
+            mounted,
+            root,
+            entries: unsafe { UPSafeCell::new(Namespace::default()) },
+        }))
+    }
+
+    pub(super) fn dev(&self) -> u64 {
+        self.dev
+    }
+
+    pub(super) fn magic(&self) -> u64 {
+        self.magic
+    }
+
+    pub(super) fn root_ino(&self) -> u32 {
+        self.root.ino
+    }
+
+    pub(super) fn root_dir(&self) -> Arc<OverlayDirectory> {
+        Arc::clone(&self.root)
+    }
+
+    pub(super) fn unmount(&self) {
+        self.mounted.store(false, Ordering::Relaxed);
+        let removed = self.entries.exclusive_access().clear();
+        for entry in removed {
+            detach(Some(entry));
+        }
+    }
+
+    pub(super) fn get(&self, name: &str) -> Option<OverlayEntry> {
+        self.entries.exclusive_access().entries.get(name).cloned()
+    }
+
+    pub(super) fn new_file(&self, lower: Option<Ext4File>, linked: bool) -> Result<OverlayData, isize> {
+        new_file_with_dev(self.dev, lower, linked)
+    }
+
+    pub(super) fn create(&self, name: &str, lower: Option<Ext4File>) -> Result<OverlayData, isize> {
+        let mut entries = self.entries.exclusive_access();
+        if let Some(OverlayEntry::File(data)) = entries.entries.get(name) {
+            return Ok(data.clone());
+        }
+        entries.check_insert(name)?;
+        let data = new_file_with_dev(self.dev, lower, true)?;
+        entries.insert(String::from(name), OverlayEntry::File(data.clone()));
+        Ok(data)
+    }
+
+    pub(super) fn mkdir(&self, name: &str) -> Result<(), isize> {
+        let mut entries = self.entries.exclusive_access();
+        entries.check_insert(name)?;
+        let directory = Arc::new(OverlayDirectory {
+            dev: self.dev,
+            mount_prefix: self.mount_prefix.clone(),
+            mounted: Arc::clone(&self.mounted),
+            detached: AtomicBool::new(false),
+            path: unsafe { UPSafeCell::new(String::from(name)) },
+            ino: next_inode(),
+            _charge: Some(InodeCharge::new()?),
+        });
+        entries.insert(String::from(name), OverlayEntry::Directory(directory));
+        Ok(())
+    }
+
+    pub(super) fn symlink(&self, name: &str, target: Vec<u8>) -> Result<(), isize> {
+        let mut entries = self.entries.exclusive_access();
+        entries.check_insert(name)?;
+        let charge = SymlinkCharge::new(target.len())?;
+        let link = Arc::new(Symlink::new(
+            target,
+            Some((self.dev, u64::from(next_inode()))),
+            Some(charge),
+        ));
+        entries.insert(String::from(name), OverlayEntry::Symlink(link));
+        Ok(())
+    }
+
+    pub(super) fn unlink(&self, name: &str, hide_lower: bool, directory: bool) -> Result<(), isize> {
+        let mut entries = self.entries.exclusive_access();
+        let children = if directory {
+            child_paths(&entries.entries, name)
+        } else {
+            Vec::new()
+        };
+        if hide_lower && !entries.entries.contains_key(name) {
+            let child_bytes = children.iter().map(String::len).sum::<usize>();
+            entries.check_capacity(
+                entries.entries.len() - children.len() + 1,
+                entries.path_bytes - child_bytes + name.len(),
+            )?;
+        }
+        for child in children {
+            detach(entries.remove(&child));
+        }
+        detach(entries.remove(name));
+        if hide_lower {
+            entries.insert(String::from(name), OverlayEntry::Whiteout);
+        }
+        Ok(())
+    }
+
+    pub(super) fn rename(
+        &self,
+        old: &str,
+        new: &str,
+        source: OverlayEntry,
+        hide_lower: bool,
+    ) -> Result<(), isize> {
+        let mut entries = self.entries.exclusive_access();
+        let removes_source = usize::from(entries.entries.contains_key(old));
+        let adds_destination = usize::from(!entries.entries.contains_key(new));
+        let whiteout = usize::from(hide_lower);
+        let final_count = entries.entries.len() - removes_source + adds_destination + whiteout;
+        let final_bytes = entries.path_bytes - removes_source * old.len()
+            + adds_destination * new.len()
+            + whiteout * old.len();
+        if let OverlayEntry::Directory(dir) = &source {
+            let destination_children = child_paths(&entries.entries, new);
+            let paths = child_paths(&entries.entries, old);
+            let prefix_extra = if self.mount_prefix.is_empty() {
+                0
+            } else {
+                self.mount_prefix.len() + 1
+            };
+            if paths
+                .iter()
+                .any(|path| prefix_extra + new.len() + path.len() - old.len() >= 4096)
+            {
+                return Err(-36);
+            }
+            let replaced_bytes = destination_children.iter().map(String::len).sum::<usize>();
+            entries.check_capacity(
+                final_count - destination_children.len(),
+                final_bytes - replaced_bytes - paths.len() * old.len() + paths.len() * new.len(),
+            )?;
+            for path in destination_children {
+                detach(entries.remove(&path));
+            }
+            *dir.path.exclusive_access() = String::from(new);
+            for old_path in paths {
+                let new_path = alloc::format!("{}{}", new, &old_path[old.len()..]);
+                let child = entries.remove(&old_path).unwrap();
+                if let OverlayEntry::Directory(dir) = &child {
+                    *dir.path.exclusive_access() = new_path.clone();
+                }
+                entries.insert(new_path, child);
+            }
+        } else {
+            entries.check_capacity(final_count, final_bytes)?;
+        }
+        entries.remove(old);
+        if hide_lower {
+            entries.insert(String::from(old), OverlayEntry::Whiteout);
+        }
+        detach(entries.insert(String::from(new), source));
+        Ok(())
+    }
+
+    pub(super) fn children(&self, directory: &str) -> BTreeMap<String, OverlayEntry> {
+        let mut prefix = String::from(directory);
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        self.entries
+            .exclusive_access()
+            .entries
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+            .filter_map(|(path, entry)| {
+                let child = &path[prefix.len()..];
+                (!child.contains('/')).then(|| (String::from(child), entry.clone()))
+            })
+            .collect()
     }
 }
 
 lazy_static! {
-    static ref OVERLAY: UPSafeCell<Namespace> = unsafe { UPSafeCell::new(Namespace::default()) };
+    static ref OVERLAY: MemFs = MemFs::new_root_overlay();
 }
 
 pub(super) fn overlay_get(name: &str) -> Option<OverlayEntry> {
-    OVERLAY.exclusive_access().entries.get(name).cloned()
+    OVERLAY.get(name)
 }
 
 pub(super) fn overlay_create(name: &str, lower: Option<Ext4File>) -> Result<OverlayData, isize> {
-    let mut entries = OVERLAY.exclusive_access();
-    if let Some(OverlayEntry::File(data)) = entries.entries.get(name) {
-        return Ok(data.clone());
-    }
-    entries.check_insert(name)?;
-    let data = new_file(lower, true)?;
-    entries.insert(String::from(name), OverlayEntry::File(data.clone()));
-    Ok(data)
+    OVERLAY.create(name, lower)
 }
 
 pub(super) fn new_file(lower: Option<Ext4File>, linked: bool) -> Result<OverlayData, isize> {
+    new_file_with_dev(OVERLAY_DEVICE, lower, linked)
+}
+
+fn new_file_with_dev(
+    dev: u64,
+    lower: Option<Ext4File>,
+    linked: bool,
+) -> Result<OverlayData, isize> {
     let charge = InodeCharge::new()?;
     let len = lower.as_ref().map_or(0, Ext4File::len);
     Ok(Arc::new(unsafe {
         UPSafeCell::new(OverlayContents {
+            dev,
             ino: next_inode(),
             linked,
             _charge: charge,
@@ -152,21 +460,21 @@ pub(super) fn new_file(lower: Option<Ext4File>, linked: bool) -> Result<OverlayD
 }
 
 pub(super) fn overlay_mkdir(name: &str) -> Result<(), isize> {
-    let mut entries = OVERLAY.exclusive_access();
-    entries.check_insert(name)?;
-    let directory = Arc::new(OverlayDirectory {
-        path: unsafe { UPSafeCell::new(String::from(name)) },
-        ino: next_inode(),
-        _charge: InodeCharge::new()?,
-    });
-    entries.insert(String::from(name), OverlayEntry::Directory(directory));
-    Ok(())
+    OVERLAY.mkdir(name)
+}
+
+pub(super) fn overlay_symlink(name: &str, target: Vec<u8>) -> Result<(), isize> {
+    OVERLAY.symlink(name, target)
 }
 
 fn detach(entry: Option<OverlayEntry>) {
     match entry {
         Some(OverlayEntry::File(data)) => data.exclusive_access().linked = false,
-        Some(OverlayEntry::Directory(dir)) => *dir.path.exclusive_access() = String::new(),
+        Some(OverlayEntry::Directory(dir)) => {
+            dir.detached.store(true, Ordering::Relaxed);
+            *dir.path.exclusive_access() = String::new();
+        }
+        Some(OverlayEntry::Symlink(link)) => link.detach(),
         _ => (),
     }
 }
@@ -181,27 +489,7 @@ fn child_paths(entries: &BTreeMap<String, OverlayEntry>, name: &str) -> Vec<Stri
 }
 
 pub(super) fn overlay_unlink(name: &str, hide_lower: bool, directory: bool) -> Result<(), isize> {
-    let mut entries = OVERLAY.exclusive_access();
-    let children = if directory {
-        child_paths(&entries.entries, name)
-    } else {
-        Vec::new()
-    };
-    if hide_lower && !entries.entries.contains_key(name) {
-        let child_bytes = children.iter().map(String::len).sum::<usize>();
-        entries.check_capacity(
-            entries.entries.len() - children.len() + 1,
-            entries.path_bytes - child_bytes + name.len(),
-        )?;
-    }
-    for child in children {
-        detach(entries.remove(&child));
-    }
-    detach(entries.remove(name));
-    if hide_lower {
-        entries.insert(String::from(name), OverlayEntry::Whiteout);
-    }
-    Ok(())
+    OVERLAY.unlink(name, hide_lower, directory)
 }
 
 pub(super) fn overlay_rename(
@@ -210,70 +498,16 @@ pub(super) fn overlay_rename(
     source: OverlayEntry,
     hide_lower: bool,
 ) -> Result<(), isize> {
-    let mut entries = OVERLAY.exclusive_access();
-    let removes_source = usize::from(entries.entries.contains_key(old));
-    let adds_destination = usize::from(!entries.entries.contains_key(new));
-    let whiteout = usize::from(hide_lower);
-    let final_count = entries.entries.len() - removes_source + adds_destination + whiteout;
-    let final_bytes = entries.path_bytes - removes_source * old.len()
-        + adds_destination * new.len()
-        + whiteout * old.len();
-    if let OverlayEntry::Directory(dir) = &source {
-        let destination_children = child_paths(&entries.entries, new);
-        let paths = child_paths(&entries.entries, old);
-        if paths
-            .iter()
-            .any(|path| new.len() + path.len() - old.len() >= 4096)
-        {
-            return Err(-36);
-        }
-        let replaced_bytes = destination_children.iter().map(String::len).sum::<usize>();
-        entries.check_capacity(
-            final_count - destination_children.len(),
-            final_bytes - replaced_bytes - paths.len() * old.len() + paths.len() * new.len(),
-        )?;
-        for path in destination_children {
-            detach(entries.remove(&path));
-        }
-        *dir.path.exclusive_access() = String::from(new);
-        for old_path in paths {
-            let new_path = alloc::format!("{}{}", new, &old_path[old.len()..]);
-            let child = entries.remove(&old_path).unwrap();
-            if let OverlayEntry::Directory(dir) = &child {
-                *dir.path.exclusive_access() = new_path.clone();
-            }
-            entries.insert(new_path, child);
-        }
-    } else {
-        entries.check_capacity(final_count, final_bytes)?;
-    }
-    entries.remove(old);
-    if hide_lower {
-        entries.insert(String::from(old), OverlayEntry::Whiteout);
-    }
-    detach(entries.insert(String::from(new), source));
-    Ok(())
+    OVERLAY.rename(old, new, source, hide_lower)
 }
 
 pub(super) fn overlay_children(directory: &str) -> BTreeMap<String, OverlayEntry> {
-    let mut prefix = String::from(directory);
-    if !prefix.is_empty() {
-        prefix.push('/');
-    }
-    OVERLAY
-        .exclusive_access()
-        .entries
-        .range(prefix.clone()..)
-        .take_while(|(path, _)| path.starts_with(&prefix))
-        .filter_map(|(path, entry)| {
-            let child = &path[prefix.len()..];
-            (!child.contains('/')).then(|| (String::from(child), entry.clone()))
-        })
-        .collect()
+    OVERLAY.children(directory)
 }
 
 /// The in-memory file owns its pages. MAP_SHARED takes another reference to the same frames.
 pub(super) struct OverlayContents {
+    dev: u64,
     ino: u32,
     linked: bool,
     _charge: InodeCharge,
@@ -320,7 +554,7 @@ pub(super) fn resize(data: &OverlayData, len: usize) {
 
 impl OverlayContents {
     fn identity(&self) -> (u64, u64) {
-        (OVERLAY_DEVICE, u64::from(self.ino))
+        (self.dev, u64::from(self.ino))
     }
 
     pub(super) fn snapshot(&self) -> Result<FileData, isize> {

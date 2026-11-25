@@ -7,6 +7,7 @@ use alloc::{string::String, sync::Arc};
 
 const AT_FDCWD: isize = -100;
 const AT_EMPTY_PATH: usize = 0x1000;
+const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 
 fn with_io_file<T>(file: Arc<dyn fs::File>, operation: impl FnOnce(&dyn fs::File) -> T) -> T {
     let pointer = Arc::as_ptr(&file);
@@ -25,7 +26,7 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
     }
     if let Some(file) = &inner.fd_table[fd] {
         if !file.writable() {
-            return -1;
+            return if file.path_only() { -9 } else { -1 };
         }
         let file = file.clone();
         // release current task TCB manually to avoid multi-borrow
@@ -49,6 +50,9 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
     }
     if let Some(file) = &inner.fd_table[fd] {
         let file = file.clone();
+        if file.path_only() {
+            return -9;
+        }
         if file.directory().is_some() {
             return -21; // EISDIR
         }
@@ -151,7 +155,7 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
     }
     if let Some(file) = &inner.fd_table[fd] {
         if !file.writable() {
-            return -1;
+            return if file.path_only() { -9 } else { -1 };
         }
         let file = file.clone();
         drop(inner);
@@ -181,11 +185,15 @@ pub fn sys_ioctl() -> isize {
 }
 
 fn resolve_at(dirfd: isize, path: &str) -> Result<String, isize> {
+    resolve_at_with(dirfd, path, true)
+}
+
+fn resolve_at_with(dirfd: isize, path: &str, follow_final: bool) -> Result<String, isize> {
     if path.is_empty() {
         return Err(-2); // ENOENT
     }
     if path.starts_with('/') || dirfd == AT_FDCWD {
-        return fs::resolve_path(path);
+        return fs::resolve_path_with(path, follow_final);
     }
 
     let process = current_process();
@@ -201,16 +209,23 @@ fn resolve_at(dirfd: isize, path: &str) -> Result<String, isize> {
     if !fs::directory_is_live(directory) {
         return Err(-2);
     }
-    fs::resolve_from(path, &directory.path())
+    fs::resolve_from(path, &directory.path(), follow_final)
 }
 
 /// openat(56)：解析 cwd 或目录 fd，并把 Linux flags 翻译成内核 OpenFlags。
 pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isize {
+    const O_NOFOLLOW: u32 = 0o400000;
+    const O_DIRECTORY: u32 = 0o200000;
+    const O_PATH: u32 = 0o10000000;
+    let path_only = flags & O_PATH != 0;
+    let flags = if path_only { flags & (O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW | O_PATH) } else { flags };
+    let exclusive = flags & (0o100 | 0o200) == (0o100 | 0o200);
     let raw = match translated_path(current_user_token(), path) {
         Ok(path) => path,
         Err(errno) => return errno,
     };
-    let path = match resolve_at(dirfd, &raw) {
+    let follow_final = raw.ends_with('/') || (flags & O_NOFOLLOW == 0 && !exclusive);
+    let path = match resolve_at_with(dirfd, &raw, follow_final) {
         Ok(path) => path,
         Err(errno) => return errno,
     };
@@ -244,7 +259,19 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
         Some(fd) => fd,
         None => return -24,
     };
-    let file = match fs::open_dyn(&path, open_flags) {
+    let result = (|| -> Result<Arc<dyn fs::File + Send + Sync>, isize> {
+        if !follow_final {
+            if let Some(link) = fs::find_symlink(&path)? {
+                return if exclusive { Err(-17) }
+                else if !path_only { Err(-40) }
+                else if open_flags.contains(OpenFlags::DIRECTORY) { Err(-20) }
+                else { Ok(Arc::new(fs::PathFile(link, flags & !O_CLOEXEC))) };
+            }
+        }
+        let file = fs::open_dyn(&path, open_flags)?;
+        if path_only { Ok(Arc::new(fs::PathFile(file, flags & !O_CLOEXEC))) } else { Ok(file) }
+    })();
+    let file = match result {
         Ok(file) => file,
         Err(errno) => return errno,
     };
@@ -252,6 +279,48 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
     inner.fd_table[fd] = Some(file);
     inner.set_close_on_exec(fd, flags & O_CLOEXEC != 0);
     fd as isize
+}
+
+pub fn sys_readlinkat(dirfd: isize, path: *const u8, buffer: *mut u8, len: usize) -> isize {
+    if len == 0 { return -22; }
+    let result = (|| {
+        let token = current_user_token();
+        let raw = translated_path(token, path)?;
+        let file = if raw.is_empty() {
+            file_by_fd(dirfd as usize)?
+        } else {
+            let trailing_slash = raw.ends_with('/');
+            let path = resolve_at_with(dirfd, &raw, trailing_slash)?;
+            if trailing_slash { fs::require_directory(&path)?; }
+            match fs::find_symlink(&path)? {
+                Some(link) => link,
+                None => {
+                    fs::path_is_directory(&path)?;
+                    return Err(-22);
+                }
+            }
+        };
+        let target = file.link_target().ok_or(-22isize)?;
+        let count = len.min(target.len());
+        let output = translated_byte_buffer(token, buffer, count, MapPermission::W).ok_or(-14isize)?;
+        UserBuffer::new(output).copy_from(&target[..count]);
+        Ok(count as isize)
+    })();
+    result.unwrap_or_else(|errno| errno)
+}
+
+pub fn sys_symlinkat(target: *const u8, dirfd: isize, link: *const u8) -> isize {
+    let result = (|| {
+        let token = current_user_token();
+        let target = crate::mm::translated_c_bytes(token, target)?;
+        let raw = translated_path(token, link)?;
+        let path = resolve_at_with(dirfd, &raw, false)?;
+        if raw.ends_with('/') {
+            return Err(if fs::exists(&path) { -17 } else { -2 });
+        }
+        fs::symlink(&path, target)
+    })();
+    result.err().unwrap_or(0)
 }
 
 /// dup3(24)：把 oldfd 复制到指定的 newfd
@@ -316,7 +385,7 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
 
 pub fn sys_mkdirat(dirfd: isize, path: *const u8) -> isize {
     translated_path(current_user_token(), path)
-        .and_then(|raw| resolve_at(dirfd, &raw))
+        .and_then(|raw| resolve_at_with(dirfd, &raw, false))
         .and_then(|path| fs::mkdir(&path))
         .err()
         .unwrap_or(0)
@@ -330,7 +399,7 @@ pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: usize) -> isize {
     let remove_directory = flags & AT_REMOVEDIR != 0;
     translated_path(current_user_token(), path)
         .and_then(|raw| {
-            let path = resolve_at(dirfd, &raw)?;
+            let path = resolve_at_with(dirfd, &raw, false)?;
             if remove_directory {
                 match raw.trim_end_matches('/').rsplit('/').next() {
                     Some(".") => return Err(-22),
@@ -359,9 +428,41 @@ pub fn sys_fstat(fd: usize, st: *mut u8) -> isize {
     }
 }
 
-/// mount / umount2：无真实挂载，直接成功
-pub fn sys_mount_stub() -> isize {
-    0
+pub fn sys_mount(
+    source: *const u8,
+    target: *const u8,
+    fstype: *const u8,
+    flags: usize,
+) -> isize {
+    let token = current_user_token();
+    let result = (|| {
+        let source = if source.is_null() {
+            String::new()
+        } else {
+            translated_path(token, source)?
+        };
+        let raw_target = translated_path(token, target)?;
+        let target = resolve_at(AT_FDCWD, &raw_target)?;
+        let fstype = if fstype.is_null() {
+            String::new()
+        } else {
+            translated_path(token, fstype)?
+        };
+        fs::mount::mount_fs(&source, &target, &fstype, flags)
+    })();
+    result.err().unwrap_or(0)
+}
+
+pub fn sys_umount2(target: *const u8, flags: usize) -> isize {
+    const UMOUNT_NOFOLLOW: usize = 8;
+    let token = current_user_token();
+    let result = (|| {
+        let raw_target = translated_path(token, target)?;
+        let follow = flags & UMOUNT_NOFOLLOW == 0 || raw_target.ends_with('/');
+        let target = resolve_at_with(AT_FDCWD, &raw_target, follow)?;
+        fs::mount::umount_fs(&target, flags)
+    })();
+    result.err().unwrap_or(0)
 }
 
 /// getdents64(61)：按打开的目录描述读取目录项。
@@ -374,6 +475,7 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
             None => return -9,
         }
     };
+    if file.path_only() { return -9; }
     let directory = match file.directory() {
         Some(directory) => directory,
         None => return -20,
@@ -425,10 +527,6 @@ pub fn sys_getdents64(fd: usize, buf: *mut u8, len: usize) -> isize {
     n as isize
 }
 
-fn stat_mode(file: &dyn fs::File) -> u16 {
-    if file.directory().is_some() { 0o40755 } else { 0o100644 }
-}
-
 fn write_stat_bytes(st: *mut u8, bytes: &[u8]) -> isize {
     let target = match translated_byte_buffer(current_user_token(), st, bytes.len(), MapPermission::W) {
         Some(buffers) => UserBuffer::new(buffers),
@@ -443,7 +541,7 @@ fn write_stat(st: *mut u8, file: &dyn fs::File, fallback_inode: u64) -> isize {
     let mut buf = [0u8; 128];
     buf[0..8].copy_from_slice(&device.to_le_bytes());
     buf[8..16].copy_from_slice(&inode.to_le_bytes());
-    buf[16..20].copy_from_slice(&u32::from(stat_mode(file)).to_le_bytes());
+    buf[16..20].copy_from_slice(&u32::from(file.mode()).to_le_bytes());
     buf[20..24].copy_from_slice(&file.link_count().to_le_bytes());
     buf[48..56].copy_from_slice(&(file.size() as u64).to_le_bytes());
     buf[56..60].copy_from_slice(&4096u32.to_le_bytes());
@@ -461,7 +559,14 @@ fn stat_file_at(
         }
         fs::resolve_path(".")?
     } else {
-        resolve_at(dirfd, raw)?
+        let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0 || raw.ends_with('/');
+        let path = resolve_at_with(dirfd, raw, follow_final)?;
+        if !follow_final {
+            if let Some(link) = fs::find_symlink(&path)? {
+                return Ok((link, 0));
+            }
+        }
+        path
     };
     if raw.ends_with('/') {
         fs::require_directory(&path)?;
@@ -477,7 +582,6 @@ pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut u8, flags: usize) 
 }
 
 pub fn sys_statx(dirfd: isize, path: *const u8, flags: usize, mask: u32, st: *mut u8) -> isize {
-    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
     const AT_NO_AUTOMOUNT: usize = 0x800;
     const AT_STATX_SYNC_TYPE: usize = 0x6000;
     const STATX_RESERVED: u32 = 0x8000_0000;
@@ -507,7 +611,7 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: usize, mask: u32, st: *mu
     buf[0..4].copy_from_slice(&available.to_le_bytes());
     buf[4..8].copy_from_slice(&4096u32.to_le_bytes());
     buf[16..20].copy_from_slice(&file.link_count().to_le_bytes());
-    buf[28..30].copy_from_slice(&stat_mode(file.as_ref()).to_le_bytes());
+    buf[28..30].copy_from_slice(&file.mode().to_le_bytes());
     buf[32..40].copy_from_slice(&inode.to_le_bytes());
     buf[40..48].copy_from_slice(&(file.size() as u64).to_le_bytes());
     buf[136..140].copy_from_slice(&major.to_le_bytes());
@@ -529,8 +633,8 @@ pub fn sys_renameat(oldfd: isize, oldpath: *const u8, newfd: isize, newpath: *co
                 return Err(-22);
             }
         }
-        let old_name = resolve_at(oldfd, &old)?;
-        let new_name = resolve_at(newfd, &new)?;
+        let old_name = resolve_at_with(oldfd, &old, false)?;
+        let new_name = resolve_at_with(newfd, &new, false)?;
         if old.ends_with('/') {
             fs::require_directory(&old_name)?;
         }
@@ -546,6 +650,7 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_DUPFD: usize = 0;
     const F_GETFD: usize = 1;
     const F_SETFD: usize = 2;
+    const F_GETFL: usize = 3;
     const F_DUPFD_CLOEXEC: usize = 1030;
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
@@ -589,6 +694,8 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 0
             }
         }
+        F_GETFL => inner.fd_table.get(fd).and_then(Option::as_ref)
+            .map_or(-9, |file| file.path_flags().unwrap_or(0) as isize),
         _ => 0,
     }
 }
@@ -628,23 +735,51 @@ pub fn sys_utimensat(path: *const u8) -> isize {
         .unwrap_or(0)
 }
 
-/// statfs(43)/fstatfs(44)：返回最小的 ext4 统计信息
-pub fn sys_statfs(buf: *mut u8) -> isize {
-    let token = current_user_token();
+fn write_statfs(buf: *mut u8, magic: u64) -> isize {
     let mut b = [0u8; 120];
-    // f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_namelen
-    b[0..8].copy_from_slice(&0xEF53u64.to_le_bytes());
+    // f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_namelen, f_frsize
+    b[0..8].copy_from_slice(&magic.to_le_bytes());
     b[8..16].copy_from_slice(&4096u64.to_le_bytes());
     b[16..24].copy_from_slice(&16384u64.to_le_bytes());
     b[24..32].copy_from_slice(&12000u64.to_le_bytes());
     b[32..40].copy_from_slice(&12000u64.to_le_bytes());
     b[40..48].copy_from_slice(&4096u64.to_le_bytes());
     b[48..56].copy_from_slice(&3000u64.to_le_bytes());
-    b[56..64].copy_from_slice(&255u64.to_le_bytes());
-    for (i, byte) in b.iter().enumerate() {
-        write_user(token, (buf as usize + i) as *mut u8, *byte);
+    b[64..72].copy_from_slice(&255u64.to_le_bytes());
+    b[72..80].copy_from_slice(&4096u64.to_le_bytes());
+    write_stat_bytes(buf, &b)
+}
+
+pub fn sys_statfs(path: *const u8, buf: *mut u8) -> isize {
+    let result = (|| {
+        let raw = translated_path(current_user_token(), path)?;
+        let resolved = resolve_at(AT_FDCWD, &raw)?;
+        if raw.ends_with('/') {
+            fs::require_directory(&resolved)?;
+        } else if !fs::exists(&resolved) {
+            return Err(-2);
+        }
+        Ok(fs::statfs_magic(&resolved))
+    })();
+    match result {
+        Ok(magic) => write_statfs(buf, magic),
+        Err(errno) => errno,
     }
-    0
+}
+
+pub fn sys_fstatfs(fd: usize, buf: *mut u8) -> isize {
+    let file = match file_by_fd(fd) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    let magic = if let Some(directory) = file.directory() {
+        fs::statfs_magic(&directory.location().path())
+    } else if let Some((dev, _)) = file.stat_identity() {
+        fs::statfs_magic_for_dev(dev)
+    } else {
+        fs::mount::EXT4_MAGIC
+    };
+    write_statfs(buf, magic)
 }
 
 /// lseek(62)：支持 SEEK_SET(0) / SEEK_CUR(1) / SEEK_END(2)
@@ -653,6 +788,7 @@ pub fn sys_lseek(fd: usize, offset: isize, whence: usize) -> isize {
         Ok(file) => file,
         Err(errno) => return errno,
     };
+    if file.path_only() { return -9; }
     match whence {
         0 => file.seek_to(offset),
         1 => file.seek(offset),
@@ -670,6 +806,7 @@ pub fn sys_readv(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
         return -1;
     }
     if let Some(file) = &inner.fd_table[fd] {
+        if file.path_only() { return -9; }
         if file.directory().is_some() {
             return -21; // EISDIR
         }
@@ -703,6 +840,7 @@ pub fn sys_ftruncate(fd: usize, len: isize) -> isize {
         return -22;
     }
     match file_by_fd(fd) {
+        Ok(file) if file.path_only() => -9,
         Ok(file) => file.set_len(len as usize),
         Err(errno) => errno,
     }

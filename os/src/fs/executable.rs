@@ -1,6 +1,7 @@
 use super::{
-    ext4::Ext4File, lower_inode, open_file, overlay::FileData, overlay_get, OpenFlags,
-    OverlayEntry, EXT4,
+    ext4::Ext4File, lower_inode,
+    mount::{resolve_mount, MountBackend},
+    open_file, overlay::FileData, overlay_get, OpenFlags, OverlayEntry, EXT4,
 };
 use crate::mm::FrameTracker;
 use alloc::{sync::Arc, vec::Vec};
@@ -46,11 +47,32 @@ impl Executable {
 }
 
 pub fn open_executable(name: &str) -> Result<Executable, isize> {
+    if let Some((mount, rel)) = resolve_mount(name) {
+        match mount.backend {
+            MountBackend::Procfs | MountBackend::Devfs => return Err(-13),
+            MountBackend::Memfs(fs) => {
+                if rel.is_empty() {
+                    return Err(-13);
+                }
+                return match fs.get(rel) {
+                    Some(OverlayEntry::File(data)) => {
+                        data.exclusive_access().snapshot().map(Executable::Overlay)
+                    }
+                    Some(OverlayEntry::Directory(_)) => Err(-13),
+                    Some(OverlayEntry::Symlink(_)) => Err(-40),
+                    Some(OverlayEntry::Whiteout) | None => Err(-2),
+                };
+            }
+            MountBackend::RootOverlay => {}
+        }
+    }
+
     match overlay_get(name) {
         Some(OverlayEntry::File(data)) => {
             return data.exclusive_access().snapshot().map(Executable::Overlay);
         }
         Some(OverlayEntry::Directory(_)) => return Err(-13),
+        Some(OverlayEntry::Symlink(_)) => return Err(-40),
         Some(OverlayEntry::Whiteout) => return Err(-2),
         None => {}
     }

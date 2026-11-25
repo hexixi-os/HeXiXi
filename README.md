@@ -6,9 +6,9 @@
 
 - **架构与多核**：RISC-V64 默认单核，支持 `SMP=1` 双核调度与远程 TLB 同步；LoongArch64 支持单核 ELF 直启与 VirtIO PCI。
 - **内存与装载**：按需 ELF 加载、`fork` 写时复制（CoW）、文件/匿名 `mmap` 与 VMA 拆分、共享页缓存（`lru` / `adaptive` / `none`）、动态 ELF 解释器（musl / glibc）。
-- **进程与线程**：实现 100+ Linux 系统调用，支持 `clone` / `futex` / TLS / 信号投递 / `pthread` 与线程组退出。
-- **文件系统**：只读 EXT4（支持多块组、稀疏文件、区间读取）+ 可写内存 Overlay（大文件、稀疏页、`MAP_SHARED`、`truncate`、重命名与 `O_TMPFILE`）。
-- **评测对接**：`make all` 产出内嵌 `oscomp_runner` 的 `kernel-rv`，可直接运行 2025 官方原盘 `/musl` 与 `/glibc` 脚本。网卡驱动与 TCP/IP 协议栈待实现。
+- **进程与线程**：实现 100+ Linux 系统调用，支持 `clone` / 进程内与跨进程共享 `futex` / TLS / 信号投递 / `pthread` 与线程组退出。
+- **文件系统与运行环境**：VFS 挂载表（`mount` / `umount2` / `statfs`）、只读 EXT4 + 可写内存 Overlay、独立 `tmpfs`（`/tmp`、`/var/tmp`、`/dev/shm`）、符号链接、`/proc/self` 与 `/dev/{null,zero,random,urandom,tty}` 及 `/lib`↔`/lib64` 兼容链接。
+- **评测对接**：`make all` 产出内嵌 `oscomp_runner` 的 `kernel-rv`。2025 初赛原盘可通过 `--legacy-image` 运行 `/musl` 与 `/glibc` 脚本，见[评测文档](docs/oscomp-evaluation.md)。网卡驱动与 TCP/IP 协议栈待实现。
 
 > 分支说明：`oscomp-adaptation` 为主开发分支，`main` 为上游原版教学内核基线。
 

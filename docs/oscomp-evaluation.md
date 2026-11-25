@@ -13,6 +13,8 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m <mem> -nographic -smp <sm
   -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
 ```
 
+上述启动命令使用默认 ABI。运行 2025 初赛旧原盘的兼容路径，要求评测环境允许传入第 3 节的启动参数。
+
 内核对接要点：
 - **只读 EXT4 + 内存 Overlay**：`os/src/fs/ext4.rs` 负责块组/稀疏文件读取与统一页缓存，`os/src/fs/overlay.rs` 承接全部写入（关机不落盘）。
 - **内嵌 `oscomp_runner`**：`make all` 与 `make kernel-la` 开启 `oscomp_runner` feature，识别官方盘布局后进入 `/musl`、`/glibc` 依次用 BusyBox 执行脚本；支持 `-append "oscomp.group=<组名>"` 指定单组运行。
@@ -34,7 +36,11 @@ SUITE=~/testsuits-pre-20250615 tools/oscomp/run_official_basic.sh ~/sdcard-rv.im
 
 ## 3. 完整 24 项评测矩阵
 
-`tools/oscomp/run_official_matrix.py` 为每个测试组独立启动 QEMU 并记录 `run.meta.json`、`matrix.json` 及每组的 `serial.log` / `group.log` / `result.json` / `score.json`：
+`tools/oscomp/run_official_matrix.py` 为每个测试组独立启动 QEMU 并记录 `run.meta.json`、`matrix.json` 及每组的 `serial.log` / `group.log` / `result.json` / `score.json`。
+
+复跑 2025 初赛原盘时使用 `--legacy-image`。它在 RISC-V64 上设置 `oscomp.legacy=1` bootarg，在 LoongArch64 上设置 `opt/hexixi/oscomp.legacy` fw_cfg 字符串 `1`。该模式启用旧镜像的 `mnt` 文件处理、脚本解释器回退和满足限制的 basic PIE 直启。内核默认采用标准路径语义。
+
+`--strict` 在保存全部结果后检查组标记、脚本退出及关机，要求所有选中的 basic 组达到 `102/102`。双核完整得分验证仍会受 `test_pipe` 串口交错影响。全量探索运行可直接读取 `matrix.json` 的分组状态。
 
 ```bash
 git -C ~/testsuits-pre-20250615 checkout 4b40ee92e8b594fb20e3957ebc2f79ad43aca538
@@ -43,20 +49,20 @@ git -C ~/oscomp-judges checkout 44fa7ac65f292580c3974a8252f533c4484ebe6b
 
 # 运行全部 24 项（12 组 × musl/glibc），也可在末尾指定组名如 basic busybox-glibc
 python3 tools/oscomp/run_official_matrix.py ~/sdcard-rv.img ~/oscomp-work/official-matrix \
-  --suite ~/testsuits-pre-20250615 --judges ~/oscomp-judges --timeout 120
+  --suite ~/testsuits-pre-20250615 --judges ~/oscomp-judges --legacy-image --timeout 120
 
-# RISC-V64 双核 / LoongArch64 单核 basic
+# RISC-V64 双核 basic 采样和 LoongArch64 单核 basic 门禁
 python3 tools/oscomp/run_official_matrix.py --smp 2 ~/sdcard-rv.img /tmp/rv-smp basic \
-  --suite ~/testsuits-pre-20250615 --kernel kernel-rv
+  --suite ~/testsuits-pre-20250615 --kernel kernel-rv --legacy-image
 python3 tools/oscomp/run_official_matrix.py --arch loongarch64 ~/sdcard-la.img /tmp/la-basic basic \
-  --suite ~/testsuits-pre-20250615 --kernel kernel-la
+  --suite ~/testsuits-pre-20250615 --kernel kernel-la --legacy-image --strict
 ```
 
 本地矩阵已接入 `basic`、`busybox`、`lua`、`libctest`、`iozone` 五组公开判分器，其余组保留原始串口日志与可提取结果。
 
 ## 4. 已知限制
 
-- EXT4 为只读，写入仅保存在内存 Overlay（数据页预算为 RAM/4，上限 128 MiB）。
+- EXT4 为只读，写入仅保存在内存 Overlay 或 `tmpfs`（共享数据页预算为 RAM/4，上限 128 MiB，关机不落盘）。
 - 网卡驱动与 TCP/IP 协议栈尚未实现（`iperf` / `netperf` 无法得分）。
 - RISC-V64 SMP 仍使用全局内核锁串行化内核态，同一进程的线程绑定在同一 hart；LoongArch64 仅支持单核。
-- 跨进程共享 futex、robust futex owner-death 恢复及完整 siginfo 队列待实现。
+- robust futex owner-death 恢复及完整 siginfo 队列待实现。

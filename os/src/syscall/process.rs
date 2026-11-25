@@ -342,10 +342,14 @@ pub fn sys_mmap(
         if !file.readable() {
             return -13;
         }
-        if file.mapping_size().is_none() {
-            return -19;
+        if file.is_zero_device() {
+            VmaBacking::anonymous(shared)
+        } else {
+            if file.mapping_size().is_none() {
+                return -19;
+            }
+            VmaBacking::file(file, offset, shared)
         }
-        VmaBacking::file(file, offset, shared)
     };
     if !backing.allows(permissions) {
         return -13;
@@ -582,17 +586,21 @@ pub fn sys_getrusage(buf: *mut u8) -> isize {
     0
 }
 
-/// getrandom(278)：给伪随机字节（测试只当熵源，不要求密码学强度）
-pub fn sys_getrandom(buf: *mut u8, len: usize) -> isize {
-    if buf.is_null() {
-        return -14;
+/// getrandom(278)：校验标志位与用户缓冲区，输出与 /dev/{random,urandom} 同源的随机流
+pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> isize {
+    const GRND_VALID: u32 = 0x7; // GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE
+    if flags & !GRND_VALID != 0 {
+        return -22; // EINVAL
     }
+    if len == 0 {
+        return 0;
+    }
+    let count = len.min(0x01ff_ffff);
     let token = current_user_token();
-    for i in 0..len {
-        let byte = (i as u8).wrapping_mul(73).wrapping_add(41);
-        write_user(token, (buf as usize + i) as *mut u8, byte);
+    match translated_byte_buffer(token, buf, count, MapPermission::W) {
+        Some(buffers) => crate::fs::random::fill_random(&UserBuffer::new(buffers)) as isize,
+        None => -14, // EFAULT
     }
-    len as isize
 }
 
 /// rt_sigtimedwait(137)：简化版——有挂起信号就取走并返回信号号，

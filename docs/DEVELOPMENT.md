@@ -20,9 +20,18 @@ QEMU 加载 OpenSBI（RISC-V64）或直接加载 ELF（LoongArch64）后进入 `
 | `trap/` | 用户态陷阱分发（系统调用、缺页、时钟中断）与 `TrapContext` |
 | `task/` | 进程/线程控制块、fork/exec、调度器、信号状态与跨核页表失效 |
 | `syscall/` | Linux 系统调用分发与实现（`fs`、`process`、`signal`、`thread`、`futex`、`sync`） |
-| `fs/` | 只读 EXT4、内存可写 Overlay、统一文件页缓存、管道、标准 I/O 与 `/proc` 虚拟文件 |
+| `fs/` | VFS 挂载表、只读 EXT4、内存可写 Overlay 与独立 `tmpfs`、统一文件页缓存、符号链接、管道、字符设备与 `/proc` |
 | `drivers/block/` | VirtIO MMIO（RISC-V64）与 VirtIO PCI（LoongArch64）块设备驱动 |
 | `sync/` | 全局内核票号锁（SMP）、`UPSafeCell`、互斥锁、信号量、条件变量 |
+
+### 用户态文件环境
+
+- EXT4 根文件系统支持快链接和数据块符号链接，内存 Overlay 与 `tmpfs` 支持 `symlinkat`、`readlinkat`、改名和删除。路径按 UTF-8 组件解析，`openat` 支持 `O_NOFOLLOW` 与 `O_PATH`，`fstatat` 和 `statx` 支持 `AT_SYMLINK_NOFOLLOW`。
+- VFS 挂载表支持 `ext4`、独立 `tmpfs`、`proc`、`devtmpfs` 等命名空间及 `mount` / `umount2`（含 `MNT_DETACH` 延迟卸载、活跃句柄/工作目录/映射占用 `EBUSY`、跨挂载 `EXDEV` 与按挂载点区分魔数的 `statfs`/`fstatfs`，兼容 `shm_open`）。
+- EXT4 根启动时自动挂载独立的 `/dev/shm`、`/tmp` 和 `/var/tmp` `tmpfs`（保留镜像中已有的非空目录内容），并在 `/lib` 与 `/lib64` 仅单侧存在时补齐兼容符号链接。
+- `/dev` 提供 `null`、`zero`（支持匿名语义的私有/共享 `mmap`）、`random`、`urandom`（与 `getrandom` 同源随机流）及 `tty`/`console`；`/proc/self` 与 `/proc/<pid>` 提供 `cwd`、`exe`、`cmdline`、`stat`、`status`，`meminfo`、`cpuinfo` 与 `mounts` 反映实时内核状态。
+- `MAP_SHARED` 匿名与文件映射（如 `/dev/shm`）上的非私有 `futex`（含跨进程异址映射及单线程进程退出 `clear_child_tid`）按物理页帧地址匹配唤醒。
+- 双架构任务内核栈统一为 16 KiB（保留保护页），以容纳 `execve`、`PT_INTERP` 路径解析与块设备驱动调用栈；LoongArch64 启动入口兼容 QEMU 8.2 高位入口与 QEMU 10+ 物理 DA 入口。
 
 ## 2. 调试
 
@@ -45,6 +54,8 @@ QEMU 加载 OpenSBI（RISC-V64）或直接加载 ELF（LoongArch64）后进入 `
 | 回归项 | 命令 |
 |---|---|
 | EXT4 区间读取与页缓存（宿主） | `bash tools/oscomp/test_ext4.sh [sdcard-rv.img]` |
+| ELF 入口契约与组选择（双架构） | `bash tools/oscomp/test_exec_entry.sh <riscv64\|loongarch64> /tmp/hexixi-exec.log` |
+| VFS、挂载、`tmpfs`、设备与共享 `futex`（双架构） | `bash tools/oscomp/test_vfs_abi.sh <riscv64\|loongarch64> /tmp/hexixi-vfs.log` |
 | basic ABI（大偏移写、目录/unlink、clone） | `bash tools/oscomp/test_basic_abi.sh` |
 | 文件 `mmap` 与 VMA 拆分 | `bash tools/oscomp/test_mmap_vma.sh` |
 | ELF 按需装载 | `bash tools/oscomp/test_elf_demand.sh` |

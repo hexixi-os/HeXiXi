@@ -10,7 +10,7 @@ mod vma;
 
 use address::VPNRange;
 pub use address::{PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
-pub(crate) use frame_allocator::frame_alloc_charged;
+pub(crate) use frame_allocator::{frame_alloc_charged, free_frame_count};
 #[cfg(target_arch = "riscv64")]
 pub use frame_allocator::frame_dealloc;
 pub use frame_allocator::{frame_alloc, ram_end, set_ram_end, FrameTracker};
@@ -21,7 +21,8 @@ pub use memory_set::{kernel_token, MapPermission, MemorySet, KERNEL_SPACE};
 pub use vma::{PageFault, VmaBacking, USER_END};
 use page_table::PTEFlags;
 pub(crate) use page_table::{
-    prepare_user_write, read_user, translated_c_bytes, try_read_user, try_write_user, write_user,
+    futex_phys_addr, prepare_user_write, read_user, translated_c_bytes, try_read_user,
+    try_write_user, write_user,
 };
 pub use page_table::{
     translated_byte_buffer, translated_path, PageTable, PageTableEntry, UserBuffer,

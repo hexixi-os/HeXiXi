@@ -6,6 +6,10 @@ pub const MAX_HARTS: usize = 8;
 const SUPPORTED_HARTS: usize = (1 << MAX_HARTS) - 1;
 
 static ONLINE: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn online_hart_mask() -> usize {
+    ONLINE.load(Ordering::Acquire)
+}
 static NEXT_HART: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn boot(configured: usize) {

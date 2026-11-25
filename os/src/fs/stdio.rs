@@ -8,6 +8,19 @@ pub struct Stdin;
 
 pub struct Stdout;
 
+pub struct ConsoleFile(pub bool, pub bool, pub u64);
+
+impl File for ConsoleFile {
+    fn readable(&self) -> bool { self.0 }
+    fn writable(&self) -> bool { self.1 }
+    fn read(&self, buf: UserBuffer) -> usize { Stdin.read(buf) }
+    fn write(&self, buf: UserBuffer) -> isize { Stdout.write(buf) }
+    fn mode(&self) -> u16 { 0o20666 }
+    fn stat_identity(&self) -> Option<(u64, u64)> {
+        Some((super::DEV_DEVICE, self.2))
+    }
+}
+
 impl File for Stdin {
     fn readable(&self) -> bool {
         true

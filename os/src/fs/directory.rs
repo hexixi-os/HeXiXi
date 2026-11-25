@@ -4,7 +4,7 @@ use super::{
 };
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::{borrow::Cow, string::String};
 
 #[derive(Clone)]
@@ -12,6 +12,7 @@ pub(super) enum DirectoryIdentity {
     Permanent,
     Lower,
     Upper(Arc<OverlayDirectory>),
+    Proc(Weak<crate::task::ProcessControlBlock>),
 }
 
 #[derive(Clone)]
@@ -38,7 +39,7 @@ impl DirectoryLocation {
 
     pub fn path(&self) -> Cow<'_, str> {
         match &self.identity {
-            DirectoryIdentity::Upper(dir) => Cow::Owned(dir.path.exclusive_access().clone()),
+            DirectoryIdentity::Upper(dir) => Cow::Owned(dir.full_path()),
             _ => Cow::Borrowed(&self.path),
         }
     }

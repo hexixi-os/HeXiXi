@@ -12,13 +12,13 @@ use self::id::TaskUserRes;
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 use manager::fetch_task;
-use process::ProcessControlBlock;
+pub(crate) use process::ProcessControlBlock;
 use switch::__switch;
 use crate::timer::remove_timer;
 
 pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
-pub(crate) use manager::invalidate_file_pages;
+pub(crate) use manager::{invalidate_file_pages, mount_is_busy, process_ids};
 pub use manager::{add_task, remove_task, pid2process, remove_from_pid2process, tid2task};
 pub use processor::{
     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
@@ -80,8 +80,8 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
         let inner = process.inner_exclusive_access();
         (inner.legacy_thread_exit, inner.thread_count() == 1)
     };
-    // A private file mapping may need a COW fault while the task is still current.
-    if clear_child_tid != 0 && !last_thread {
+    // A shared mapping or multi-threaded exit may have a waiter on clear_child_tid.
+    if clear_child_tid != 0 {
         let token = process.inner_exclusive_access().memory_set.token();
         if crate::mm::try_write_user(token, clear_child_tid as *mut i32, 0).is_some() {
             crate::syscall::futex::wake_one(token, clear_child_tid);
@@ -169,6 +169,7 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
 
         let mut process_inner = process.inner_exclusive_access();
         process_inner.children.clear();
+        process_inner.cmdline = None;
         // 主线程此刻还在自己的内核栈上跑：如果随 tasks.clear() 一起 drop，
         // KernelStack::drop 会把当前内核栈从内核页表 unmap，接着的栈访问就缺页
         //（libcbench/ltp 的 kernel StorePageFault 就是这个原因：TLB 没失效时侥幸不炸）。
@@ -205,7 +206,7 @@ lazy_static! {
         let runner = include_bytes!(env!("OSCOMP_RUNNER_ELF"));
         #[cfg(feature = "oscomp_runner")]
         if crate::fs::has_ext4() && crate::fs::exists("musl/basic_testcode.sh") {
-            return ProcessControlBlock::new(crate::fs::Executable::Embedded(runner));
+            return ProcessControlBlock::new(crate::fs::Executable::Embedded(runner), None);
         }
         // 测试盘上有 run_tests 标记时，改为启动自动跑测的 autorun
         // 盘里有 oscomp_runner 就交给它去跑 *_testcode.sh
@@ -219,14 +220,14 @@ lazy_static! {
             #[cfg(feature = "oscomp_runner")]
             if crate::fs::has_ext4() {
                 if let Ok(cwd) = crate::fs::working_directory("musl") {
-                    let process = ProcessControlBlock::new(crate::fs::Executable::Embedded(runner));
+                    let process = ProcessControlBlock::new(crate::fs::Executable::Embedded(runner), None);
                     process.inner_exclusive_access().cwd = cwd;
                     return process;
                 }
             }
             panic!("missing init executable");
         };
-        ProcessControlBlock::new(crate::fs::open_executable(name).expect("missing init executable"))
+        ProcessControlBlock::new(crate::fs::open_executable(name).expect("missing init executable"), Some(name))
     };
 }
 
