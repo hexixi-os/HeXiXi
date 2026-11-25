@@ -203,10 +203,10 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
 lazy_static! {
     pub static ref INITPROC: Arc<ProcessControlBlock> = {
         #[cfg(feature = "oscomp_runner")]
+        let runner = include_bytes!(env!("OSCOMP_RUNNER_ELF"));
+        #[cfg(feature = "oscomp_runner")]
         if crate::fs::has_ext4() && crate::fs::exists("musl/basic_testcode.sh") {
-            return ProcessControlBlock::new(crate::fs::Executable::Embedded(
-                include_bytes!(env!("OSCOMP_RUNNER_ELF")),
-            ));
+            return ProcessControlBlock::new(crate::fs::Executable::Embedded(runner));
         }
         // 测试盘上有 run_tests 标记时，改为启动自动跑测的 autorun
         // 盘里有 oscomp_runner 就交给它去跑 *_testcode.sh
@@ -214,8 +214,18 @@ lazy_static! {
             "oscomp_runner"
         } else if crate::fs::exists("run_tests") {
             "autorun"
-        } else {
+        } else if crate::fs::exists("initproc") {
             "initproc"
+        } else {
+            #[cfg(feature = "oscomp_runner")]
+            if crate::fs::has_ext4() {
+                if let Ok(cwd) = crate::fs::working_directory("musl") {
+                    let process = ProcessControlBlock::new(crate::fs::Executable::Embedded(runner));
+                    process.inner_exclusive_access().cwd = cwd;
+                    return process;
+                }
+            }
+            panic!("missing init executable");
         };
         ProcessControlBlock::new(crate::fs::open_executable(name).expect("missing init executable"))
     };

@@ -48,6 +48,14 @@ pub(super) fn fork_with_child_tid(
         .map(|pid| pid as isize).unwrap_or_else(|errno| errno)
 }
 
+fn open_busybox() -> Result<Executable, isize> {
+    // 评测脚本可能已进入 basic 等子目录，继续查找根目录和官方盘的 musl 目录。
+    crate::fs::resolve_path("busybox")
+        .and_then(|path| open_executable(&path))
+        .or_else(|_| open_executable("busybox"))
+        .or_else(|_| open_executable("musl/busybox"))
+}
+
 pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isize {
     let token = current_user_token();
     let raw_path = match translated_path(token, path) {
@@ -67,7 +75,13 @@ pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isiz
         Ok(envs) => envs,
         Err(errno) => return errno,
     };
-    let source = match open_executable(&path) {
+    let source = match open_executable(&path).or_else(|errno| {
+        if errno == -2 && raw_path.rsplit('/').next() == Some("busybox") {
+            open_busybox()
+        } else {
+            Err(errno)
+        }
+    }) {
         Ok(source) => source,
         Err(errno) => return errno,
     };
@@ -135,16 +149,7 @@ fn script_interpreter(
     let (program, argument, source) = match open_executable(name) {
         Ok(source) => (name, argument, source),
         Err(_) => {
-            let (program, source) = open_executable("busybox")
-                .map(|source| ("busybox", source))
-                .or_else(|errno| {
-                    if interpreter == "/bin/sh" {
-                        open_executable("musl/busybox").map(|source| ("/musl/busybox", source))
-                    } else {
-                        Err(errno)
-                    }
-                })?;
-            (program, argument.or(Some("sh")), source)
+            ("busybox", argument.or(Some("sh")), open_busybox()?)
         }
     };
     let mut new_args = Vec::with_capacity(args.len() + 3);

@@ -320,3 +320,21 @@ Martyr 的内核基于 `3bf874f` 加未提交的稀疏文件修复，以下分�
 ## wonder-world 文档里提到的、仍未解决的限制
 
 以下来自 wonder-world 记录，待在当前版本复测。信号返回上下文可能影响 lmbench 的 `lat_ctx`，单核调度下 cyclictest 压力阶段可能超时。网卡驱动和 TCP/IP 栈仍待实现。
+
+## 2026-11-24 旧版官方布局盘实测
+
+`feat/integrated` 合并官方盘适配与页缓存、写时复制和文件映射后，在本地官方布局盘上留下以下记录。basic 使用官方 `test_runner.py` 判分。
+
+| 组 | 历史结果 | 说明 |
+|---|---|---|
+| basic | 94/102，29/32 用例满分 | `test_openat` 2/4、`test_clone` 1/4、`test_open` 0/3 |
+| lua | 9/9 | |
+| busybox | 51/55 | `which ls`、`hwclock`、`mv`、`rmdir` 失败 |
+| libctest | 94 个用例，88 个通过 | |
+| cyclictest | 4/4 | |
+| iozone / libcbench | 脚本跑完并关机 | libcbench 输出 27 项 |
+| unixbench | 17 行结果 | DHRY2 63.7M lps、SYSCALL 246K lps、EXEC 4.0K lps |
+| lmbench | 13 项结果 | fork→exec 1346 µs，写带宽 290 MB/s |
+| ltp | 162 个用例，TPASS 4 | 测试使用了当时内核缺少的 `/dev/shm` |
+
+同一份记录中的分支对照值为 fork→exec 3846 µs、写带宽 66 MB/s。后续提交 `916ea273` 的回归记录中，basic 为 99/102，`test_openat` 和 `test_open` 已满分，仍有 `test_clone` 失分。

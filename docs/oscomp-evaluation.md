@@ -19,7 +19,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m <mem> -nographic -smp <sm
 
 | 步骤 | 实现 |
 |---|---|
-| 读 EXT4 | `os/src/fs/ext4.rs` 按块组查找 inode，稀疏洞和未写入 extent 读为零 |
+| 读 EXT4 | `os/src/fs/ext4.rs` 按块组查找 inode，稀疏洞和未写入 extent 读为零。文件读取、文件映射和 ELF 缺页可共用页缓存 |
 | 选第一个进程 | `make all` 的 QEMU 评测构建先编译并内嵌 runner。`INITPROC` 识别官方布局后启动内嵌 runner |
 | 执行脚本 | runner 进入 `/musl` 或 `/glibc`，用对应目录的 `busybox sh` 执行原盘脚本。串口保留脚本的组标记、用例输出和 runner 记录的脚本退出码 |
 | 写文件 | EXT4 是只读的，写入走内存 overlay（`os/src/fs/mod.rs`），重启就没了 |
@@ -28,6 +28,8 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m <mem> -nographic -smp <sm
 QEMU 支持 `-append "oscomp.group=basic-glibc"` 指定一组。省略参数时，runner 按内置顺序依次启动各组，卡住的脚本可能阻断后续组。宿主机矩阵工具为每组单独启动 QEMU，并单独计时。
 
 平铺模拟盘继续从根目录加载 `oscomp_runner`。教学盘可通过 `run_tests` 启动 `autorun`，默认启动 `initproc`。
+
+执行 BusyBox 或回退到 BusyBox 解释脚本时，可从当前目录、根目录和 `/musl` 查找 BusyBox。平铺模拟盘上的 Lua 组可由 runner 直接逐项执行。
 
 ## 官方盘回归
 
@@ -71,7 +73,7 @@ python3 tools/oscomp/run_official_matrix.py ~/sdcard-rv.img ~/oscomp-work/offici
 ## 已知限制
 
 - EXT4 只读，写入由内存 overlay 提供。
-- 当前为 RISC-V64 单核构建，使用 FIFO 轮转调度。
+- RISC-V64 默认单核。可用 `SMP=1` 构建双核版，LoongArch64 使用单核。
 - 网卡驱动和 TCP/IP 协议栈仍待实现。
 - 动态 ELF 需要在 `PT_INTERP` 指定的路径提供解释器普通文件，共享库须位于加载器的搜索路径。原盘把 libc 放在 `/musl/lib` 与 `/glibc/lib`，部署通用动态程序需要布置运行时文件。
 - 本地矩阵接入 basic、busybox、lua、libctest、iozone 五组的公开判分器。其余组保留原始输出和可提取的用例结果，尚无本地总分。

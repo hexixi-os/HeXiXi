@@ -72,7 +72,9 @@ pub struct Ext4Fs {
     pub block_size: usize,
     pub inode_size: usize,
     inode_count: u32,
+    /// 每个块组的 inode 数：官方盘 4GB 有 32 个块组，inode 可能落在任意块组
     inodes_per_group: u32,
+    /// 块组描述符表的起始字节偏移与单个描述符大小
     group_desc_offset: u64,
     group_desc_size: usize,
 }
@@ -111,6 +113,7 @@ impl Ext4Fs {
             inode_size,
             inode_count,
             inodes_per_group,
+            // 块组描述符表紧跟在超级块所在块之后：(first_data_block + 1) 号块
             group_desc_offset: (first_data_block + 1) * block_size as u64,
             group_desc_size: desc_size,
         })
@@ -126,15 +129,21 @@ impl Ext4Fs {
         if ino == 0 || ino > self.inode_count {
             return None;
         }
+        // inode 可能在任意块组里：按块组描述符找到该组的 inode 表。
+        // （4GB 的官方盘有 32 个块组，只读块组 0 会让别组的 inode 全错）
         let group = (ino - 1) / self.inodes_per_group;
         let idx = (ino - 1) % self.inodes_per_group;
-        let mut desc = [0; 64];
+        let mut desc = [0u8; 64];
         let desc_len = self.group_desc_size.min(desc.len());
         read_at(
             self.group_desc_offset + group as u64 * self.group_desc_size as u64,
             &mut desc[..desc_len],
         );
-        let inode_table_block = le32(&desc, 8) as u64 | ((le32(&desc, 40) as u64) << 32);
+        // bg_inode_table_lo(偏移 8) + bg_inode_table_hi(偏移 40，仅 64 字节描述符有)
+        let mut inode_table_block = le32(&desc, 8) as u64;
+        if self.group_desc_size >= 64 {
+            inode_table_block |= (le32(&desc, 40) as u64) << 32;
+        }
         if inode_table_block == 0 {
             return None;
         }
@@ -220,6 +229,10 @@ impl Ext4Fs {
                 BlockMapping::Physical(block) => {
                     read_at(block * block_size + in_block as u64, chunk);
                 }
+                // 稀疏文件的“洞”（extent 没覆盖的逻辑块）按 POSIX 语义读作全零；
+                // 未写入（fallocate 预分配）的 extent 同样读作零。
+                // 以前把洞当成文件结尾，会让 ELF 被截断、exec 时 panic
+                // （mkfs.ext4 -d / cp 默认都会把全零块做成洞）。
                 BlockMapping::Hole | BlockMapping::Unwritten => chunk.fill(0),
             }
             offset += count as u64;

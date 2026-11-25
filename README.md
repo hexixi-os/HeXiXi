@@ -1,16 +1,16 @@
 # 核夕夕 HeXiXi
 
-基于 [rCore-Tutorial-v3](https://github.com/rcore-os/rCore-Tutorial-v3) 的 RISC-V64 教学内核，
-已改造成能跑「全国大学生操作系统比赛（oscomp）」官方测例。运行在 QEMU 里。
+基于 [rCore-Tutorial-v3](https://github.com/rcore-os/rCore-Tutorial-v3) 的教学内核，
+支持在 QEMU 的 RISC-V64 和 LoongArch64 平台上运行全国大学生操作系统比赛（oscomp）官方测例。
 
 ## 现在是什么状态
 
 - 内核约 7700 行 Rust，实现了 100 多个 Linux 系统调用（`fork`/`exec`/`clone`/`futex`/`mmap`/信号等）。
 - 文件系统：只读 EXT4（评测盘）。写入的文件只存在内存里，重启就没了。
-- 单核，网卡驱动和网络协议栈仍待实现。
+- RISC-V64 默认单核，可启用双核。LoongArch64 支持单核启动。网卡驱动和网络协议栈仍待实现。
 - RISC-V64 `execve` 支持 ELF 解释器，已验证动态链接的 musl 和 glibc Hello World。
 - QEMU 内核内嵌 runner，可按组执行官方盘 `/musl` 和 `/glibc` 下的原版脚本。
-- **基线**：2025 官方发布的 RISC-V64 原盘已在本地 QEMU 上跑通 `basic-musl`。分数和失败用例见 [测试状态](docs/TEST_STATUS.md)。
+- 2025 年官方原盘的 RISC-V64 和 LoongArch64 basic 测试结果，以及旧版官方布局盘的实测记录，见 [测试状态](docs/TEST_STATUS.md)。
 
 评测适配基于 `oscomp-adaptation`，`main` 为原版教学内核基线。
 

@@ -482,10 +482,10 @@ impl ProcessControlBlock {
         let mut child_inner = child.inner_exclusive_access();
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
-        // modify kstack_top in trap_cx of this thread
         let mut task_inner = task.inner_exclusive_access();
         let parent_task = parent.get_task(0);
         let parent_thread = parent_task.inner_exclusive_access();
+        let parent_cx = *parent_thread.get_trap_cx();
         task_inner.signal_mask = parent_thread.signal_mask;
         task_inner.signal_context = parent_thread.signal_context.map(|(mut context, mask)| {
             context.kernel_sp = task.kstack.get_top();
@@ -495,6 +495,7 @@ impl ProcessControlBlock {
         task_inner.set_child_tid = set_child_tid;
         task_inner.clear_child_tid = clear_child_tid.unwrap_or(0);
         let trap_cx = task_inner.get_trap_cx();
+        *trap_cx = parent_cx;
         trap_cx.kernel_sp = task.kstack.get_top();
         if stack != 0 {
             trap_cx.x[crate::arch::REG_SP] = stack;
