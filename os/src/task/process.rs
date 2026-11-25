@@ -201,7 +201,7 @@ impl ProcessControlBlock {
         let token = inner.get_user_token();
         let task = inner.get_task(0);
         drop(inner);
-        let mut inner = task.inner_exclusive_access();
+        let inner = task.inner_exclusive_access();
         let mut sp = inner.res.as_ref().unwrap().ustack_top();
         let mut pointers = Vec::with_capacity(args.len());
         for arg in args {

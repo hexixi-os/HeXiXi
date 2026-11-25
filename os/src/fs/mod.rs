@@ -66,8 +66,8 @@ pub trait File: Send + Sync {
     }
 }
 
-pub use inode::{is_unlinked, list_apps, mark_unlinked, open_file, root_names, OSInode, OpenFlags};
-pub use pipe::{make_pipe, Pipe};
+pub use inode::{list_apps, mark_unlinked, open_file, root_names, OpenFlags};
+pub use pipe::make_pipe;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -495,10 +495,6 @@ pub fn rename_overlay(old: &str, new: &str, no_replace: bool) -> Result<(), isiz
     overlay_rename(old, new, source, hide_lower)
 }
 
-/// 根目录下的名字列表
-pub fn names() -> Vec<String> {
-    list_dir_path("").into_iter().map(|(name, _, _)| name).collect()
-}
 pub use stdio::{Stdin, Stdout};
 
 /// Keep one statistics snapshot per open without allocating a physical cache frame.

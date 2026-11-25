@@ -15,4 +15,3 @@ debug = true
 
 [features]
 board_qemu = []
-board_k210 = []

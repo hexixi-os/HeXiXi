@@ -116,9 +116,7 @@ pub fn local_flush_tlb() {
 }
 
 pub fn activate_kernel_table(token: usize) {
-    unsafe {
-        satp::write(token);
-    }
+    satp::write(token);
     local_flush_tlb();
 }
 

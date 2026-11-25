@@ -37,21 +37,19 @@
 #      否则绝大多数用例一启动就 TBROK（见 logs 里的 unsupported syscall）。
 # =============================================================================
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
-SUITE=${SUITE:-$HOME/testsuits}
 SRC=${SRC:-$SUITE/ltp-full-20240524}
-OUT=${OUT:-$HOME/oscomp-work/ltp}
-TOOLCHAIN=${TOOLCHAIN:-$HOME/toolchains/riscv64-linux-musl-cross/bin}
-KERNEL=${KERNEL:-$HOME/rCore-Tutorial-v3/kernel-rv}
-[ -f "$KERNEL" ] || KERNEL=$HOME/rCore-Tutorial-v3/os/target/riscv64gc-unknown-none-elf/release/os.bin
-WORK=$OUT/imgwork
+OUT=${OUT:-$WORK/ltp}
+KERNEL=${KERNEL:-$REPO/kernel-rv}
+[ -f "$KERNEL" ] || KERNEL=$REPO/os/target/riscv64gc-unknown-none-elf/release/os.bin
+IMGWORK=$OUT/imgwork
 LOGD=$OUT/logs
 AT=$OUT/autotools
-export PATH="$AT/usr/bin:$TOOLCHAIN:$PATH"
+export PATH="$AT/usr/bin:$PATH"
 export ACLOCAL_PATH=/usr/share/aclocal
-CC_BIN=$TOOLCHAIN/riscv64-linux-musl-gcc
-CC_CMD="$CC_BIN -static -no-pie"
-mkdir -p "$OUT" "$LOGD" "$WORK/ltp/testcases/bin"
+CC_CMD="$CC -static -no-pie"
+mkdir -p "$OUT" "$LOGD" "$IMGWORK/ltp/testcases/bin"
 
 # 只构建这批 syscall 目录（想扩子集就改这里；FULL=1 时忽略）
 DIRS=${DIRS:-"getpid getppid getuid getgid geteuid getegid uname gettimeofday times \
@@ -134,28 +132,28 @@ build_ltp() {
 # ---------------------------------------------------------------- 打包
 pack_image() {
     echo "== [5/5] 收集二进制 + 打 128MB ext4 盘"
-    rm -rf "$WORK/ltp/testcases/bin"; mkdir -p "$WORK/ltp/testcases/bin"
+    rm -rf "$IMGWORK/ltp/testcases/bin"; mkdir -p "$IMGWORK/ltp/testcases/bin"
     : > "$OUT/binlist.txt"
     if [ "${FULL:-0}" = "1" ]; then
         # 全量：按 install 布局从各源码目录收集可执行文件
         find "$SRC/testcases" -maxdepth 4 -type f -perm -u+x \
             -name '*' ! -name '*.c' ! -name '*.h' ! -name '*.o' > "$OUT/allbins.tmp" 2>/dev/null || true
-        while read -r f; do cp -f "$f" "$WORK/ltp/testcases/bin/${f##*/}"; done < "$OUT/allbins.tmp"
+        while read -r f; do cp -f "$f" "$IMGWORK/ltp/testcases/bin/${f##*/}"; done < "$OUT/allbins.tmp"
     else
         for d in $DIRS; do
             [ -d "$SRC/testcases/kernel/syscalls/$d" ] || continue
             for f in "$SRC/testcases/kernel/syscalls/$d"/*; do
                 [ -f "$f" ] && [ -x "$f" ] || continue
                 case "$f" in *.c|*.h|*.o|*.d|*.mk|Makefile*) continue;; esac
-                cp -f "$f" "$WORK/ltp/testcases/bin/${f##*/}"
+                cp -f "$f" "$IMGWORK/ltp/testcases/bin/${f##*/}"
             done
         done
     fi
-    "$TOOLCHAIN/riscv64-linux-musl-strip" "$WORK/ltp/testcases/bin/"* 2>/dev/null || true
-    echo "   用例数: $(ls "$WORK/ltp/testcases/bin" | wc -l), 大小: $(du -sh "$WORK/ltp/testcases/bin" | cut -f1)"
+    "$STRIP" "$IMGWORK/ltp/testcases/bin/"* 2>/dev/null || true
+    echo "   用例数: $(ls "$IMGWORK/ltp/testcases/bin" | wc -l), 大小: $(du -sh "$IMGWORK/ltp/testcases/bin" | cut -f1)"
 
     # 本地 testcode：保留官方 START/END 标记，去掉 basename 依赖，加单例超时
-    cat > "$WORK/ltp_testcode.sh" <<'EOS'
+    cat > "$IMGWORK/ltp_testcode.sh" <<'EOS'
 #!/bin/bash
 cd /
 export PATH=/:/bin:/sbin:/usr/bin:/usr/sbin
@@ -172,18 +170,18 @@ for file in "$target_dir"/*; do
 done
 echo "#### OS COMP TEST GROUP END ltp ####"
 EOS
-    chmod 755 "$WORK/ltp_testcode.sh"
+    chmod 755 "$IMGWORK/ltp_testcode.sh"
 
     local img=$OUT/ltp-disk.img cmds=$LOGD/cmds.txt
     rm -f "$img"
     dd if=/dev/zero of="$img" bs=1M count=128 status=none
     mkfs.ext4 -q -F -L LTP "$img"
     : > "$cmds"
-    echo "write $WORK/ltp_testcode.sh /ltp_testcode.sh"          >> "$cmds"
+    echo "write $IMGWORK/ltp_testcode.sh /ltp_testcode.sh"          >> "$cmds"
     echo "write $SUITE/busybox/busybox /busybox"                 >> "$cmds"
-    echo "write $HOME/oscomp-work/fsroot/target/oscomp_runner /oscomp_runner" >> "$cmds"
+    echo "write $RUNNER /oscomp_runner" >> "$cmds"
     for d in ltp ltp/testcases ltp/testcases/bin tmp var var/tmp dev; do echo "mkdir /$d" >> "$cmds"; done
-    for f in "$WORK/ltp/testcases/bin/"*; do
+    for f in "$IMGWORK/ltp/testcases/bin/"*; do
         echo "write $f /ltp/testcases/bin/${f##*/}" >> "$cmds"
     done
     debugfs -w -f "$cmds" "$img" > "$LOGD/debugfs.log" 2>&1 || true

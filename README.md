@@ -1,68 +1,54 @@
 # 核夕夕 HeXiXi
 
-基于 [rCore-Tutorial-v3](https://github.com/rcore-os/rCore-Tutorial-v3) 的教学内核，
-支持在 QEMU 的 RISC-V64 和 LoongArch64 平台上运行全国大学生操作系统比赛（oscomp）官方测例。
+基于 [rCore-Tutorial-v3](https://github.com/rcore-os/rCore-Tutorial-v3) 的 Rust 操作系统内核，支持在 QEMU 的 RISC-V64（单核 / 双核）与 LoongArch64（单核）平台上运行全国大学生操作系统比赛（oscomp）官方测例。
 
-## 现在是什么状态
+## 当前能力
 
-- 内核约 7700 行 Rust，实现了 100 多个 Linux 系统调用（`fork`/`exec`/`clone`/`futex`/`mmap`/信号等）。
-- 文件系统：只读 EXT4（评测盘）。写入的文件只存在内存里，重启就没了。
-- RISC-V64 默认单核，可启用双核。LoongArch64 支持单核启动。网卡驱动和网络协议栈仍待实现。
-- RISC-V64 `execve` 支持 ELF 解释器，已验证动态链接的 musl 和 glibc Hello World。
-- QEMU 内核内嵌 runner，可按组执行官方盘 `/musl` 和 `/glibc` 下的原版脚本。
-- 2025 年官方原盘的 RISC-V64 和 LoongArch64 basic 测试结果，以及旧版官方布局盘的实测记录，见 [测试状态](docs/TEST_STATUS.md)。
+- **架构与多核**：RISC-V64 默认单核，支持 `SMP=1` 双核调度与远程 TLB 同步；LoongArch64 支持单核 ELF 直启与 VirtIO PCI。
+- **内存与装载**：按需 ELF 加载、`fork` 写时复制（CoW）、文件/匿名 `mmap` 与 VMA 拆分、共享页缓存（`lru` / `adaptive` / `none`）、动态 ELF 解释器（musl / glibc）。
+- **进程与线程**：实现 100+ Linux 系统调用，支持 `clone` / `futex` / TLS / 信号投递 / `pthread` 与线程组退出。
+- **文件系统**：只读 EXT4（支持多块组、稀疏文件、区间读取）+ 可写内存 Overlay（大文件、稀疏页、`MAP_SHARED`、`truncate`、重命名与 `O_TMPFILE`）。
+- **评测对接**：`make all` 产出内嵌 `oscomp_runner` 的 `kernel-rv`，可直接运行 2025 官方原盘 `/musl` 与 `/glibc` 脚本。网卡驱动与 TCP/IP 协议栈待实现。
 
-评测适配基于 `oscomp-adaptation`，`main` 为原版教学内核基线。
+> 分支说明：`oscomp-adaptation` 为主开发分支，`main` 为上游原版教学内核基线。
 
 ## 快速开始
 
-在 Ubuntu / WSL2 里（Windows 原生不支持）。环境怎么装、每个脚本干什么，见 [开发与测试指南](docs/DEVELOPMENT.md)。
-
-### 官方盘
-
-使用 2025 初赛原盘及同一版本的测试套件。下载步骤见 [官方盘回归](docs/oscomp-evaluation.md#官方盘回归)，全部 24 项的复跑方法见 [完整评测矩阵](docs/oscomp-evaluation.md#完整评测矩阵)。
+在 Linux / Ubuntu（或 WSL2）下执行，环境配置见 [构建与运行](docs/BUILD.md)。
 
 ```bash
+# 构建 RISC-V64 评测内核（单核 / 双核）
+make all
+make all SMP=1
+
+# 构建 LoongArch64 评测内核
+make kernel-la
+
+# 官方盘 basic 回归
 SUITE=~/testsuits-pre-20250615 tools/oscomp/run_official_basic.sh ~/sdcard-rv.img ~/oscomp-work/official-basic
-```
-
-### 本地模拟盘
-
-```bash
-bash tools/oscomp/setup.sh                 # 下载测试套件、交叉编译器、cmake
-bash tools/oscomp/build_runner.sh          # 用户态启动程序 oscomp_runner
-bash tools/oscomp/build_busybox.sh         # busybox
-bash tools/oscomp/build_tests.sh           # basic 组的 32 个用例
-bash tools/oscomp/make_local_image.sh      # 打成 EXT4 测试盘
-make -C os build                      # 编译内核
-bash tools/oscomp/run_group.sh ~/oscomp-work/local/disk.img 256M 200 ~/oscomp-work/local/basic.log
-bash tools/oscomp/score_basic.sh ~/oscomp-work/local/basic.log     # 官方判分器打分
 ```
 
 ## 目录结构
 
 ```
-os/             内核：内存 mm/、陷阱 trap/、进程线程 task/、系统调用 syscall/、文件系统 fs/、驱动 drivers/
-user/           用户态库和程序；src/bin/oscomp_runner.rs 是内核启动的第一个进程
-easy-fs/        原版 rCore 的文件系统库（评测路线基本用不到）
-easy-fs-fuse/   把用户程序打成 easy-fs 镜像的宿主工具
-bootloader/     预编译 RustSBI 固件（已不用，改用 QEMU 自带 OpenSBI）
-tools/oscomp/   测试盘构建、运行、判分脚本
-docs/           文档
+os/             内核源码（arch/、boards/、drivers/、fs/、mm/、sync/、syscall/、task/、trap/）
+user/           用户态库、回归测试程序与 oscomp_runner
+easy-fs/        easy-fs 文件系统库（教学盘 / usertests）
+easy-fs-fuse/   easy-fs 镜像打包工具
+tools/oscomp/   官方盘评测矩阵、本地模拟盘构建与专项回归脚本
+docs/           项目文档
 ```
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
-| [开发与测试指南](docs/DEVELOPMENT.md) | **先看这个**：环境、模块、开发流程、调试、测试原理 |
-| [测试状态](docs/TEST_STATUS.md) | 各评测组的实测分数和已知问题 |
-| [构建与运行](docs/BUILD.md) | 环境安装；在本地镜像上跑 usertests |
-| [对接官方评测](docs/oscomp-evaluation.md) | 评测机怎么跑、内核怎么对接 |
-| [参考链接](docs/REFERENCES.md) | 各工具、测试套件、上游项目和规范的官方地址 |
-| [适配改动说明](docs/ADAPTATION_NOTES.md) | 历史记录：每一轮适配改了什么（数字未经 Martyr 复现） |
-| [部署笔记](docs/deploy-notes.md)、[线程笔记](docs/thread-support.md) | 历史记录，仅供参考 |
+| [构建与运行](docs/BUILD.md) | 环境安装、RISC-V64 / LoongArch64 / SMP 构建、usertests 与常见问题 |
+| [开发与测试指南](docs/DEVELOPMENT.md) | 内核模块、启动流程、调试方法、本地模拟盘与专项回归 |
+| [对接官方评测](docs/oscomp-evaluation.md) | 评测机契约、官方原盘回归与 24 项评测矩阵 |
+| [测试状态](docs/TEST_STATUS.md) | 当前各平台与各专项回归的实测结果与已知限制 |
+| [参考链接](docs/REFERENCES.md) | 赛事仓库、内核资料、工具链与测例上游地址 |
 
 ## 许可证
 
-沿用上游，见 [LICENSE](LICENSE)。
+沿用上游许可证，见 [LICENSE](LICENSE)。

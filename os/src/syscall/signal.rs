@@ -10,10 +10,6 @@ pub const SIGSTUB_VA: usize = 0x00FF_E000;
 pub const SIGCTX_VA: usize = 0x00FF_F000;
 /// 信号编号：SIGALRM（定时器）
 pub const SIGALRM: usize = 14;
-/// 信号编号：SIGCHLD（子进程退出）
-pub const SIGCHLD: usize = 17;
-/// 信号编号：SIGSEGV（非法访问）
-pub const SIGSEGV: usize = 11;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

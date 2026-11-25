@@ -10,7 +10,6 @@ use crate::task::{
     current_process, current_task, current_user_token, exit_current_and_run_next,
     suspend_current_and_run_next,
 };
-use crate::timer::get_time_ms;
 use alloc::vec::Vec;
 
 pub fn sys_exit(exit_code: i32) -> ! {
@@ -23,20 +22,8 @@ pub fn sys_yield() -> isize {
     0
 }
 
-pub fn sys_get_time() -> isize {
-    get_time_ms() as isize
-}
-
 pub fn sys_getpid() -> isize {
     current_task().unwrap().process.upgrade().unwrap().getpid() as isize
-}
-
-pub fn sys_fork() -> isize {
-    fork_with_stack(0)
-}
-
-pub(super) fn fork_with_stack(stack: usize) -> isize {
-    fork_with_child_tid(stack, None, None)
 }
 
 pub(super) fn fork_with_child_tid(

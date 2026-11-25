@@ -1,7 +1,6 @@
 use core::arch::asm;
 
 const SYSCALL_DUP: usize = 23;
-const SYSCALL_DUP3: usize = 24;
 const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_OPEN: usize = 56;
 const SYSCALL_CLOSE: usize = 57;

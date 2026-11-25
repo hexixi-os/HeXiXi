@@ -193,6 +193,7 @@ struct DummyUserPage([u8; PAGE_SIZE]);
 static mut DUMMY_USER_PAGE: DummyUserPage = DummyUserPage([0; PAGE_SIZE]);
 
 fn dummy_user_page() -> *mut u8 {
+    #[allow(unused_unsafe)]
     unsafe { core::ptr::addr_of_mut!(DUMMY_USER_PAGE) as *mut u8 }
 }
 
@@ -293,12 +294,6 @@ pub fn translated_byte_buffer(
         start += count;
     }
     Some(buffers)
-}
-
-/// Load a string from other address spaces into kernel space without an end `\0`.
-pub fn translated_str(token: usize, ptr: *const u8) -> String {
-    read_user_string(token, ptr, |s: &mut String, byte| s.push(char::from(byte)))
-        .unwrap_or_else(|(prefix, _)| prefix)
 }
 
 /// Require a NUL terminator before returning a path to a filesystem operation.

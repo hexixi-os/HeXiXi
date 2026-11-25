@@ -1,7 +1,4 @@
 //! 从 boot DTB 读取真实物理内存大小（QEMU -m 参数）
-use core::sync::atomic::{AtomicUsize, Ordering};
-
-static DETECTED_RAM_END: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]
 pub struct BootInfo {
@@ -133,7 +130,7 @@ pub fn detect_boot_info() -> BootInfo {
                 let nameoff = read_be32(p + 4) as usize;
                 let value = p + 8;
                 p = (value + len + 3) & !3;
-                let mut q = dtb + off_strings + nameoff;
+                let q = dtb + off_strings + nameoff;
                 let mut nlen = 0;
                 while unsafe { *(q as *const u8).add(nlen) } != 0 {
                     nlen += 1;
@@ -199,13 +196,7 @@ pub fn detect_boot_info() -> BootInfo {
         }
     }
     if max_end > 0 {
-        DETECTED_RAM_END.store(max_end, Ordering::Relaxed);
         info.ram_end = Some(max_end);
     }
     info
-}
-
-pub fn ram_end() -> Option<usize> {
-    let v = DETECTED_RAM_END.load(Ordering::Relaxed);
-    if v == 0 { None } else { Some(v) }
 }

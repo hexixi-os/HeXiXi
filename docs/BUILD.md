@@ -1,33 +1,38 @@
 # 构建与运行
 
-这份讲环境安装、编译内核、在本地镜像上跑 usertests。
-评测测试盘的构建、运行和判分见 [开发与测试指南](DEVELOPMENT.md)。
+支持 Ubuntu 22.04+（原生或 WSL2，不支持原生 Windows；WSL 请将仓库放在 Linux 文件系统内如 `~/HeXiXi`，避免 `/mnt/d/...`）。
 
-## 支持环境
+## 1. 环境安装
 
-- Ubuntu 22.04 及以上，原生或 WSL2（实测 Ubuntu 26.04）。
-- 不支持原生 Windows，请用 WSL2。macOS 需要自己装 `riscv64-elf-gcc` 和 QEMU，没验证过。
-- 仓库请放在 WSL 自己的文件系统里（如 `~/HeXiXi`），不要放 `/mnt/d/...`，跨文件系统编译慢很多。
+### 实测工具链版本
 
-## 一次性安装
+| 组件 | 版本 | 说明 |
+|---|---|---|
+| Rust（RISC-V64 内核与用户态） | `nightly-2022-08-05` | 由 `rust-toolchain.toml` 自动锁定 |
+| Rust（LoongArch64） | `1.98.1` | 目标 `loongarch64-unknown-none-softfloat` |
+| Rust（宿主工具） | `stable` | 构建 `easy-fs-fuse` 与 `cargo-binutils 0.3.3` |
+| QEMU | 8.2.2 / 10.2.1 | 使用自带 OpenSBI（`-bios default`） |
+| 交叉编译器 / 工具 | `gcc-riscv64-linux-gnu`、`musl.cc` GCC 11.2.1、CMake 3.31.6 | 本地模拟盘用 `tools/oscomp/setup.sh` 自动准备 |
+
+### 系统包与 Rust
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential curl git make tmux \
   qemu-system-riscv gcc-riscv64-linux-gnu gcc-riscv64-unknown-elf \
   gdb-multiarch binutils-riscv64-unknown-elf
-sudo ln -sf /usr/bin/gdb-multiarch /usr/local/bin/riscv64-unknown-elf-gdb   # Makefile 里调用的是这个名字
+sudo ln -sf /usr/bin/gdb-multiarch /usr/local/bin/riscv64-unknown-elf-gdb
 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
+cargo +stable install cargo-binutils --version 0.3.3 --locked
 ```
 
-- 较旧的 Ubuntu（如 24.04）里 QEMU 的包名是 `qemu-system-misc`。
-- `rust-toolchain.toml` 会自动拉取 `nightly-2022-08-05` 和所需组件，不用手动装。
+> 较旧的 Ubuntu（如 24.04）中 QEMU 包名为 `qemu-system-misc`。
 
-### cargo 镜像源（国内网络必需）
+### 国内 Cargo 镜像源（可选）
 
-`~/.cargo/config.toml`：
+`~/.cargo/config.toml`（锁定的 Cargo 1.64 需显式开启 `sparse-registry`）：
 
 ```toml
 [source.crates-io]
@@ -40,46 +45,38 @@ registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
 git-fetch-with-cli = true
 
 [unstable]
-sparse-registry = true      # 锁定的 cargo 1.64 需要显式开启
+sparse-registry = true
 ```
 
-### cargo-binutils
+仓库提交了 `os/`、`user/`、`easy-fs-fuse/` 三个 `Cargo.lock` 以锁定旧版 nightly 兼容的依赖，修改依赖时请同步更新 lockfile。
 
-`make env` 会用旧 nightly 去装它，会失败。先用 stable 装好：
+## 2. 构建内核
 
-```bash
-cargo +stable install cargo-binutils --version 0.3.3 --locked
-```
-
-### GitHub 不通时
+### RISC-V64（单核 / 双核）
 
 ```bash
-git config --global url."https://gitee.com/".insteadOf "https://github.com/"
-```
-
-`os/Cargo.toml` 和 `user/Cargo.toml` 里的依赖已经固定为 Gitee 地址，这条只影响其他间接依赖。
-
-## 编译
-
-```bash
-make -C os build        # 编译内核 + 用户程序 + 打包 easy-fs 镜像
+make all                         # 评测内核 kernel-rv（单核，内嵌 oscomp_runner）
+make all SMP=1                   # 双核评测内核（依赖 OpenSBI HSM/RFENCE）
+make -C os build                 # 开发构建：os.bin + easy-fs 镜像 fs.img
 make -C os clean
 ```
 
-| 产物 | 路径 |
-|---|---|
-| 内核镜像 | `os/target/riscv64gc-unknown-none-elf/release/os.bin` |
-| easy-fs 镜像 | `user/target/riscv64gc-unknown-none-elf/release/fs.img` |
+可选构建参数：
+- `PAGE_CACHE_POLICY=lru|adaptive|none`（默认 `lru`）
+- `ELF_STARTUP_STATS=1`（开启 ELF/fork 启动统计）
+- `KERNEL_OUT=<path>`（指定输出路径）
 
-评测用的 EXT4 测试盘不在这里，由 `tools/oscomp/` 的脚本生成。
+### LoongArch64（单核）
 
-## 在本地镜像上跑 usertests
+```bash
+rustup toolchain install 1.98.1 --profile minimal
+rustup target add --toolchain 1.98.1 loongarch64-unknown-none-softfloat
+make kernel-la                   # 产出 ELF 格式 kernel-la
+```
 
-**这个分支上 `make run`、`make run TEST=1` 都不会按预期工作。**
-内核启动第一个进程时，盘里只要有 `oscomp_runner` 就先启动它（见 `os/src/task/mod.rs` 的 `INITPROC`），
-而 `user/src/bin/` 下的程序会全部打进 `fs.img`，所以它总在。它找不到评测脚本就直接退出，内核随即关机，看起来就是「没有任何输出」。
+## 3. 运行 easy-fs `usertests`
 
-可以用独立的 easy-fs 镜像启动 usertests。从仓库根目录运行，镜像会把 usertests 作为 `initproc` 安装。
+本分支在 `fs.img` 包含 `oscomp_runner` 时会优先启动 runner，导致 `make -C os run TEST=1` 直接退出。可用独立 easy-fs 镜像将 `usertests` 作为 `initproc` 启动：
 
 ```bash
 work=$(mktemp -d)
@@ -100,80 +97,11 @@ qemu-system-riscv64 -machine virt -m 256M -nographic -bios default \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 ```
 
-完整执行包含 1,000 次管道测试，结束时会输出 `Usertests passed!` 并自动关机。测试结果见 [测试状态](TEST_STATUS.md)。
-不带 `TEST=1` 时 `initproc` 会启动 `user_shell`，这条路径 Martyr 没有实测。
+## 4. 常见问题
 
-## 在只读 EXT4 盘上验证可写 Overlay
-
-从仓库根目录执行以下命令。脚本使用 `mkfs.ext4`、`sha256sum` 和 QEMU，构建独立测试盘并启动 768 MiB 单核虚拟机。串口日志可用于核对大文件、稀疏页、共享映射和临时文件生命周期。
-
-```bash
-bash tools/oscomp/test_overlay_fs.sh /tmp/hexixi-overlay-fs.log
-```
-
-## 构建和运行 LoongArch64
-
-LoongArch64 使用 Rust 1.98.1 的裸机 soft-float 目标，产物为 ELF 格式的 `kernel-la`。RISC-V 的默认入口仍是 `make all`。
-
-```bash
-rustup toolchain install 1.98.1 --profile minimal
-rustup target add --toolchain 1.98.1 loongarch64-unknown-none-softfloat
-make kernel-la
-```
-
-在装有 QEMU 8.2.2、`mkfs.ext4` 和 GNU `timeout` 的环境中运行启动回归。脚本在 QEMU `virt` 单核上挂载只读 VirtIO PCI 盘，执行用户态 ELF，并核对 `clone` 的 TLS 与 child TID。
-
-```bash
-bash tools/oscomp/test_loongarch_boot.sh /tmp/hexixi-loongarch.log
-```
-
-使用 [2025 初赛原盘](https://github.com/oscomp/testsuits-for-oskernel/releases/tag/pre-20250615) 复跑 basic。解压 `sdcard-la.img.xz` 后传入原盘路径，`--suite` 指向包含官方 basic 判分器的源码检出。
-
-```bash
-python3 tools/oscomp/run_official_matrix.py --arch loongarch64 \
-    /path/to/sdcard-la.img /tmp/hexixi-loongarch-basic basic \
-    --suite /path/to/testsuits --kernel kernel-la
-```
-
-LoongArch64 的 `virt` 测试使用 QEMU 直启 ELF，通过 `fw_cfg` 传入单个测试组。虚拟机配置 1 GiB，内核分配器使用低地址连续 RAM。硬件范围为单核 QEMU `virt`，用户上下文保存整数和标量浮点寄存器。成绩和已知限制见[测试状态](TEST_STATUS.md)。
-
-## 在 RISC-V QEMU 上启用双核
-
-`SMP=1` 启用 RISC-V `virt` 的多 hart 启动和调度。默认的 `make all` 仍构建单核内核。SMP 使用 OpenSBI 的 HSM 与 RFENCE，已在 QEMU 8.2.2 自带的 OpenSBI v1.3 上验证。
-
-```bash
-make all SMP=1 KERNEL_OUT=kernel-rv
-KERNEL="$PWD/kernel-rv" bash tools/oscomp/test_smp.sh /tmp/hexixi-smp.log
-```
-
-启动回归创建只读 EXT4 测试盘，默认以两个 hart 启动。测试会核对父子进程的 CPU 和调度亲和性，并运行跨核 COW 与共享文件截断。也可以让脚本自行构建 SMP 内核。
-
-```bash
-python3 tools/oscomp/run_official_matrix.py --smp 2 \
-    /path/to/sdcard-rv.img /tmp/hexixi-smp-basic basic \
-    --suite /path/to/testsuits --kernel kernel-rv
-```
-
-SMP 首版在创建进程时轮转分配 hart，同一进程的线程留在同一 hart。不同进程的用户态可以并行，内核代码由一把全局票号锁串行执行。LoongArch64 沿用单核启动路径。
-
-## 常见问题
-
-| 现象 | 原因 | 处理 |
-|---|---|---|
-| `Updating crates.io index` 长时间无响应 | 走的是 git 索引 | 配 USTC sparse 源（见上） |
-| `usage of sparse registries requires -Z sparse-registry` | cargo 1.64 没开开关 | `[unstable] sparse-registry = true` |
-| `cannot be built because it requires rustc 1.xx or newer` | 依赖选了新版 | `Cargo.lock` 已锁定；若被删，`cargo update -p regex --precise 1.7.3` |
-| `this version of Cargo is older than the 2024 edition` | 旧 nightly 编不动新 crate | 这个 crate 改用 stable 安装（见 cargo-binutils） |
-| `make run` 直接退出，没有 shell | `oscomp_runner` 先被启动 | 见上一节 |
-| 启动后串口完全没输出 | 仓库自带的 `bootloader/rustsbi-qemu.bin` 损坏 | 已改用 `-bios default` + `-kernel`，不要换回去 |
-| 输入命令时首字符丢失 | 管道一次性灌入时的串口时序问题 | 在终端里手敲 |
-
-## 版本锁定
-
-仓库提交了三个 `Cargo.lock`（`os/`、`user/`、`easy-fs-fuse/`），是刻意的：
-工具链固定在 2022 年的 nightly，而 crates.io 上的依赖在持续升级，不锁版本随时会因 rustc 版本过低而编不过。
-**改了依赖，请把 lockfile 一起提交。**
-
-## 关于根目录的 Dockerfile
-
-它是 `main` 分支遗留的旧环境（QEMU 7.0、stable 工具链），和这个分支要求的 `nightly-2022-08-05` 对不上，当前不使用。
+| 现象 | 原因与处理 |
+|---|---|
+| `Updating crates.io index` 卡住 / 报 `-Z sparse-registry` | 按上文配置 USTC sparse 源并加上 `[unstable] sparse-registry = true` |
+| `make env` 安装 `cargo-binutils` 失败 | 先用 `cargo +stable install cargo-binutils --version 0.3.3 --locked` |
+| 依赖提示需要新版 rustc | 使用已提交的 `Cargo.lock`；若重建，需 `cargo update -p regex --precise 1.7.3` |
+| `make -C os run` 直接退出 | `fs.img` 含 `oscomp_runner` 被优先启动，见第 3 节 |

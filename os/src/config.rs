@@ -1,8 +1,5 @@
-#[allow(unused)]
-
 pub const USER_STACK_SIZE: usize = 4096 * 256;
 pub const KERNEL_STACK_SIZE: usize = 4096 * 2;
-pub const KERNEL_HEAP_SIZE: usize = 0x400_0000;
 #[cfg(target_arch = "riscv64")]
 pub const MEMORY_END: usize = 0x8FF0_0000;
 #[cfg(target_arch = "loongarch64")]

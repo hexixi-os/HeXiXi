@@ -160,27 +160,3 @@ pub fn frame_dealloc(ppn: PhysPageNum) {
     #[cfg(feature = "elf_startup_stats")]
     crate::fork_stats::on_frame_free();
 }
-
-#[allow(unused)]
-pub fn frame_allocator_test() {
-    let mut v: Vec<FrameTracker> = Vec::new();
-    for i in 0..5 {
-        let frame = frame_alloc().unwrap();
-        println!("{:?}", frame);
-        v.push(frame);
-    }
-    v.clear();
-    for i in 0..5 {
-        let frame = frame_alloc().unwrap();
-        println!("{:?}", frame);
-        v.push(frame);
-    }
-    drop(v);
-    println!("frame_allocator_test passed!");
-}
-
-/// 剩余可用页数（调试用）
-pub fn free_pages() -> usize {
-    let a = FRAME_ALLOCATOR.exclusive_access();
-    a.end - a.current
-}

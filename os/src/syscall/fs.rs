@@ -1,7 +1,6 @@
 use crate::fs::{self, make_pipe, OpenFlags};
 use crate::mm::{
-    read_user, translated_byte_buffer, translated_path, translated_str, write_user, MapPermission,
-    UserBuffer,
+    read_user, translated_byte_buffer, translated_path, write_user, MapPermission, UserBuffer,
 };
 use crate::task::{current_process, current_user_token};
 use alloc::{string::String, sync::Arc};
@@ -66,23 +65,6 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
     } else {
         -1
     }
-}
-
-pub fn sys_open(path: *const u8, flags: u32) -> isize {
-    let process = current_process();
-    let token = current_user_token();
-    let path = translated_str(token, path);
-    let inode = match crate::fs::open_dyn(path.as_str(), OpenFlags::from_bits(flags).unwrap()) {
-        Ok(file) => file,
-        Err(errno) => return errno,
-    };
-    let mut inner = process.inner_exclusive_access();
-    let fd = match inner.alloc_fd() {
-        Some(fd) => fd,
-        None => return -24, // EMFILE
-    };
-    inner.fd_table[fd] = Some(inode);
-    fd as isize
 }
 
 pub fn sys_close(fd: usize) -> isize {

@@ -23,7 +23,6 @@ virtio-pci = { package = "virtio-drivers", version = "=0.7.0" }
 [features]
 smp = []
 board_qemu = []
-board_k210 = []
 oscomp_runner = []
 elf_startup_stats = []
 page_cache_none = []

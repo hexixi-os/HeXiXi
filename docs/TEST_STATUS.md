@@ -1,340 +1,66 @@
 # 测试状态
 
-## 2026-11-25 PR-16 RISC-V 双核
+记录当前代码（RISC-V64 单核/双核 + LoongArch64 单核）在 2025 初赛官方原盘及专项回归上的最新实测结果（QEMU 8.2.2）。
 
-在 QEMU 8.2.2 和 OpenSBI v1.3 上用 `-smp 2` 启动。双核专项连续通过 12 次，两种启动 hart 各出现 6 次。每次在不同 hart 上运行 8 轮父子进程，核对 `getcpu` 与 `sched_getaffinity` 一致、私有映射写入互不影响，以及截短共享文件后，另一 hart 访问已撤销的页收到 `SIGBUS`。
+## 1. 官方 2025 初赛原盘 `basic`
 
-单核与双核均通过 basic ABI、mmap/VMA、fork COW、页缓存、ELF 按需加载、动态 ELF、pthread、可写 Overlay 和 easy-fs `usertests`。双核 `usertests` 跑完 29 项正常用例、8 项预期失败用例和 1,000 轮管道测试。LoongArch64 单核启动和 `clone` 回归也通过。
+| 平台与模式 | `basic-musl` | `basic-glibc` | 备注 |
+|---|---:|---:|---|
+| RISC-V64 单核 | **102/102** | **102/102** | 32 用例全部满分；musl 正常退出，glibc 外层 BusyBox 在组结束后退出 139 |
+| RISC-V64 双核（`SMP=1`，5 次） | 98–102/102 | 98–99/102 | 失分均来自 `test_pipe` 父子串口输出交错；组标记均完整 |
+| LoongArch64 单核 | **102/102** | **102/102** | 32 用例全部满分；无依赖 PIE 直启 + `statx`；glibc 外层脚本结束退出 139 |
 
-| RISC-V 官方原盘 | basic-musl | basic-glibc |
-| --- | --- | --- |
-| 单核 | 102/102 | 102/102 |
-| 双核，5 次 | 98–102/102 | 98–99/102 |
+## 2. 专项回归（全部通过）
 
-双核失分均来自 `test_pipe` 的父子串口输出交错。每次评测都得到完整的组输出，glibc 外层脚本仍在组结束后以 139 退出。内核态由全局锁串行执行，同进程线程固定在同一 hart，进程之间可并行。构建与复跑见[双核运行说明](BUILD.md#在-risc-v-qemu-上启用双核)。
+| 专项 | 覆盖范围 |
+|---|---|
+| `test_smp.sh` | RISC-V64 `-smp 2` 连续 12 次通过（双启动 hart 各 6 次），核对 `getcpu` / `sched_getaffinity`、跨核 CoW 与共享文件截断 `SIGBUS` |
+| `test_loongarch_boot.sh` | LoongArch64 ELF 直启、VirtIO PCI 只读 EXT4、用户态执行与 `clone` TLS/child TID |
+| `test_overlay_fs.sh` | 768 MiB 下 100 MiB 顺序写、>2 GiB 稀疏写、预算上限与回收、`MAP_SHARED` + `truncate`/`SIGBUS`、重命名与 `O_TMPFILE`；下层 EXT4 SHA-256 不变 |
+| `test_pthread_abi.sh` | 动态 musl 1.2.0 / glibc 2.31 各 16×8 并发线程（mutex/condvar/TLS/TID/信号/futex/`exit_group`）及动态 glibc BusyBox |
+| `test_elf_dynamic.sh` | musl PIE、glibc PIE 与高地址非 PIE 经 `PT_INTERP` 动态装载、堆扩缩与异常解释器处理 |
+| `test_elf_demand.sh` | 按需 ELF 加载与共享页缓存，覆盖非页对齐段、BSS、`mprotect` 与异常 ELF |
+| `test_fork_cow.sh` | `fork` 写时复制、父子隔离、`MAP_SHARED`、内存不足回滚与 128 MiB 下 40 MiB 驻留 `fork→exec` |
+| `test_mmap_vma.sh` & `test_basic_abi.sh` | 六参数 `mmap`、局部 `munmap`/`mprotect`、`MAP_FIXED`、跨 EOF `SIGBUS` 与基础文件/目录/进程 ABI |
+| `test_ext4.sh` | 宿主侧跨块组、稀疏洞、未写入 extent、索引 extent 树与页缓存复用/淘汰 |
+| easy-fs `usertests` | 单核与双核均跑完 29 项正常用例、8 项预期失败用例及 1,000 轮管道测试 |
 
-## 2026-11-24 PR-15 LoongArch64
+## 3. 关键性能基准
 
-QEMU 8.2.2 单核下，LoongArch64 内核从 ELF 直启，通过现代 VirtIO PCI 读取只读 EXT4，加载用户程序后正常关机。专项测试核对了 Linux `clone` 的 TLS 和 child TID 参数顺序，修正前缺少成功标记，修正后通过。缺页入口在遍历三层页表前检查 39 位规范地址。
+### ELF 按需装载冷启动（8 MiB 文件段 / 32 MiB 内存段，256 MiB 单核，5 次中位数）
 
-| 官方 2025 初赛原盘 | basic-musl | basic-glibc |
-| --- | --- | --- |
-| LoongArch64 | 102/102，正常退出 | 102/102，外层脚本退出 139 |
-| RISC-V64 | 102/102，正常退出 | 102/102，外层脚本退出 139 |
-
-LoongArch64 原盘的两组 basic ELF 均声明了全局路径缺失的 glibc 解释器。只有符合既有检查的无依赖、无重定位 PIE 在这种情况下直接启动。三项用例通过新增的 `statx` 获取文件大小和类型等基本属性。盘内 glibc BusyBox 仍在结束标记后发生用户态取指异常，测试组的完整输出已送交判分器。
-
-RISC-V64 的 basic ABI、可写 Overlay、mmap/VMA、fork COW、页缓存、ELF 按需加载、动态 ELF、pthread 和 easy-fs `usertests` 通过。LoongArch64 验证范围为单核 QEMU、低地址连续 RAM 和标量浮点上下文。构建与复跑命令见[构建说明](BUILD.md#构建和运行-loongarch64)。
-
-## 2026-11-24 PR-14 可写 Overlay
-
-在 QEMU 8.2.2 单核、768 MiB 内存和只读 EXT4 测试盘上运行 `tools/oscomp/test_overlay_fs.sh`。PR-13 在写到 1 MiB 时复现 `EFBIG`。PR-14 顺序写入 100 MiB 并读回文件末页，随后在 2 GiB 以上的偏移写入并读回稀疏文件。测试盘在退出前后的 SHA-256 一致。
-
-- 数据页预算为探测到的 RAM 四分之一，最多 128 MiB。硬上限覆盖所有上层文件、映射页及 Overlay ELF 快照，写满时返回短写或 `ENOSPC`。目录项和存活 inode 各限 16,384，命名路径总长限 2 MiB。专项覆盖预算耗尽、解除映射或删除目录项后的恢复。
-- 普通读写、追加和 `MAP_SHARED` 使用同一份上层数据。`truncate`、`ftruncate` 和 `O_TRUNC` 更新长度，清零截断尾部并移除各进程超出新 EOF 的驻留页。越界访问触发 `SIGBUS`，扩长后原映射可重新缺页。文件页预算耗尽时，共享缺页同样触发 `SIGBUS`。
-- 覆盖相对 dirfd 的重命名、覆盖已有文件、`RENAME_NOREPLACE`、上层目录移动后的旧 dirfd 与 cwd、unlink 后的打开描述符和映射、`O_TMPFILE` 回收，以及下层正规文件按需复制与旧路径遮蔽。大稀疏 Overlay ELF 快照只复制驻留数据页，上层 `#!` 脚本也能通过同一解释器启动。
-
-EXT4 下层以只读方式使用，上层数据随关机丢失。复制发生前打开的只读 fd 继续读取下层。同一映射的共享页在首次访问时计入数据预算。`msync` 校验地址区间和参数，内存内的共享写入即时可见。下层目录移动返回 `EXDEV`，无名临时文件当前只能通过 fd 或映射访问。
-
-| 回归 | 结果 |
-| --- | --- |
-| Overlay、basic ABI、mmap/VMA、fork COW、ELF 按需加载、页缓存 | 通过 |
-| musl/glibc 动态 ELF、pthread、glibc 动态 BusyBox | 通过 |
-| easy-fs `usertests` | 29 项成功用例、8 项预期失败，1,000 轮管道测试完成 |
-| 官方原盘 basic-musl / basic-glibc | 最新一次均为 102/102。glibc 外层脚本仍退出 139。重复运行中，`test_pipe` 的父子输出可能交错，PR-13 和 PR-14 均复现了这一判分波动。 |
-| 官方原盘 iozone-musl / iozone-glibc | 各 20 个判分项均为 0 分。两个 ELF 的 `PT_INTERP` 指向原盘缺失的 `/lib` 路径。glibc 脚本也出现低地址取指异常并退出 139。 |
-
-## 2026-11-24 PR-13 Linux 线程与进程 ABI
-
-QEMU 8.2.2 单核下，动态链接的 musl 1.2.0 和 glibc 2.31 各通过 16 轮、每轮 8 个并发线程的回归。每个线程执行 256 次互斥计数操作，条件变量同步启动，逐个检查 `pthread_join` 返回值、独立 TLS、TID 和共享 pipe 描述符。glibc 版动态 BusyBox 也通过 `sh -c` 启动并执行外部 `true`。
-
-ABI 回归还覆盖了 futex 值不匹配、唤醒计数和超时、线程信号屏蔽与定向投递、处理函数执行中收到 SIGKILL、在 handler 内 fork 后正常返回、工作线程调用 `exit_group`、线程组退出时仍在管道 I/O 的同伴，以及 fork 后 exec 对普通描述符和 `FD_CLOEXEC` 的区别处理。
-
-PR-12 内核在 easy-fs `usertests` 的 `race_adder_arg` 可复现内核 panic。教学线程的固定步长栈跨到保留信号页附近，创建返回 `-ENOMEM`，测试把负错误码转成无符号索引后触发越界。PR-13 在空闲地址区找栈并在 `waittid` 校验索引。完成的教学线程保留退出值，Linux 线程由内核回收资源，等待由 libc 配合 `clear_child_tid` 完成。
-
-easy-fs `usertests` 跑完 29 项正常与 8 项预期失败用例，包含 1,000 次 fork/exec 管道回归。套件中的 `until_timeout` 和 `huge_write_mt` 按原用例配置以缺少参数触发预期失败。官方原盘 `basic-musl`、`basic-glibc` 均为 **102/102**。musl 正常关机，glibc 原盘的静态 BusyBox 仍在结束标记后退出 139。
-
-复跑说明见[线程与进程 ABI](thread-support.md)，教学盘见 [usertests](BUILD.md#在本地镜像上跑-usertests)。
-
-## 2026-11-24 PR-12 动态 ELF
-
-在 QEMU 8.2.2 上以 `execve` 启动 musl 1.2.0 PIE、glibc 2.31 PIE 和高地址 glibc 2.31 非 PIE。三个程序均经各自的加载器链接 libc，读取参数和环境变量，输出 Hello World 并以 0 退出。两个 glibc 程序同时验证堆能扩展和收缩。主程序和解释器的 `PT_LOAD` 复用 ELF 缺页与文件页缓存。解释器缺失、路径未终止、解释器格式错误及映射冲突均纳入 ELF 回归。
-
-原盘 `basic-musl` 和 `basic-glibc` 均为 **102/102**，各 32 个用例全部满分。musl 正常关机，glibc BusyBox 仍在结束标记后以 139 退出。原盘 basic 的无依赖、无重定位程序在其声明的解释器缺失时沿用直启。basic ABI、静态 ELF 按需加载、fork COW、`mmap`/VMA 和 LRU `mixed32` 回归通过。
-
-在 Linux 环境下复跑动态 ELF。下例使用 Bootlin RISC-V64 软浮点 musl 交叉编译器、Ubuntu RISC-V64 glibc 交叉编译器和从官方盘提取的静态 BusyBox。若更换工具链，用 `readelf -l` 确认各程序的解释器路径，按该路径放置普通文件。
-
-```bash
-fixture=$(mktemp -d)
-mkdir -p "$fixture/lib"
-musl_cc=/path/to/riscv64-buildroot-linux-musl-gcc
-glibc_cc=riscv64-linux-gnu-gcc
-source_file=tools/oscomp/tests/elf_hello.c
-"$musl_cc" -fPIE -pie -O2 "$source_file" -o "$fixture/hello-musl"
-"$glibc_cc" -fPIE -pie -O2 "$source_file" -o "$fixture/hello-glibc"
-"$glibc_cc" -fno-pie -no-pie -Wl,-Ttext-segment=0x50000000 -O2 "$source_file" -o "$fixture/hello-glibc-exec"
-install -m755 "$("$musl_cc" -print-file-name=libc.so)" "$fixture/lib/ld-musl-riscv64-sf.so.1"
-for library in ld-linux-riscv64-lp64d.so.1 libc.so.6; do
-    install -m755 "$("$glibc_cc" -print-file-name="$library")" "$fixture/lib/$library"
-done
-debugfs -R "dump /musl/busybox $fixture/busybox" /path/to/sdcard-rv.img
-chmod +x "$fixture/busybox"
-tools/oscomp/test_elf_dynamic.sh "$fixture" "$fixture/serial.log"
-```
-
-## 2026-11-24 PR-11 官方原盘评测基线
-
-第一阶段基线 `c5903f1f` 在快进合入本地 `oscomp-adaptation` 前通过原盘 `basic-musl`，得分 102/102，32 个用例全部满分并正常关机。该基线与 PR-11 的评测内核均通过 basic ABI、ELF 按需加载、fork COW 和 `mmap`/VMA 回归。两者的默认 LRU 在 `mixed32` 页缓存回归中均读取 25,600 个扇区，热点未命中 96 次。
-
-矩阵使用 `feat/oscomp-linux-compat` 的 `bb4bed09128b6020b6a20ea0cdfc4d1934c0dbd1` 内核，SHA-256 为 `d9a3d5d0d2df78debeab8acbd9be85c986a490c6d4fff9d195e0a72743554f79`。2025 初赛 RISC-V64 发布盘解压后的 SHA-256 为 `95973543db6b84a9a5e70f30da466ce292867aff5b689fb14c88dc9406e378b8`。使用 QEMU 8.2.2、单核、1 GiB 内存，每组独立启动并限制 120 秒。套件与公开判分器版本见[复跑命令](oscomp-evaluation.md#完整评测矩阵)。
-
-24 项均启动了目标脚本。9 项正常退出，9 项在输出结束标记后以 139 退出，6 项超时。全部串口中未观察到内核 panic。表中的分数来自本地运行的公开判分器。其余组记录脚本自己的结果或日志，赛事平台总分待评测。
-
-| 组 | musl 运行与结果 | glibc 运行与结果 | 串口观察 |
-|---|---|---|---|
-| basic | 正常，102/102 | 退出 139，102/102 | 两版各 32 个用例满分。glibc BusyBox 在结束标记后发生取指缺页 |
-| busybox | 超时，10/53 | 超时，2/53 | 两版都停在 `dmesg` 后的 `du` 一带。分数来自超时前的输出 |
-| lua | 正常，0/9 | 退出 139，0/9 | 原盘有 `test.sh`，其 shebang 指向盘上缺失的 `/bin/busybox` |
-| libctest | 正常，220 项共 0 分 | 退出 139，220 项共 0 分 | 原盘有 `run-static.sh`、`run-dynamic.sh`，当前 BusyBox 报两个脚本无法执行 |
-| libcbench | 正常，部分子项输出耗时 | 退出 139 | 两版都有用户态取指缺页 |
-| lmbench | 超时，输出部分延迟数据 | 超时，输出部分延迟数据 | 两版都记录到 `Simple read`，此后没有完成整组 |
-| unixbench | 正常 | 退出 139 | 多个子进程取指缺页退出 |
-| iozone | 正常，20 项共 0 分 | 退出 139，20 项共 0 分 | 测试程序多次取指缺页，判分器没有匹配到有效吞吐量 |
-| cyclictest | 正常，4 项标记 `success` | 退出 139，4 项标记 `fail` | musl 的 `hackbench` 崩溃，部分环境命令或接口缺失，带压结果无效 |
-| ltp | 超时，109 个子进程退出记录 | 超时，109 个子进程退出记录 | 两版缺少 `basename`，用例名为空，随后都停在 `cgroup_regression_3_1.sh` |
-| iperf | 正常，6 项标记 `fail` | 退出 139，6 项标记 `fail` | musl 报缺 `/dev/urandom` 和 `socket` 返回 `ENOSYS`，glibc 有取指缺页 |
-| netperf | 正常，5 项标记 `fail` | 退出 139，5 项标记 `fail` | 两版都在子项中出现取指缺页 |
-
-## 2026-11-24 PR-10 页缓存扫描识别
-
-默认策略是 `lru`，可在构建时用 `PAGE_CACHE_POLICY=none|lru|adaptive` 切换。LRU 和自适应策略都最多保留 256 个 4 KiB 文件页，保护仍被映射引用的帧。自适应策略为每个打开文件记录连续读取的页数。缓存满时，从第 8 个连续页开始，未命中且近期历史中没有记录的页直接读请求的字节区间。近期淘汰页和被旁路后再次访问的页可以重新入缓存。历史最多记录 512 次淘汰或旁路事件。两种缓存策略都让 `mmap`、ELF 缺页和普通读取共享文件页。
-
-`/proc/page_cache` 在每次打开时生成一份只读快照。`hits`、`misses` 以查找次数计，一个 `readv` 跨多个缓冲区时可能多次查找同一页。`evictions` 包含容量淘汰及内存压力回收。`bypasses` 计入关缓存、扫描旁路、没有可淘汰帧及分配失败。`refaults` 只统计近期确实被淘汰的页再次未命中，历史过期后再访问不会计入。`resident_pages` 和 `pinned_pages` 分别是当前驻留数和其中仍有缓存外引用的页数。`ext4_sectors_read` 统计已完成的 EXT4 数据和元数据扇区读取，每个扇区为 512 字节。自行比较吞吐时应固定读取对齐和缓冲区切分，未对齐的旁路区间可能重复读取同一扇区。
-
-三种策略在 2025 年初赛 RISC-V64 官方原盘 `basic-musl` 上均为 **102/102**，32 个用例全部满分并正常关机。三种策略均通过文件 `mmap`/VMA 和 ELF 按需加载回归。默认策略还通过 basic ABI、fork COW、easy-fs 和宿主 EXT4 回归。宿主 EXT4 测试也覆盖自适应策略的碎片读、分句柄扫描识别及重复命中。
-
-### 策略对比
-
-在 QEMU 8.2.2、单核、128 MiB 内存下，每组负载使用同一份 32 MiB EXT4 镜像，每种策略独立启动三次，取中位数。混合负载先读一遍热点文件，再交替执行三轮 1,024 页顺序扫描与热点乱序访问。`reuse` 从冷缓存连续读同一段 128 页三次。`revisit` 先扫过另外 256 页填充缓存，再连续读同一段 128 页三次。BusyBox 取自 2025 年初赛 RISC-V64 官方盘的 `/musl/busybox`，测量冷页缓存下第一次执行 `true` 和后续七次启动。以下扇区数只统计测量区间。
-
-| 负载 | 无缓存扇区 | LRU 扇区 | 自适应扇区 | LRU 热点未命中 | 自适应热点未命中 |
-|---|---:|---:|---:|---:|---:|
-| 32 页热点与顺序扫描 | 25,600 | 25,600 | 21,616 | 96 | 0 |
-| 128 页热点与顺序扫描 | 28,672 | 28,672 | 23,920 | 384 | 0 |
-| 单次顺序扫描 | 8,192 | 8,192 | 8,192 | — | — |
-| `reuse` | 3,072 | 1,024 | 1,024 | — | — |
-| `revisit` | 5,120 | 3,072 | 4,040 | — | — |
-| BusyBox 启动八次 | 1,192 | 239 | 239 | — | — |
-
-六组负载的三轮扇区和命中计数完全一致。两组混合负载中，自适应策略分别少读 15.6% 和 16.6% 的扇区，QEMU 客体耗时中位数由 1,760 和 2,050 ms 降至 1,386 和 1,631 ms。`revisit` 的自适应策略在第三遍已全部命中，前两遍的旁路仍使总扇区读取比 LRU 高 31.5%。BusyBox 上两种缓存策略都读 239 个扇区。考虑到满缓存后短扫描的重读成本，默认使用 LRU。本轮测量覆盖 BusyBox 启动，编译工作负载尚未测量。
-
-在 Linux 环境下，从仓库根目录复跑。把 `official_image` 指向官方原盘，`debugfs` 以只读模式取出 BusyBox。每个场景第一次生成镜像，剩余轮次以 `-snapshot` 复用它。
-
-```bash
-official_image=/path/to/sdcard-rv.img
-experiment=$(mktemp -d)
-debugfs -R "dump /musl/busybox $experiment/busybox" "$official_image"
-(cd user && cargo build --release --bin page_cache_probe --bin oscomp_runner)
-export USER_BIN_DIR="$PWD/user/target/riscv64gc-unknown-none-elf/release"
-export PAGE_CACHE_BUSYBOX="$experiment/busybox" QEMU_MEM=128M
-for policy in none lru adaptive; do
-    make all PAGE_CACHE_POLICY="$policy" KERNEL_OUT="$experiment/$policy"
-done
-for scenario in mixed32 mixed128 sequential reuse revisit busybox; do
-    for trial in 1 2 3; do
-        for policy in none lru adaptive; do
-            PAGE_CACHE_IMAGE="$experiment/$scenario.img" PAGE_CACHE_POLICY="$policy" \
-                KERNEL="$experiment/$policy" tools/oscomp/test_page_cache_policy.sh "$scenario" \
-                "$experiment/$scenario-$policy-$trial.log"
-        done
-    done
-done
-```
-
-## 2026-11-24 PR-09 fork 写时复制
-
-`fork` 共享已驻留的私有用户页，覆盖用户栈、信号页、ELF 和匿名映射。父子任一侧写入时都会检查原映射权限。仍有其他引用的帧会复制，只剩当前映射引用的帧直接恢复可写。共享映射继续保持共享。子进程单独分配内核栈并复制 trap context。当前支持只有一个存活线程的进程执行 `fork`。
-
-`tools/oscomp/test_fork_cow.sh` 覆盖父子隔离、`mprotect`、内核写回与信号帧、`MAP_SHARED`、子进程回收和内存不足回滚。在 128 MiB QEMU 中，父进程驻留 40 MiB 后可完成 `fork→exec`。PR-08 在同一压力样本上复制页时耗尽物理帧。
-
-2025 年初赛 RISC-V64 官方原盘 `basic-musl` 为 **102/102**，32 个用例全部满分并正常关机。basic ABI、ELF 按需加载、文件 mmap/VMA、EXT4 页缓存和 easy-fs 文件读写回归通过。
-
-### fork→exec 对比
-
-用 QEMU 8.2.2、单核和 256 MiB，父进程预先写入 40 MiB 私有页，子进程立即执行另一份 ELF。两版各跑五轮，取中位数。延迟从 `fork` 入口计至新程序的第一次系统调用。峰值为这个区间内相对 `fork` 前新增的最多物理帧，包含页表、内核栈和地址空间所用帧。
-
-| 指标 | PR-08 `9f623f51`（已加同一套计数器） | PR-09 |
+| 指标（至首次用户系统调用） | 全量预加载基线 | 当前按需装载 |
 |---|---:|---:|
-| 复制物理页 | 10,504 | 1 |
-| 额外峰值物理帧 | 10,540（41.17 MiB） | 277（1.08 MiB） |
-| `fork` 耗时 | 51.006 ms | 6.770 ms |
-| `fork→exec` 后首次系统调用 | 152.999 ms | 12.157 ms |
+| 物理帧分配次数 | 8,475 | **268** |
+| EXT4 扇区读取（512 B） | 16,412 | **28** |
+| 耗时 | 2,124.1 ms | **3.3 ms** |
 
-在 PR-09 工作区用相同的测试脚本跑两版。日志中只取 `path=fork-cow-leaf` 的记录。
+### `fork→exec` 写时复制（40 MiB 私有驻留页，256 MiB 单核，5 次中位数）
 
-```bash
-experiment=$(mktemp -d)
-git worktree add --detach "$experiment/eager-src" 9f623f51
-make -C "$experiment/eager-src" all ELF_STARTUP_STATS=1 KERNEL_OUT="$experiment/eager"
-make all ELF_STARTUP_STATS=1 KERNEL_OUT="$experiment/cow"
-for trial in 1 2 3 4 5; do
-    for mode in eager cow; do
-        log="$experiment/$mode-$trial.log"
-        FORK_BENCH_ONLY=1 QEMU_MEM=256M KERNEL="$experiment/$mode" tools/oscomp/test_fork_cow.sh "$log"
-        grep -a '^\[fork-cow\] path=fork-cow-leaf ' "$log"
-    done
-done
-```
-
-## 2026-11-24 PR-08 ELF 按需加载
-
-EXT4 上的 `exec` 按区间读取 ELF 头和程序头，登记 `PT_LOAD` 的 VMA。缺页时，完整文件页与普通 `read/readv`、文件 `mmap` 共用页缓存。私有写入触发 COW，部分页和 BSS 按需分配并补零。内嵌程序直接使用内核内的字节，easy-fs 与 Overlay 使用文件快照。PR-14 之后，Overlay 快照按页保存稀疏内容。
-
-`tools/oscomp/test_elf_demand.sh` 覆盖非页对齐的段、同页相邻段、BSS、文件页写隔离、`mprotect` 后的缺页、内核向未驻留 BSS 写入，以及无效 ELF 和 `argv`。官方盘的 basic-musl ELF 含 `PT_INTERP`，保留直接进入 `e_entry` 的兼容路径。通用动态链接仍待适配。
-
-2025 年初赛 RISC-V64 官方原盘 `basic-musl` 为 **102/102**，32 个用例全部满分并正常关机。basic ABI、文件 mmap/VMA、EXT4 页缓存和 easy-fs 文件读写回归通过。
-
-### 冷启动对比
-
-QEMU 8.2.2、单核、256 MiB RAM。合成 ELF 含一个 8 MiB 的冷文件段，其内存范围为 32 MiB，程序只执行首个代码页。两版各从冷盘启动五次，表中取中位数。计数从记录 exec 路径后开始，截止新程序发起第一次系统调用，包含首次缺页。帧分配统计成功分配次数，扇区读取计入 EXT4 数据和元数据。计数器为单核测试中的全局计数，耗时为客体墙钟时间。
-
-| 截止第一次用户系统调用 | PR-07 装载器 `0eb2d7f1`（已加同一套计数器） | PR-08 按需装载 |
+| 指标 | 全量复制基线 | 当前 CoW |
 |---|---:|---:|
-| 物理帧分配次数 | 8,475 | 268 |
-| 512 字节扇区读取 | 16,412 | 28 |
-| 耗时 | 2,124.110 ms | 3.326 ms |
+| 复制物理页 | 10,504 | **1** |
+| 额外峰值物理帧 | 10,540（41.2 MiB） | **277（1.1 MiB）** |
+| `fork` / `fork→exec` 耗时 | 51.0 ms / 153.0 ms | **6.8 ms / 12.2 ms** |
 
-在 PR-08 工作区用相同的测试脚本跑两版。日志中只取 `path=elf-startup` 的记录。
+### 页缓存策略对照（128 MiB 单核，32 MiB EXT4，3 次中位数）
 
-```bash
-experiment=$(mktemp -d)
-git worktree add --detach "$experiment/eager-src" 0eb2d7f1
-make -C "$experiment/eager-src" all ELF_STARTUP_STATS=1 KERNEL_OUT="$experiment/eager"
-make all ELF_STARTUP_STATS=1 KERNEL_OUT="$experiment/demand"
-for trial in 1 2 3 4 5; do
-    for mode in eager demand; do
-        log="$experiment/$mode-$trial.log"
-        ELF_STARTUP_ONLY=1 KERNEL="$experiment/$mode" tools/oscomp/test_elf_demand.sh "$log"
-        grep -a '^\[elf-startup\] path=elf-startup ' "$log"
-    done
-done
-```
+| 负载 | `none` 扇区 | `lru`（默认）扇区 | `adaptive` 扇区 |
+|---|---:|---:|---:|
+| 32 页热点 + 顺序扫描 | 25,600 | 25,600（热点未命中 96） | **21,616**（未命中 0） |
+| 128 页热点 + 顺序扫描 | 28,672 | 28,672（热点未命中 384） | **23,920**（未命中 0） |
+| `reuse`（连续重读 128 页×3） | 3,072 | **1,024** | **1,024** |
+| `revisit`（满缓存后重读 128 页×3） | 5,120 | **3,072** | 4,040 |
+| BusyBox 启动 8 次 | 1,192 | **239** | **239** |
 
-## 2026-11-23 PR-07 文件系统与进程 ABI
+> 考虑满缓存后短扫描的重读成本，默认采用 `lru`；可通过 `PAGE_CACHE_POLICY=adaptive|none` 切换，`/proc/page_cache` 提供只读统计快照。
 
-2025 年初赛 RISC-V64 官方原盘的 `basic-musl` 在 QEMU 8.2.2、单核和 1 GiB 内存下达到 **102/102**，32 个用例全部满分并正常关机。`clone` 采用调用者指定的子栈，`mkdir` 可以创建并打开目录，`unlink` 按当前工作目录或目录 fd 解析路径。
+## 4. 官方 24 项矩阵基线与待解决问题
 
-`tools/oscomp/test_basic_abi.sh` 用独立 EXT4 镜像验证 `write/writev` 跨越 1 MiB 偏移的读写一致性、目录创建和枚举、删除后继续使用已打开的文件、只读 EXT4 目录项遮蔽、异常路径和目录删除后重建。进程 `clone` 的子栈用独立用例校验。
+PR-11 基线（单核 1 GiB、每组 120 s，0 次内核 panic）全量实测摘要，复跑命令见 [对接官方评测](oscomp-evaluation.md#3-完整-24-项评测矩阵)：
 
-## 2026-11-23 PR-06 统一文件页缓存
-
-EXT4 普通 `read/readv` 和文件 `mmap` 缺页按文件系统实例、inode 和页号查找同一帧。LRU 缓存最多持有 256 个 4 KiB 页，帧分配遇到内存压力时可回收空闲缓存页。活动映射持有独立引用，缓存满且所有页仍被引用时，新读入的页按需使用，不留在缓存中。冷读以 4 KiB 填充缓存，ELF 装载仍走原有读取路径。
-
-`tools/oscomp/test_ext4.sh` 在宿主侧对同一个 8 MiB 文件计数，扇区为 512 字节。
-
-| 验证 | PR-05 `5f8737d8` | PR-06 |
-|---|---:|---:|
-| 首次读 32 KiB，分 8 次请求 | 64 次扇区读取 | 64 次扇区读取 |
-| 回到起点再次读 4 KiB | 8 次扇区读取 | 0 次扇区读取 |
-
-普通读取后取得映射页、取得映射页后普通读取，两条路径的第二步均为 0 次扇区读取。宿主测试还覆盖跨文件句柄复用、文件系统实例隔离、LRU 淘汰、满容量旁路及帧回收。
-
-QEMU 下 `tools/oscomp/test_mmap_vma.sh` 验证了私有映射首次写入时复制页面，并覆盖权限变更、子进程写入、`read` 和 `pipe` 写回用户缓冲区、线程退出清除 TID。写入后同文件的其他映射和普通读取仍返回原数据。256 MiB 下的 129 MiB 稀疏文件区间读取也通过。
-
-QEMU 8.2.2 上连续两次运行 2025 年初赛官方 RISC-V64 原盘 `basic-musl`，均为 **97/102**，32 个用例均执行，29 个用例满分并正常关机。失分项仍为 `clone`、`mkdir` 和 `unlink`。
-
-## 2026-11-23 PR-05 文件映射与 VMA
-
-QEMU 8.2.2 上用最终内核连续运行两次官方 RISC-V64 `basic-musl`，均为 **97/102**，29 个用例满分，32 个用例均执行并正常关机。`mmap` 从 2/3 升至 3/3，剩余失分来自 `clone`、`mkdir` 和 `unlink`。
-
-在 Linux 或 WSL2 上用 `tools/oscomp/test_mmap_vma.sh` 可构建并启动专用 EXT4 测试盘。它覆盖六参数 `mmap`、非零文件偏移、关闭 fd 后访问、私有隔离、共享 overlay 与普通 I/O 一致、局部 `munmap`、局部 `mprotect`、固定地址替换，以及文件末页补零和跨 EOF 整页的 `SIGBUS`。测试同时检查 `waitpid` 的信号状态和共享缓冲区重叠时的文件读写。 [mmap(2)](https://man7.org/linux/man-pages/man2/mmap.2.html) · [mprotect(2)](https://man7.org/linux/man-pages/man2/mprotect.2.html)
-
-可写文件共享映射由内存 Overlay 提供。私有映射使用写时复制。PR-14 之后，缩短文件会撤销超出新 EOF 的整页映射，之后触发访问的进程收到 `SIGBUS`。`munmap` 和 `MAP_FIXED` 操作动态 VMA，ELF 装载段和任务资源由各自的生命周期管理。
-
-## 2026-11-23 PR-04 EXT4 区间读取
-
-普通 `read` 和 `readv` 按当前文件偏移读取所需扇区。新版 `tools/oscomp/test_ext4.sh` 覆盖跨块、分段缓冲区、EOF 短读、稀疏洞、未写入 extent 和索引 extent 树。
-
-| 验证 | M1 基线 `601a839b` | PR-04 |
+| 状态 | 测试组 | 主要原因 / 观察 |
 |---|---|---|
-| 宿主对同一个 8 MiB 文件连续读 8 次，每次 4 KiB | 131,072 次扇区读取 | 64 次扇区读取，数据一致 |
-| QEMU 256 MiB，从 129 MiB 稀疏文件的 128 MiB 偏移执行 BusyBox `dd`，读取 4 KiB 并用 `cmp` 校验 | 内核尝试分配 129 MiB，触发 panic | 内容一致，正常关机 |
-| 官方 RISC-V64 原盘 `basic-musl` | 96/102 | 96/102，32 个用例均执行并正常关机 |
-
-## 2026-11-23 官方盘回归
-
-基线 `44a89a39` 在原盘上复现了首进程启动 panic。更新到 `ac9e23c7` 后，用 QEMU 8.2.2、1 核和 1 GiB RAM 连续运行三次。每次执行原盘 `/musl/basic_testcode.sh` 的 32 个用例，均为 **96/102**，28 个用例满分，QEMU 正常退出。三轮 QEMU 墙钟耗时依次为 4、5、4 秒。
-
-- 镜像为 2025 初赛发布的 `sdcard-rv.img.xz` 解压所得，原盘 SHA-256 为 `95973543db6b84a9a5e70f30da466ce292867aff5b689fb14c88dc9406e378b8`。 [发布页](https://github.com/oscomp/testsuits-for-oskernel/releases/tag/pre-20250615)
-- 判分使用同一发布版本的测试套件 `4b40ee92e8b594fb20e3957ebc2f79ad43aca538`。内核 SHA-256 为 `057544f007f71b18f98f9e5e3a0c3d6bb0693b1ab68b47a6a6e89535b952749f`。
-- 官方盘跨块组文件 `/glibc/basic/brk` 的 56,472 字节与宿主 `debugfs` 结果逐字节一致。合成镜像中的三个文件分别验证了稀疏洞、未写入 extent 和带索引的 extent 树，读取结果均与预期一致。
-- 四项失分为 `clone` 1/4、`mkdir` 2/3、`mmap` 2/3、`unlink` 1/2。三次 `pipe` 均得满分，历史偶发失败仍需观察。
-
-以上是本地 QEMU 对历史官方盘的回归。复跑命令见 [官方盘回归](oscomp-evaluation.md#官方盘回归)。
-
-## 2026-11-22 本地模拟盘记录
-
-Martyr 的内核基于 `3bf874f` 加未提交的稀疏文件修复，以下分数来自平铺布局的本地模拟盘。
-
-- 「Martyr 实测」是 Martyr 用官方判分方式跑出来的，可信。
-- 「wonder-world 记录」来自 [适配改动说明](ADAPTATION_NOTES.md) 第 17 章，是 wonder-world 在自己机器上的结果，**没有经 Martyr 复现**。而且那些数字多数只表示「脚本跑到了 END」，不等于得分，不要当成绩用。
-
-## 总表
-
-| 组 | Martyr 实测 | wonder-world 记录（未复现） | 测试盘脚本 |
-|---|---|---|---|
-| basic | **96/102**（28/32 个用例满分，仅限本地模拟盘） | 称 32/32 | 有，全套 |
-| lua | 未测 | 称 9/9 | `build_lua.sh`（已写，没跑过） |
-| busybox | 未测 | 55 条命令 52 条成功 | 只有 `build_busybox.sh`（构建二进制），缺组盘脚本 |
-| libc-test | 未测 | 94 个用例，88 Pass | `build_libctest.sh`（旧脚本，路径没对齐 `env.sh`） |
-| libcbench | 未测 | 27 个 benchmark，256M 内存 | 缺 |
-| lmbench | 未测 | 跑完，约 17 项数字，需 1G 内存 | `build_lmbench.sh`（旧脚本，同上） |
-| unixbench | 未测 | 19 行结果 | 缺 |
-| iozone | 未测 | 子测试全部执行 | 缺 |
-| cyclictest | 未测 | 称 4/4 | 缺 |
-| ltp | 未测 | 162 个用例，TPASS 54~60，且有波动 | `build_ltp.sh`（旧脚本，同上） |
-| iperf / netperf | 未测 | 脚本跑完，全部子测试失败 | `build_net.sh`（旧脚本，同上） |
-
-「旧脚本」指 wonder-world 留下的 4 个脚本，仍引用 `$HOME/rCore-Tutorial-v3` 和 `fsroot`，没有改成用 `tools/oscomp/env.sh`，Martyr 没试跑过。
-「缺」指仓库里没有这个脚本，wonder-world 的文档提到过但没提交。
-
-## basic 的 4 个失败（Martyr 实测，本地模拟盘）
-
-| 用例 | 得分 | 现象 |
-|---|---|---|
-| clone | 1/4 | 子进程跳到栈地址执行，触发 `InstructionPageFault`（`sepc=0x105d60`），收到 SIGSEGV |
-| mkdir | 2/3 | 输出了 `mkdir error` |
-| mmap | 2/3 | 读出的 mmap 内容为空 |
-| unlink | 1/2 | 输出了 `unlink error` |
-
-原因还没查。
-
-**结果不稳定**：同一张盘、同一个内核，连续 3 次运行中 2 次是 96/102，1 次是 92/102（`test_pipe` 得 0/4，断言 `[2, 3] (>=)` 失败）。`test_pipe` 存在偶发失败，原因未查，所以 96/102 只是典型值，不是确定值。
-
-## 历史测试记录（Martyr 发现）
-
-- **旧版 usertests 内核 panic**：在本地 easy-fs 镜像上跑 `usertests`，跑到 `race_adder_arg` 时曾发生内核 panic：
-  `src/mm/page_table.rs:115 vpn 0xffe is mapped before mapping`。
-  `0xffe000` 是信号 stub 页。现版本的复现与修复见[PR-13](#2026-11-24-pr-13-linux-线程与进程-abi)。
-
-## wonder-world 文档里提到的、仍未解决的限制
-
-以下来自 wonder-world 记录，待在当前版本复测。信号返回上下文可能影响 lmbench 的 `lat_ctx`，单核调度下 cyclictest 压力阶段可能超时。网卡驱动和 TCP/IP 栈仍待实现。
-
-## 2026-11-24 旧版官方布局盘实测
-
-`feat/integrated` 合并官方盘适配与页缓存、写时复制和文件映射后，在本地官方布局盘上留下以下记录。basic 使用官方 `test_runner.py` 判分。
-
-| 组 | 历史结果 | 说明 |
-|---|---|---|
-| basic | 94/102，29/32 用例满分 | `test_openat` 2/4、`test_clone` 1/4、`test_open` 0/3 |
-| lua | 9/9 | |
-| busybox | 51/55 | `which ls`、`hwclock`、`mv`、`rmdir` 失败 |
-| libctest | 94 个用例，88 个通过 | |
-| cyclictest | 4/4 | |
-| iozone / libcbench | 脚本跑完并关机 | libcbench 输出 27 项 |
-| unixbench | 17 行结果 | DHRY2 63.7M lps、SYSCALL 246K lps、EXEC 4.0K lps |
-| lmbench | 13 项结果 | fork→exec 1346 µs，写带宽 290 MB/s |
-| ltp | 162 个用例，TPASS 4 | 测试使用了当时内核缺少的 `/dev/shm` |
-
-同一份记录中的分支对照值为 fork→exec 3846 µs、写带宽 66 MB/s。后续提交 `916ea273` 的回归记录中，basic 为 99/102，`test_openat` 和 `test_open` 已满分，仍有 `test_clone` 失分。
+| 满分 | `basic`（musl/glibc 均 102/102） | glibc 外层 BusyBox 在结束标记后触发用户态取指缺页退出 139 |
+| 部分运行 / 超时 | `busybox`、`lmbench`、`ltp`、`libcbench`、`unixbench`、`cyclictest` | 缺少部分工具/接口、动态库路径未部署或单核超时 |
+| 0 分 / 不可用 | `lua`、`libctest`、`iozone`、`iperf`、`netperf` | 原盘脚本 shebang/路径缺失、动态链接器 `/lib` 缺失、无网卡与 TCP/IP 栈 |

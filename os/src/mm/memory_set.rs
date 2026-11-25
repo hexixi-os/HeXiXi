@@ -2,12 +2,14 @@ use super::elf::{ElfHeaders, ElfImage};
 use super::resident::{alloc_page, ResidentPage};
 use super::FrameTracker;
 use super::{PTEFlags, PageTable, PageTableEntry};
-use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
+#[cfg(target_arch = "riscv64")]
+use super::PhysAddr;
+use super::{PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use super::vma::{PageFault, VmaBacking, VmaSpace, USER_END};
 #[cfg(target_arch = "riscv64")]
-use crate::config::MMIO;
-use crate::config::{PAGE_SIZE, TRAMPOLINE, USER_STACK_SIZE};
+use crate::config::{MMIO, TRAMPOLINE};
+use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{open_executable, resolve_path, Executable};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
@@ -568,7 +570,7 @@ pub fn handle_user_page_fault(stval: usize, access: MapPermission) -> PageFault 
 
 #[cfg(target_arch = "riscv64")]
 pub fn remap_test() {
-    let mut kernel_space = KERNEL_SPACE.exclusive_access();
+    let kernel_space = KERNEL_SPACE.exclusive_access();
     let mid_text: VirtAddr = ((stext as usize + etext as usize) / 2).into();
     let mid_rodata: VirtAddr = ((srodata as usize + erodata as usize) / 2).into();
     let mid_data: VirtAddr = ((sdata as usize + edata as usize) / 2).into();

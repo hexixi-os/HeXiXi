@@ -12,10 +12,7 @@ extern crate alloc;
 #[macro_use]
 extern crate bitflags;
 
-#[cfg(all(target_arch = "riscv64", feature = "board_k210"))]
-#[path = "boards/k210.rs"]
-mod board;
-#[cfg(all(target_arch = "riscv64", not(feature = "board_k210")))]
+#[cfg(target_arch = "riscv64")]
 #[path = "boards/qemu.rs"]
 mod board;
 #[cfg(target_arch = "loongarch64")]

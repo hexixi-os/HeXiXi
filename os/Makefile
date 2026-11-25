@@ -1,78 +1,18 @@
-# Building
+# Building (QEMU RISC-V64)
 TARGET := riscv64gc-unknown-none-elf
 MODE := release
 KERNEL_ELF := target/$(TARGET)/$(MODE)/os
 KERNEL_BIN := $(KERNEL_ELF).bin
 DISASM_TMP := target/$(TARGET)/$(MODE)/asm
 FS_IMG := ../user/target/$(TARGET)/$(MODE)/fs.img
-SDCARD := /dev/sdb
 APPS := ../user/src/bin/*
 
-# BOARD
-BOARD ?= qemu
-SBI ?= rustsbi
-BOOTLOADER := ../bootloader/$(SBI)-$(BOARD).bin
-K210_BOOTLOADER_SIZE := 131072
-
-# Building mode argument
-ifeq ($(MODE), release)
-	MODE_ARG := --release
-endif
-
-# KERNEL ENTRY
-ifeq ($(BOARD), qemu)
-	KERNEL_ENTRY_PA := 0x80200000
-else ifeq ($(BOARD), k210)
-	KERNEL_ENTRY_PA := 0x80020000
-endif
-
-# Run K210
-K210-SERIALPORT	= /dev/ttyUSB0
-K210-BURNER	= ../tools/kflash.py
-
-# Binutils
 OBJDUMP := rust-objdump --arch-name=riscv64
 OBJCOPY := rust-objcopy --binary-architecture=riscv64
-
-# Disassembly
 DISASM ?= -x
-
-# Run usertests or usershell
 TEST ?=
 
-build: env switch-check $(KERNEL_BIN) fs-img 
-
-kernel-bin: $(KERNEL_BIN)
-
-switch-check:
-ifeq ($(BOARD), qemu)
-	(which last-qemu) || (rm -f last-k210 && touch last-qemu && make clean)
-else ifeq ($(BOARD), k210)
-	(which last-k210) || (rm -f last-qemu && touch last-k210 && make clean)
-endif
-
-env:
-	(rustup target list | grep "riscv64gc-unknown-none-elf (installed)") || rustup target add $(TARGET)
-	command -v rust-objcopy >/dev/null 2>&1 || cargo install cargo-binutils --version 0.3.3
-	rustup component add rust-src
-	rustup component add llvm-tools-preview
-
-sdcard: fs-img
-	@echo "Are you sure write to $(SDCARD) ? [y/N] " && read ans && [ $${ans:-N} = y ]
-	@sudo dd if=/dev/zero of=$(SDCARD) bs=1048576 count=32
-	@sudo dd if=$(FS_IMG) of=$(SDCARD)
-
-$(KERNEL_BIN): kernel
-	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $@
-
-fs-img: $(APPS)
-	@cd ../user && make build TEST=$(TEST)
-	@rm -f $(FS_IMG)
-	@cd ../easy-fs-fuse && cargo +stable run --release -- -s ../user/src/bin/ -t ../user/target/riscv64gc-unknown-none-elf/release/
-
-$(APPS):
-
-FEATURES := board_$(BOARD)
+FEATURES := board_qemu
 ifeq ($(SMP),1)
 FEATURES += smp
 endif
@@ -88,16 +28,35 @@ endif
 ifeq ($(ELF_STARTUP_STATS),1)
 FEATURES += elf_startup_stats
 endif
-ifeq ($(BOARD):$(OSCOMP),qemu:1)
+ifeq ($(OSCOMP),1)
 FEATURES += oscomp_runner
 kernel: oscomp-runner
 oscomp-runner:
 	$(MAKE) -C ../user oscomp-runner
 endif
 
+build: env $(KERNEL_BIN) fs-img
+
+kernel-bin: $(KERNEL_BIN)
+
+env:
+	(rustup target list | grep "riscv64gc-unknown-none-elf (installed)") || rustup target add $(TARGET)
+	command -v rust-objcopy >/dev/null 2>&1 || cargo install cargo-binutils --version 0.3.3
+	rustup component add rust-src
+	rustup component add llvm-tools-preview
+
+$(KERNEL_BIN): kernel
+	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $@
+
+fs-img: $(APPS)
+	@cd ../user && make build TEST=$(TEST)
+	@rm -f $(FS_IMG)
+	@cd ../easy-fs-fuse && cargo +stable run --release -- -s ../user/src/bin/ -t ../user/target/riscv64gc-unknown-none-elf/release/
+
+$(APPS):
+
 kernel:
-	@echo Platform: $(BOARD)
-	@cp src/linker-$(BOARD).ld src/linker.ld
+	@cp src/linker-qemu.ld src/linker.ld
 	@cargo build --release --features "$(FEATURES)"
 	@rm src/linker.ld
 
@@ -112,10 +71,7 @@ disasm-vim: kernel
 	@vim $(DISASM_TMP)
 	@rm $(DISASM_TMP)
 
-run: run-inner
-
-run-inner: build
-ifeq ($(BOARD),qemu)
+run: build
 	@qemu-system-riscv64 \
 		-machine virt \
 		-smp $(QEMU_SMP) \
@@ -124,16 +80,7 @@ ifeq ($(BOARD),qemu)
 		-bios default \
 		-kernel $(KERNEL_BIN) \
 		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \
-        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
-else
-	(which $(K210-BURNER)) || (cd .. && git clone https://github.com/sipeed/kflash.py.git && mv kflash.py tools)
-	@cp $(BOOTLOADER) $(BOOTLOADER).copy
-	@dd if=$(KERNEL_BIN) of=$(BOOTLOADER).copy bs=$(K210_BOOTLOADER_SIZE) seek=1
-	@mv $(BOOTLOADER).copy $(KERNEL_BIN)
-	@sudo chmod 777 $(K210-SERIALPORT)
-	python3 $(K210-BURNER) -p $(K210-SERIALPORT) -b 1500000 $(KERNEL_BIN)
-	python3 -m serial.tools.miniterm --eol LF --dtr 0 --rts 0 --filter direct $(K210-SERIALPORT) 115200
-endif
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 
 debug: build
 	@tmux new-session -d \
@@ -141,11 +88,10 @@ debug: build
 		tmux split-window -h "riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'" && \
 		tmux -2 attach-session -d
 
-
 gdbserver: build
 	@qemu-system-riscv64 -machine virt -nographic -bios default -kernel $(KERNEL_BIN) -s -S
 
 gdbclient:
 	@riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
 
-.PHONY: build env kernel-bin kernel oscomp-runner clean disasm disasm-vim run-inner switch-check fs-img gdbserver gdbclient
+.PHONY: build env kernel-bin kernel oscomp-runner clean disasm disasm-vim run debug fs-img gdbserver gdbclient

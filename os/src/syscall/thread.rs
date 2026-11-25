@@ -20,7 +20,7 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     };
     // add new task to scheduler
     add_task(Arc::clone(&new_task));
-    let mut new_task_inner = new_task.inner_exclusive_access();
+    let new_task_inner = new_task.inner_exclusive_access();
     let new_task_res = new_task_inner.res.as_ref().unwrap();
     let new_task_tid = new_task_res.tid;
     let mut process_inner = process.inner_exclusive_access();

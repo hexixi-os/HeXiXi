@@ -19,7 +19,6 @@ extern crate user_lib;
 
 use alloc::string::{String, ToString};
 use alloc::format;
-use alloc::vec;
 use alloc::vec::Vec;
 use user_lib::{chdir, close, exec, exit, fork, open, read, waitpid, OpenFlags};
 

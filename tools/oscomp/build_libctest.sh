@@ -26,14 +26,11 @@
 #    source 版包装（$OUT/libctest_testcode.sh）放进镜像；原始 testsuits 文件不动。
 #    根治办法是内核 execve 支持 shebang。
 set -uo pipefail
-export LC_ALL=C
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
-SUITE=${SUITE:-$HOME/testsuits}
-TOOLCHAIN=${TOOLCHAIN:-$HOME/toolchains/riscv64-linux-musl-cross/bin}
-PREFIX="$TOOLCHAIN/riscv64-linux-musl-"
-WORK=${WORK:-$HOME/oscomp-work/libctest}
 SRC="$SUITE/libc-test"
-OUTDIR="${OUT:-$WORK}"
+OUTDIR="${OUT:-$WORK/libctest}"
+WORK="$WORK/libctest"
 RUN=${RUN:-0}
 
 mkdir -p "$WORK" "$OUTDIR" "$WORK/logs"
@@ -113,7 +110,7 @@ echo "write $runroot/run-dynamic.sh /run-dynamic.sh" >> "$CMDS"
 echo "write $runroot/entry-static.exe /entry-static.exe" >> "$CMDS"
 echo "write $runroot/runtest.exe /runtest.exe" >> "$CMDS"
 echo "write $SUITE/busybox/busybox /busybox" >> "$CMDS"
-echo "write $HOME/oscomp-work/fsroot/target/oscomp_runner /oscomp_runner" >> "$CMDS"
+echo "write $RUNNER /oscomp_runner" >> "$CMDS"
 echo "mkdir /tmp" >> "$CMDS"
 echo "mkdir /var" >> "$CMDS"
 echo "mkdir /var/tmp" >> "$CMDS"
@@ -127,8 +124,8 @@ debugfs -R "ls -l /" "$OUTDIR/disk.img" 2>/dev/null | awk '{print "  /"$NF, $5, 
 
 if [ "$RUN" = "1" ]; then
     echo "== RUN=1：用最新内核跑一次"
-    K="$HOME/rCore-Tutorial-v3/kernel-rv"
-    [ -f "$K" ] || K="$HOME/rCore-Tutorial-v3/os/target/riscv64gc-unknown-none-elf/release/os.bin"
+    K="${KERNEL:-$REPO/kernel-rv}"
+    [ -f "$K" ] || K="$REPO/os/target/riscv64gc-unknown-none-elf/release/os.bin"
     cp -f "$K" /tmp/kernel-libctest.bin
     timeout 720 qemu-system-riscv64 -machine virt -m 1G -nographic -bios default \
         -kernel /tmp/kernel-libctest.bin \
