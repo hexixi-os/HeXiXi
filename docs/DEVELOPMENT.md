@@ -59,8 +59,27 @@ QEMU 加载 OpenSBI（RISC-V64）或直接加载 ELF（LoongArch64）后进入 `
 | basic ABI / `mmap` / 按需 ELF / CoW / Overlay | `bash tools/oscomp/test_{basic_abi,mmap_vma,elf_demand,fork_cow,overlay_fs}.sh` |
 | 页缓存策略对照 | `bash tools/oscomp/test_page_cache_policy.sh <scenario> <log>` |
 | RISC-V64 双核 SMP | `make all SMP=1 && KERNEL="$PWD/kernel-rv" bash tools/oscomp/test_smp.sh /tmp/hexixi-smp.log` |
+| Pipe 等待队列 | `tools/oscomp/test_pipe_wait.sh`（默认 RV64 双核，单核用 `QEMU_SMP=1`，LoongArch64 用 `ARCH=loongarch64`） |
 | LoongArch64 启动与 `clone` | `make kernel-la && bash tools/oscomp/test_loongarch_boot.sh /tmp/hexixi-la.log` |
 | 动态 ELF / pthread（需先准备 fixture） | `bash tools/oscomp/test_{elf_dynamic,pthread_abi}.sh <fixture-root> <log>` |
+
+### Pipe 调度开销对照
+
+Pipe 的读写等待分别登记到各自的 WaitQueue。全局内核锁覆盖条件检查、登记与 `Blocking` 状态转换，任务上下文保存后其他核才能获取该锁。空转为可读、满转为可写或最后一个对端关闭时，管道唤醒对应方向的等待者。信号可中断等待，线程组退出时会摘除等待登记并释放挂起的 I/O。
+
+基准让生产者每隔 15 ms 写入一个字节，共写入 12 次。消费者在空管道上调用阻塞读。`task_dispatches` 统计内核从调度器切入任务的次数，`ready_yields` 统计任务让出 CPU 并重新进入 Ready 队列的次数。两项都是从启动到关机的计数，覆盖场景中的时钟抢占。内核空闲循环和锁等待耗时另需测量。
+
+`df8b46f8` 在 `31aa0ce7` 上只添加计数器，可用于构造对照内核。
+
+```bash
+baseline=$(mktemp -d)
+git archive df8b46f8 | tar -x -C "$baseline"
+make -C "$baseline" all SMP=1 SCHED_SWITCH_STATS=1 KERNEL_OUT="$baseline/kernel-rv"
+PIPE_BENCH=1 KERNEL="$baseline/kernel-rv" tools/oscomp/test_pipe_wait.sh /tmp/pipe-base.log
+PIPE_BENCH=1 tools/oscomp/test_pipe_wait.sh /tmp/pipe-wait-queue.log
+```
+
+复测单核时将基线构建设为 `SMP=0`，并在两次运行中都设 `QEMU_SMP=1`。统计开发用例的实测结果见[测试状态](TEST_STATUS.md#pipe-waitqueue-调度开销)。
 
 ### 构建动态 ELF / pthread 测试 fixture
 

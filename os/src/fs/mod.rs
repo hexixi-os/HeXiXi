@@ -12,6 +12,7 @@ pub mod random;
 mod stdio;
 mod symlink;
 
+pub(crate) use pipe::SuspendedPipeIo;
 use crate::mm::{FrameTracker, UserBuffer};
 use crate::sync::UPSafeCell;
 use directory::DirectoryIdentity;

@@ -21,6 +21,10 @@
 | RISC-V64 | 18 | 0 | 6 | `lua` 双库 9/9；超时组为双库 `busybox` / `lmbench` / `ltp` |
 | LoongArch64 | 17 | 0 | 7 | `lua` 双库 9/9；超时组另含 `libcbench-musl` |
 
+### PR21 Pipe WaitQueue 原盘复测
+
+RISC-V64 和 LoongArch64 均以单核、1 GiB 和每组 120 s 运行原盘。两架构的 `basic-musl` 与 `basic-glibc` 在改动版中均为 **102/102**。`lmbench`、`ltp` 的双架构双 libc 共 8 项在 `31aa0ce7` 和改动版上都达到超时上限，期间均无内核 panic。
+
 ### 网络测例（`iperf` / `netperf`）
 
 - **Netperf 2.7.0**：使用独立 EXT4 盘（含按架构静态构建的 `netperf` / `netserver`），RISC-V64 与 LoongArch64 单核均 **5/5**（UDP/TCP stream、RR、CRR）。
@@ -35,6 +39,7 @@
 | `test_net_abi.sh` | 双架构（含 RV64 双核）：无网卡 IPv4 TCP/UDP 回环、半关闭、非阻塞、`ppoll`/`epoll` 与 `--virtio` 宿主↔客机 TCP 回显 |
 | `test_persistent_fs.sh` | 双架构（含 RV64 双核，含 `PAGE_CACHE_POLICY=none`）：EasyFS 数据盘 4 次重启回归、`fsync`/`msync`、盘上 ELF 执行、空白/只读盘错误处理与只读根盘哈希校验 |
 | `test_smp.sh` | RV64 双核：`getcpu`/`sched_getaffinity`、跨核 CoW、共享文件截断 `SIGBUS`、超容量跨核管道逐字节校验 |
+| `test_pipe_wait.sh` | RV64 单核与双核、LoongArch64 单核均通过空管道等待、满管道释放空间、多读者唤醒、EOF、`EPIPE`、`SIGKILL`、线程组退出及 `SIGALRM`。原 `run_pipe_test` 在 RV64 单核与双核各通过 1,000 轮 |
 | `test_loongarch_boot.sh` | LoongArch64 ELF 直启、VirtIO PCI 只读 EXT4 与 `clone` TLS/child TID |
 | `test_overlay_fs.sh` | 768 MiB 下 100 MiB 顺序写、>2 GiB 稀疏写、预算回收、`MAP_SHARED`+`truncate`/`SIGBUS`、`O_TMPFILE`；下层 EXT4 只读不变 |
 | `test_pthread_abi.sh` | 动态 musl / glibc 各 16×8 并发线程及动态 glibc BusyBox |
@@ -61,3 +66,12 @@
 | BusyBox 启动 8 次 | 1,192 | **239** | **239** |
 
 > 默认采用 `lru`；可通过 `PAGE_CACHE_POLICY=adaptive|none` 切换，`/proc/page_cache` 提供统计快照。
+
+## 4. Pipe WaitQueue 调度开销
+
+QEMU 8.2.2，RISC-V64，256 MiB。每种配置运行 5 次，表中为中位数。基线使用 `31aa0ce7` 加相同计数器，工作负载为 12 次间隔 15 ms 的单字节写入。[复现命令](DEVELOPMENT.md#pipe-调度开销对照)
+
+| 核数 | 任务派发次数，基线 → WaitQueue | 让出 CPU 后重新入队次数，基线 → WaitQueue |
+|---|---:|---:|
+| 单核 | 36 → 32 | 34 → 18 |
+| 双核 | 207,792 → 43 | 207,790 → 29 |

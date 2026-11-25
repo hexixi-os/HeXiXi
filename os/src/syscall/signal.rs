@@ -1,8 +1,13 @@
 use crate::mm::{
     read_user, try_read_user, try_write_user, MapPermission, MemorySet, UserValue, VirtAddr,
 };
-use crate::task::{current_process, current_task, current_user_token, pid2process};
-use alloc::sync::Arc;
+use crate::sync::UPSafeCell;
+use crate::task::{
+    current_process, current_task, current_user_token, pid2process, ProcessControlBlock,
+    ProcessControlBlockInner, WaitQueue,
+};
+use alloc::{collections::BTreeMap, sync::{Arc, Weak}};
+use lazy_static::lazy_static;
 
 /// 可执行的信号返回 stub 页（li a7,139; ecall; j .）
 pub const SIGSTUB_VA: usize = 0x00FF_E000;
@@ -42,6 +47,12 @@ fn signal_bit(signo: usize) -> u64 {
 
 const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
 
+lazy_static! {
+    // Only armed alarms participate in the timer check, even when all tasks are blocked.
+    static ref ALARMS: UPSafeCell<BTreeMap<(usize, usize), Weak<ProcessControlBlock>>> =
+        unsafe { UPSafeCell::new(BTreeMap::new()) };
+}
+
 /// 在用户地址空间建立信号所需的两页（exec 时调用）
 pub fn setup_signal_pages(memory_set: &mut MemorySet) {
     if memory_set.translate(SIGSTUB_VA.into()).is_none() {
@@ -70,13 +81,23 @@ pub fn sys_setitimer(which: usize, new: *const u8, _old: *mut u8) -> isize {
     let sec = read_user(token, (new as usize + 16) as *const u64) as usize;
     let usec = read_user(token, (new as usize + 24) as *const u64) as usize;
     let process = current_process();
+    let pid = process.getpid();
     let mut inner = process.inner_exclusive_access();
-    if sec == 0 && usec == 0 {
-        inner.alarm_deadline = 0;
-    } else {
-        inner.alarm_deadline = crate::timer::get_time_ms() + sec * 1000 + usec / 1000;
+    cancel_alarm(pid, &mut inner);
+    if sec != 0 || usec != 0 {
+        let duration = sec.saturating_mul(1000).saturating_add(usec / 1000).max(1);
+        let deadline = crate::timer::get_time_ms().saturating_add(duration);
+        inner.alarm_deadline = deadline;
+        ALARMS.exclusive_access().insert((deadline, pid), Arc::downgrade(&process));
     }
     0
+}
+
+pub(crate) fn cancel_alarm(pid: usize, inner: &mut ProcessControlBlockInner) {
+    if inner.alarm_deadline != 0 {
+        ALARMS.exclusive_access().remove(&(inner.alarm_deadline, pid));
+        inner.alarm_deadline = 0;
+    }
 }
 
 pub fn sys_rt_sigaction(signo: usize, act: usize, old: usize, size: usize) -> isize {
@@ -162,6 +183,10 @@ pub fn sys_thread_kill(tgid: Option<usize>, tid: usize, signo: usize) -> isize {
         if inner.exit_code.is_none() {
             if signo != 0 {
                 inner.pending_signals |= signal_bit(signo);
+                drop(inner);
+                if interrupts_wait(&task, crate::timer::get_time_ms()) {
+                    WaitQueue::interrupt(&task);
+                }
             }
             return 0;
         }
@@ -180,11 +205,24 @@ pub fn kill_process(pid: usize, signo: usize) -> isize {
     };
     if let Some(process) = process {
         if signo != 0 {
-            process.inner_exclusive_access().signal_pending |= signal_bit(signo);
+            queue_process_signal(&mut process.inner_exclusive_access(), signo);
         }
     }
     // Keep the existing success result for a PID that has already exited.
     0
+}
+
+pub(crate) fn queue_process_signal(inner: &mut ProcessControlBlockInner, signo: usize) {
+    let bit = signal_bit(signo);
+    inner.signal_pending |= bit;
+    if interrupts_for_action(inner.signal_actions[signo - 1], signo) {
+        for task in inner.tasks.iter().flatten() {
+            let unmasked = task.inner_exclusive_access().signal_mask & bit == 0;
+            if unmasked {
+                WaitQueue::interrupt(task);
+            }
+        }
+    }
 }
 
 pub(super) fn take_pending(set: u64) -> Option<usize> {
@@ -207,13 +245,23 @@ pub(super) fn take_pending(set: u64) -> Option<usize> {
     Some(index + 1)
 }
 
-/// 定时器中断里调用：到期则标记 SIGALRM 待投递
+/// Deliver due alarms even if the recipient has no runnable thread.
 pub fn check_alarm() {
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    if inner.alarm_deadline != 0 && crate::timer::get_time_ms() >= inner.alarm_deadline {
-        inner.alarm_deadline = 0;
-        inner.signal_pending |= signal_bit(SIGALRM);
+    let now = crate::timer::get_time_ms();
+    loop {
+        let process = {
+            let mut alarms = ALARMS.exclusive_access();
+            let key = match alarms.keys().next() {
+                Some(&key) if key.0 <= now => key,
+                _ => return,
+            };
+            alarms.remove(&key).unwrap()
+        };
+        if let Some(process) = process.upgrade() {
+            let mut inner = process.inner_exclusive_access();
+            inner.alarm_deadline = 0;
+            queue_process_signal(&mut inner, SIGALRM);
+        }
     }
 }
 
@@ -252,11 +300,15 @@ pub(crate) fn interrupts_wait(task: &Arc<crate::task::TaskControlBlock>, now_ms:
         let bit = ready.trailing_zeros() as usize;
         ready &= ready - 1;
         let action = process_inner.signal_actions[bit];
-        if action.handler > 1 || (action.handler == 0 && terminating_default(bit + 1)) {
+        if interrupts_for_action(action, bit + 1) {
             return true;
         }
     }
     false
+}
+
+fn interrupts_for_action(action: SignalAction, signo: usize) -> bool {
+    action.handler > 1 || (action.handler == 0 && terminating_default(signo))
 }
 
 pub(crate) fn check_fatal_current() {

@@ -104,7 +104,6 @@ pub fn trap_handler() -> ! {
         TrapCause::FloatingPoint => handle_user_fault(cause, address, SignalFlags::SIGFPE),
         TrapCause::Timer => {
             set_next_trigger();
-            crate::syscall::signal::check_alarm();
             check_timer();
             // 时间片轮转：每次时钟中断让出 CPU。
             // 之前只在系统调用/阻塞点调度，纯用户态死循环（lmbench 的 benchmp

@@ -1,9 +1,8 @@
 use super::File;
-use crate::mm::UserBuffer;
+use crate::mm::{UserBuffer, UserBufferIterator};
 use crate::sync::UPSafeCell;
+use crate::task::{block_current_and_run_next, current_task, WaitQueue};
 use alloc::sync::{Arc, Weak};
-
-use crate::task::suspend_current_and_run_next;
 
 pub struct Pipe {
     readable: bool,
@@ -47,6 +46,8 @@ pub struct PipeRingBuffer {
     status: RingBufferStatus,
     read_end: Option<Weak<Pipe>>,
     write_end: Option<Weak<Pipe>>,
+    readers: Arc<WaitQueue>,
+    writers: Arc<WaitQueue>,
 }
 
 impl PipeRingBuffer {
@@ -58,6 +59,8 @@ impl PipeRingBuffer {
             status: RingBufferStatus::Empty,
             read_end: None,
             write_end: None,
+            readers: WaitQueue::new(),
+            writers: WaitQueue::new(),
         }
     }
     pub fn set_write_end(&mut self, write_end: &Arc<Pipe>) {
@@ -97,7 +100,10 @@ impl PipeRingBuffer {
         }
     }
     pub fn all_write_ends_closed(&self) -> bool {
-        self.write_end.as_ref().unwrap().upgrade().is_none()
+        self.write_end.as_ref().unwrap().strong_count() == 0
+    }
+    fn all_read_ends_closed(&self) -> bool {
+        self.read_end.as_ref().unwrap().strong_count() == 0
     }
 }
 
@@ -111,6 +117,42 @@ pub fn make_pipe() -> (Arc<Pipe>, Arc<Pipe>) {
     ring.set_write_end(&write_end);
     drop(ring);
     (read_end, write_end)
+}
+
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        // Each direction has one endpoint shared by dup, fork and in-flight I/O.
+        // Its final drop means the peer can observe EOF or a broken pipe.
+        let ring = self.buffer.exclusive_access();
+        if self.readable {
+            ring.writers.wake_all();
+        } else {
+            ring.readers.wake_all();
+        }
+    }
+}
+
+pub(crate) struct SuspendedPipeIo(UserBufferIterator);
+
+// A suspended iterator is resumed only by its own task, whose TCB pins its frames.
+// Another hart may reclaim the iterator on exit, which only frees its descriptors.
+unsafe impl Send for SuspendedPipeIo {}
+
+fn block_pipe_io(buffer: UserBufferIterator) -> UserBufferIterator {
+    // Group exit can discard the blocked kernel stack without running its destructors.
+    current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .suspended_pipe_io = Some(SuspendedPipeIo(buffer));
+    // The kernel lock stays held until the scheduler saves the task context.
+    block_current_and_run_next();
+    current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .suspended_pipe_io
+        .take()
+        .unwrap()
+        .0
 }
 
 impl File for Pipe {
@@ -129,72 +171,93 @@ impl File for Pipe {
     fn poll_writable(&self) -> bool {
         self.buffer.exclusive_access().available_write() > 0
     }
-    fn epollable(&self) -> bool { true }
+    fn epollable(&self) -> bool {
+        true
+    }
 
     fn poll_events(&self) -> u16 {
         let ring = self.buffer.exclusive_access();
         if self.readable {
-            (if ring.available_read() != 0 { 1 } else { 0 }) |
-                (if ring.all_write_ends_closed() { 16 } else { 0 })
+            (if ring.available_read() != 0 { 1 } else { 0 })
+                | (if ring.all_write_ends_closed() { 16 } else { 0 })
         } else {
-            (if ring.available_write() != 0 { 4 } else { 0 }) |
-                (if ring.read_end.as_ref().unwrap().strong_count() == 0 { 8 } else { 0 })
+            (if ring.available_write() != 0 { 4 } else { 0 })
+                | (if ring.all_read_ends_closed() { 8 } else { 0 })
         }
     }
 
     fn read(&self, buf: UserBuffer) -> usize {
+        self.read_result(buf).max(0) as usize
+    }
+
+    fn read_result(&self, buf: UserBuffer) -> isize {
         assert!(self.readable());
+        let len = buf.len();
+        if len == 0 {
+            return 0;
+        }
         let mut buf_iter = buf.into_iter();
-        let mut read_size = 0usize;
         loop {
-            let mut ring_buffer = self.buffer.exclusive_access();
-            let loop_read = ring_buffer.available_read();
-            if loop_read == 0 {
-                if ring_buffer.all_write_ends_closed() {
-                    return read_size;
+            let mut ring = self.buffer.exclusive_access();
+            let available = ring.available_read();
+            let count = available.min(len);
+            if count != 0 {
+                for slot in buf_iter.by_ref().take(count) {
+                    slot.write(ring.read_byte());
                 }
-                drop(ring_buffer);
-                // 已经读到数据：短读返回，避免死等后续数据（Linux pipe 语义）
-                if read_size > 0 {
-                    return read_size;
+                if available == RING_BUFFER_SIZE {
+                    ring.writers.wake_all();
                 }
-                crate::task::check_kill_current();
-                suspend_current_and_run_next();
-                continue;
+                return count as isize;
             }
-            // read at most loop_read bytes
-            for _ in 0..loop_read {
-                if let Some(slot) = buf_iter.next() {
-                    slot.write(ring_buffer.read_byte());
-                    read_size += 1;
-                } else {
-                    return read_size;
-                }
+            if ring.all_write_ends_closed() {
+                return 0;
             }
+            if !ring.readers.register_current_interruptible() {
+                return -4; // EINTR
+            }
+            drop(ring);
+            buf_iter = block_pipe_io(buf_iter);
         }
     }
+
     fn write(&self, buf: UserBuffer) -> isize {
         assert!(self.writable());
+        let len = buf.len();
         let mut buf_iter = buf.into_iter();
         let mut write_size = 0usize;
-        loop {
-            let mut ring_buffer = self.buffer.exclusive_access();
-            let loop_write = ring_buffer.available_write();
-            if loop_write == 0 {
-                drop(ring_buffer);
-                crate::task::check_kill_current();
-                suspend_current_and_run_next();
+        while write_size < len {
+            let mut ring = self.buffer.exclusive_access();
+            if ring.all_read_ends_closed() {
+                crate::syscall::signal::queue_current(13); // SIGPIPE
+                return if write_size == 0 {
+                    -32
+                } else {
+                    write_size as isize
+                };
+            }
+            let available = ring.available_write();
+            let count = available.min(len - write_size);
+            if count == 0 {
+                if !ring.writers.register_current_interruptible() {
+                    return if write_size == 0 {
+                        -4
+                    } else {
+                        write_size as isize
+                    };
+                }
+                drop(ring);
+                buf_iter = block_pipe_io(buf_iter);
                 continue;
             }
-            // write at most loop_write bytes
-            for _ in 0..loop_write {
-                if let Some(slot) = buf_iter.next() {
-                    ring_buffer.write_byte(slot.read());
-                    write_size += 1;
-                } else {
-                    return write_size as isize;
-                }
+            for slot in buf_iter.by_ref().take(count) {
+                ring.write_byte(slot.read());
+            }
+            write_size += count;
+            if available == RING_BUFFER_SIZE {
+                ring.readers.wake_all();
             }
         }
+        write_size as isize
     }
 }

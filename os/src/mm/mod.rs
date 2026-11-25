@@ -22,7 +22,7 @@ pub use vma::{PageFault, VmaBacking, USER_END};
 use page_table::PTEFlags;
 pub(crate) use page_table::{
     futex_phys_addr, prepare_user_write, read_user, translated_c_bytes, try_read_user,
-    try_write_user, write_user,
+    try_write_user, write_user, UserBufferIterator,
 };
 pub use page_table::{
     translated_byte_buffer, translated_path, PageTable, PageTableEntry, UserBuffer,

@@ -1,4 +1,4 @@
-use super::{ProcessControlBlock, TaskControlBlock};
+use super::{ProcessControlBlock, TaskControlBlock, TaskStatus, WaitQueue};
 use crate::sync::UPSafeCell;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
@@ -53,7 +53,17 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 }
 
 pub fn remove_task(task: Arc<TaskControlBlock>) {
+    WaitQueue::cancel(&task);
     TASK_MANAGER.exclusive_access().remove(task);
+}
+
+pub(super) fn wake_blocked_task(task: Arc<TaskControlBlock>) {
+    let mut inner = task.inner_exclusive_access();
+    if inner.task_status == TaskStatus::Blocking && inner.exit_code.is_none() {
+        inner.task_status = TaskStatus::Ready;
+        drop(inner);
+        add_task(task);
+    }
 }
 
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {

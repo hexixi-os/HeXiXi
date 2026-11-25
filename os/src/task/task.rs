@@ -1,5 +1,6 @@
 use super::id::{try_kstack_alloc, TaskUserRes};
-use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle, ProcessControlBlock, TaskContext};
+use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle, ProcessControlBlock, TaskContext, WaitQueue};
+use crate::fs::SuspendedPipeIo;
 use crate::trap::TrapContext;
 use crate::{
     mm::{FrameTracker, PhysPageNum},
@@ -42,6 +43,7 @@ pub struct TaskControlBlockInner {
     pub trap_cx_ppn: PhysPageNum,
     pub task_cx: TaskContext,
     pub task_status: TaskStatus,
+    pub(super) wait_queue: Option<Weak<WaitQueue>>,
     pub exit_code: Option<i32>,
     /// CLONE_CHILD_CLEARTID 的地址：线程退出时把它清零
     pub clear_child_tid: usize,
@@ -52,6 +54,7 @@ pub struct TaskControlBlockInner {
     pub(crate) signal_context: Option<(TrapContext, u64)>,
     pub(crate) user_io_frames: Vec<Arc<FrameTracker>>,
     pub(crate) user_io_file: Option<Arc<dyn crate::fs::File>>,
+    pub(crate) suspended_pipe_io: Option<SuspendedPipeIo>,
 }
 
 impl TaskControlBlockInner {
@@ -118,6 +121,7 @@ impl TaskControlBlock {
                     trap_cx_ppn,
                     task_cx: TaskContext::goto_trap_return(kstack_top),
                     task_status: TaskStatus::Ready,
+                    wait_queue: None,
                     exit_code: None,
                     clear_child_tid: 0,
                     set_child_tid: None,
@@ -127,6 +131,7 @@ impl TaskControlBlock {
                     signal_context: None,
                     user_io_frames: Vec::new(),
                     user_io_file: None,
+                    suspended_pipe_io: None,
                 })
             },
         }

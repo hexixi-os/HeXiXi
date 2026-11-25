@@ -7,12 +7,13 @@ mod signal;
 mod switch;
 #[allow(clippy::module_inception)]
 mod task;
+mod wait_queue;
 
 use self::id::TaskUserRes;
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 use manager::fetch_task;
-pub(crate) use process::ProcessControlBlock;
+pub(crate) use process::{ProcessControlBlock, ProcessControlBlockInner};
 use switch::__switch;
 use crate::timer::remove_timer;
 
@@ -26,6 +27,7 @@ pub use processor::{
 };
 pub use signal::SignalFlags;
 pub use task::{TaskControlBlock, TaskStatus};
+pub(crate) use wait_queue::WaitQueue;
 
 pub fn suspend_current_and_run_next() {
     // There must be an application running.
@@ -53,7 +55,7 @@ pub fn block_current_and_run_next() {
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
     task_inner.task_status = TaskStatus::Blocking;
     drop(task_inner);
-    drop(task); // The process and the wait queue hold the task while it is blocked.
+    drop(task); // The process owns the task while its context is blocked.
     schedule(task_cx_ptr);
 }
 
@@ -117,6 +119,7 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
         }
         remove_from_pid2process(pid);
         let mut process_inner = process.inner_exclusive_access();
+        crate::syscall::signal::cancel_alarm(pid, &mut process_inner);
         // mark this process as a zombie process
         process_inner.is_zombie = true;
         // record exit code of main process
@@ -125,8 +128,7 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
         // libc-test 的 runtest 在 fork 之后用 sigtimedwait(SIGCHLD) 等子进程结束，
         // 不投递的话每次测试都要空等 5s 超时。
         if let Some(parent) = process_inner.parent.as_ref().and_then(|p| p.upgrade()) {
-            let mut pin = parent.inner_exclusive_access();
-            pin.signal_pending |= 1 << (17 - 1); // SIGCHLD
+            crate::syscall::signal::queue_process_signal(&mut parent.inner_exclusive_access(), 17);
         }
 
         {
@@ -144,14 +146,10 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
         let mut recycle_res = Vec::<TaskUserRes>::new();
         for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
             let task = task.as_ref().unwrap();
-            // if other tasks are Ready in TaskManager or waiting for a timer to be
-            // expired, we should remove them.
-            //
-            // Mention that we do not need to consider Mutex/Semaphore since they
-            // are limited in a single process. Therefore, the blocked tasks are
-            // removed when the PCB is deallocated.
+            // Unlink waits before dropping an in-flight file, which can wake its peer.
             remove_inactive_task(Arc::clone(&task));
             let mut task_inner = task.inner_exclusive_access();
+            task_inner.suspended_pipe_io = None;
             task_inner.user_io_frames.clear();
             task_inner.user_io_file = None;
             if let Some(res) = task_inner.res.take() {
