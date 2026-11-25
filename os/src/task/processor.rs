@@ -6,6 +6,27 @@ use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use lazy_static::*;
 
+#[cfg(feature = "sched_switch_stats")]
+use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "sched_switch_stats")]
+static TASK_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "sched_switch_stats")]
+static READY_YIELDS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "sched_switch_stats")]
+pub(super) fn record_ready_yield() {
+    READY_YIELDS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "sched_switch_stats")]
+pub(super) fn report_switch_stats() {
+    println!(
+        "[sched] task_dispatches={} ready_yields={}",
+        TASK_DISPATCHES.load(Ordering::Relaxed),
+        READY_YIELDS.load(Ordering::Relaxed)
+    );
+}
+
 pub struct Processor {
     current: Option<Arc<TaskControlBlock>>,
     idle_task_cx: TaskContext,
@@ -65,6 +86,8 @@ pub fn run_tasks() -> ! {
             processor.current = Some(task);
             // release processor manually
             drop(processor);
+            #[cfg(feature = "sched_switch_stats")]
+            TASK_DISPATCHES.fetch_add(1, Ordering::Relaxed);
             unsafe {
                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
             }

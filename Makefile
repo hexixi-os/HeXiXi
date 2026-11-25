@@ -20,10 +20,11 @@ kernel-rv:
 LA_TARGET := loongarch64-unknown-none-softfloat
 LA_TOOLCHAIN ?= 1.98.1
 LA_KERNEL_OUT ?= kernel-la
+LA_FEATURES := oscomp_runner $(if $(filter 1,$(SCHED_SWITCH_STATS)),sched_switch_stats)
 
 kernel-la:
 	cd user && RUSTC_BOOTSTRAP=user_lib cargo +$(LA_TOOLCHAIN) build --locked --release --target $(LA_TARGET) --bin oscomp_runner
-	cd os && RUSTC_BOOTSTRAP=os cargo +$(LA_TOOLCHAIN) build --locked --release --target $(LA_TARGET) --features oscomp_runner
+	cd os && RUSTC_BOOTSTRAP=os cargo +$(LA_TOOLCHAIN) build --locked --release --target $(LA_TARGET) --features "$(LA_FEATURES)"
 	cp os/target/$(LA_TARGET)/release/os "$(LA_KERNEL_OUT)"
 
 clean-user:

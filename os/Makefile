@@ -28,6 +28,9 @@ endif
 ifeq ($(ELF_STARTUP_STATS),1)
 FEATURES += elf_startup_stats
 endif
+ifeq ($(SCHED_SWITCH_STATS),1)
+FEATURES += sched_switch_stats
+endif
 ifeq ($(OSCOMP),1)
 FEATURES += oscomp_runner
 kernel: oscomp-runner

@@ -41,6 +41,8 @@ pub fn suspend_current_and_run_next() {
 
     // push back to ready queue.
     add_task(task);
+    #[cfg(feature = "sched_switch_stats")]
+    processor::record_ready_yield();
     // jump to scheduling cycle
     schedule(task_cx_ptr);
 }
@@ -102,6 +104,8 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
     if group || last_thread || (tid == 0 && legacy_exit) {
         let pid = process.getpid();
         if pid == IDLE_PID {
+            #[cfg(feature = "sched_switch_stats")]
+            processor::report_switch_stats();
             println!(
                 "[kernel] Idle process exit with exit_code {} ...",
                 exit_code
