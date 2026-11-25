@@ -57,7 +57,7 @@ pub fn remove_task(task: Arc<TaskControlBlock>) {
     TASK_MANAGER.exclusive_access().remove(task);
 }
 
-pub(super) fn wake_blocked_task(task: Arc<TaskControlBlock>) {
+pub(crate) fn wake_blocked_task(task: Arc<TaskControlBlock>) {
     let mut inner = task.inner_exclusive_access();
     if inner.task_status == TaskStatus::Blocking && inner.exit_code.is_none() {
         inner.task_status = TaskStatus::Ready;

@@ -96,6 +96,13 @@ impl File for DirectoryFile {
         Some(self)
     }
 
+    fn mode(&self) -> u16 {
+        match &self.location.identity {
+            DirectoryIdentity::Upper(dir) => dir.mode,
+            _ => 0o40755,
+        }
+    }
+
     fn stat_identity(&self) -> Option<(u64, u64)> {
         match &self.location.identity {
             DirectoryIdentity::Upper(dir) => Some(directory_identity(dir)),

@@ -57,6 +57,7 @@ const SYSCALL_UMASK: usize = 166;
 const SYSCALL_PRCTL: usize = 167;
 const SYSCALL_GETCPU: usize = 168;
 const SYSCALL_FACCESSAT: usize = 48;
+const SYSCALL_FACCESSAT2: usize = 439;
 const SYSCALL_FCHMOD: usize = 52;
 const SYSCALL_FCHMODAT: usize = 53;
 const SYSCALL_FCHOWNAT: usize = 54;
@@ -81,6 +82,7 @@ const SYSCALL_GETEUID: usize = 175;
 const SYSCALL_GETGID: usize = 176;
 const SYSCALL_GETEGID: usize = 177;
 const SYSCALL_GETTID_LINUX: usize = 178;
+const SYSCALL_SYSINFO: usize = 179;
 const SYSCALL_DUP_LEGACY: usize = 23;
 const SYSCALL_DUP: usize = 24;
 const SYSCALL_OPEN: usize = 56;
@@ -171,6 +173,20 @@ pub static LAST_SYSCALLS: [core::sync::atomic::AtomicUsize; 8] = [
 pub static LAST_SYSCALL_IDX: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+pub(crate) fn restartable_syscall(id: usize, args: [usize; 6]) -> bool {
+    match id {
+        SYSCALL_READ | SYSCALL_WRITE | SYSCALL_READV | SYSCALL_WRITEV | SYSCALL_WAITPID
+        | SYSCALL_ACCEPT | SYSCALL_ACCEPT4 => true,
+        // WAIT_BITSET uses an absolute deadline. Retrying a timed WAIT would extend it.
+        SYSCALL_FUTEX => match args[1] & !(128 | 256) {
+            0 => args[3] == 0,
+            9 => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
     #[cfg(feature = "elf_startup_stats")]
     crate::exec_stats::complete();
@@ -195,7 +211,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_FSTATFS => sys_fstatfs(args[0], args[1] as *mut u8),
         SYSCALL_FTRUNCATE => sys_ftruncate(args[0], args[1] as isize),
         SYSCALL_TRUNCATE => sys_truncate(args[0] as *const u8, args[1] as isize),
-        SYSCALL_IOCTL => sys_ioctl(),
+        SYSCALL_IOCTL => sys_ioctl(args[0], args[1], args[2]),
         SYSCALL_LSEEK => sys_lseek(args[0], args[1] as isize, args[2]),
         SYSCALL_FUTEX => futex::sys_futex(args),
         SYSCALL_CLONE => {
@@ -228,7 +244,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETSOCKOPT => net::set_option(args),
         SYSCALL_GETSOCKOPT => net::get_option(args),
         SYSCALL_SHUTDOWN => net::shutdown(args),
-        SYSCALL_MADVISE | SYSCALL_SET_ROBUST_LIST | SYSCALL_SIGALTSTACK => 0,
+        SYSCALL_MADVISE | SYSCALL_SET_ROBUST_LIST => 0,
+        SYSCALL_SIGALTSTACK => signal::sys_sigaltstack(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => 0,
         SYSCALL_GETRUSAGE => sys_getrusage(args[1] as *mut u8),
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2] as u32),
@@ -238,6 +255,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[0] as *const u8,
             args[1] as *mut u8,
             args[2] as *const u8,
+            args[3],
         ),
         SYSCALL_GETRLIMIT => sys_getrlimit(args[0], args[1] as *mut u8),
         SYSCALL_SETRLIMIT => sys_setrlimit(args[0], args[1] as *const u8),
@@ -254,14 +272,18 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
                 || crate::mm::try_write_user(token, node, 0u32).is_some();
             if cpu && node { 0 } else { -14 }
         }
-        SYSCALL_UMASK | SYSCALL_PRCTL => 0,
-        // LTP 每个用例 setup 都会 chown 临时目录、access 文件，全部按成功处理，
-        // 否则 162 个用例全部 TBROK 在 setup 阶段。
-        SYSCALL_FACCESSAT | SYSCALL_FCHMOD | SYSCALL_FCHMODAT | SYSCALL_FCHOWNAT => 0,
-        SYSCALL_SETSID => sys_getpid(),
-        // LTP 的 test harness 每个用例都 setpgid(0,0)，缺了就全部 TBROK
-        SYSCALL_SETPGID => 0,
-        SYSCALL_GETPGID | SYSCALL_GETSID => sys_getpid(),
+        SYSCALL_UMASK => sys_umask(args[0] as u32),
+        SYSCALL_PRCTL | SYSCALL_FCHMOD | SYSCALL_FCHMODAT | SYSCALL_FCHOWNAT => 0,
+        SYSCALL_FACCESSAT | SYSCALL_FACCESSAT2 => sys_faccessat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2],
+            if syscall_id == SYSCALL_FACCESSAT2 { args[3] } else { 0 },
+        ),
+        SYSCALL_SETSID => sys_setsid(),
+        SYSCALL_SETPGID => sys_setpgid(args[0] as i32, args[1] as i32),
+        SYSCALL_GETPGID => sys_getpgid(args[0] as i32),
+        SYSCALL_GETSID => sys_getsid(args[0] as i32),
         SYSCALL_TKILL => signal::sys_thread_kill(None, args[0], args[1]),
         SYSCALL_TGKILL => signal::sys_thread_kill(Some(args[0]), args[1], args[2]),
         SYSCALL_RT_TGSIGQUEUEINFO => -38, // Queued siginfo delivery is not supported.
@@ -284,6 +306,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SETPRIORITY => 0,
         SYSCALL_GETUID | SYSCALL_GETEUID | SYSCALL_GETGID | SYSCALL_GETEGID => 0,
         SYSCALL_GETTID_LINUX => crate::task::current_task().unwrap().linux_tid() as isize,
+        SYSCALL_SYSINFO => sys_sysinfo(args[0] as *mut u8),
         SYSCALL_DUP_LEGACY => sys_dup(args[0]),
         SYSCALL_DUP => sys_dup3(args[0], args[1], args[2] as u32),
         SYSCALL_GETCWD => sys_getcwd(args[0] as *mut u8, args[1]),
@@ -295,7 +318,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         ),
         SYSCALL_UMOUNT2 => sys_umount2(args[0] as *const u8, args[1]),
         SYSCALL_GETDENTS64 => sys_getdents64(args[0], args[1] as *mut u8, args[2]),
-        SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8),
+        SYSCALL_MKDIRAT => sys_mkdirat(args[0] as isize, args[1] as *const u8, args[2] as u32),
         SYSCALL_UNLINKAT => sys_unlinkat(args[0] as isize, args[1] as *const u8, args[2]),
         SYSCALL_SYMLINKAT => sys_symlinkat(args[0] as *const u8, args[1] as isize, args[2] as *const u8),
         SYSCALL_READLINKAT => sys_readlinkat(args[0] as isize, args[1] as *const u8, args[2] as *mut u8, args[3]),
@@ -316,7 +339,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_RT_SIGRETURN => signal::sys_rt_sigreturn(),
         SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[1] as *mut u8),
         SYSCALL_CLOCK_GETRES => sys_clock_getres(args[1] as *mut u8),
-        SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(args[2] as *const u8),
+        SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(args[1], args[2] as *const u8, args[3]),
         SYSCALL_TIMES => sys_times(args[0] as *mut u8),
         SYSCALL_UNAME => sys_uname(args[0] as *mut u8),
         SYSCALL_YIELD => sys_yield(),

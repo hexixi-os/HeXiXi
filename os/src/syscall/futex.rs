@@ -1,7 +1,7 @@
 use crate::mm::{futex_phys_addr, try_read_user, UserValue, VirtAddr};
 use crate::sync::UPSafeCell;
 use crate::task::{
-    add_task, block_current_and_run_next, current_process, current_task, current_user_token,
+    block_current_and_run_next, current_process, current_task, current_user_token,
     TaskControlBlock,
 };
 use alloc::{collections::VecDeque, sync::Arc};
@@ -43,7 +43,7 @@ fn resolve_futex_word(token: usize, address: usize, private: bool) -> Option<(Ke
 
 fn resume(waiter: Waiter, result: isize) {
     waiter.task.inner_exclusive_access().futex_result = result;
-    add_task(waiter.task);
+    crate::task::wake_blocked_task(waiter.task);
 }
 
 fn wake_matching(waiters: &mut VecDeque<Waiter>, key: Key, count: usize, bits: u32) -> usize {
@@ -82,6 +82,13 @@ pub(crate) fn remove_task(task: &Arc<TaskControlBlock>) {
     WAITERS
         .exclusive_access()
         .retain(|waiter| !Arc::ptr_eq(&waiter.task, task));
+}
+
+pub(crate) fn interrupt_waiter(task: &Arc<TaskControlBlock>) {
+    let mut waiters = WAITERS.exclusive_access();
+    if let Some(index) = waiters.iter().position(|waiter| Arc::ptr_eq(&waiter.task, task)) {
+        resume(waiters.remove(index).unwrap(), -4);
+    }
 }
 
 pub(crate) fn check_waiters() {
@@ -163,7 +170,7 @@ pub(super) fn sys_futex([address, op, value, arg4, address2, arg6]: [usize; 6]) 
             if deadline.map_or(false, |end| end <= crate::timer::get_time_ns()) {
                 return -110;
             }
-            if super::signal::alarm_interrupts() {
+            if super::signal::current_wait_interrupted() {
                 return -4;
             }
             // Kernel entry is serialized and interrupts stay masked, so no wake can slip in before blocking.

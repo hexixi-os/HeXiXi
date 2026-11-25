@@ -179,9 +179,103 @@ pub fn sys_writev(fd: usize, iov: *const u8, iovcnt: usize) -> isize {
     }
 }
 
-/// ioctl(2)：只支持 isatty 探测，其余返回 ENOTTY
-pub fn sys_ioctl() -> isize {
-    -25 // ENOTTY
+// Both guest architectures use the asm-generic kernel termios layout:
+// four 32-bit flags, one line discipline byte and 19 control characters.
+const TCGETS: usize = 0x5401;
+const TCSETS: usize = 0x5402;
+const TCSETSW: usize = 0x5403;
+const TCSETSF: usize = 0x5404;
+const TIOCGPGRP: usize = 0x540f;
+const TIOCSPGRP: usize = 0x5410;
+const TIOCGWINSZ: usize = 0x5413;
+const TIOCSWINSZ: usize = 0x5414;
+const TIOCGSID: usize = 0x5429;
+
+struct ConsoleSettings {
+    termios: [u8; 36],
+    winsize: [u8; 8],
+    foreground: Option<Arc<crate::task::PidHandle>>,
+}
+
+lazy_static::lazy_static! {
+    static ref CONSOLE_SETTINGS: crate::sync::UPSafeCell<ConsoleSettings> = {
+        let mut termios = [0; 36];
+        // The boot UART delivers raw bytes. B38400 | CS8 | CREAD, VMIN = 1.
+        termios[8..12].copy_from_slice(&0o277u32.to_ne_bytes());
+        termios[17 + 6] = 1;
+        unsafe {
+            crate::sync::UPSafeCell::new(ConsoleSettings {
+                termios,
+                winsize: [24, 0, 80, 0, 0, 0, 0, 0],
+                foreground: None,
+            })
+        }
+    };
+}
+
+fn ioctl_input<const N: usize>(arg: usize) -> Result<[u8; N], isize> {
+    let buffers = translated_byte_buffer(current_user_token(), arg as *const u8, N, MapPermission::R)
+        .ok_or(-14isize)?;
+    let mut value = [0; N];
+    for (dest, byte) in value.iter_mut().zip(UserBuffer::new(buffers)) {
+        *dest = byte.read();
+    }
+    Ok(value)
+}
+
+pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
+    let result = (|| {
+        let file = file_by_fd(fd)?;
+        if file.path_only() { return Err(-9); }
+        if !file.is_tty() { return Err(-25); }
+
+        let output = |bytes: &[u8]| match write_stat_bytes(arg as *mut u8, bytes) {
+            0 => Ok(()),
+            errno => Err(errno),
+        };
+        match request {
+            TCGETS => {
+                let value = CONSOLE_SETTINGS.exclusive_access().termios;
+                output(&value)
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                let value = ioctl_input(arg)?;
+                CONSOLE_SETTINGS.exclusive_access().termios = value;
+                Ok(())
+            }
+            TIOCGWINSZ => {
+                let value = CONSOLE_SETTINGS.exclusive_access().winsize;
+                output(&value)
+            }
+            TIOCSWINSZ => {
+                let value = ioctl_input(arg)?;
+                CONSOLE_SETTINGS.exclusive_access().winsize = value;
+                Ok(())
+            }
+            TIOCGPGRP | TIOCSPGRP | TIOCGSID => {
+                let sid = current_process().inner_exclusive_access().sid.0;
+                let console_sid = crate::task::INITPROC.inner_exclusive_access().sid.0;
+                if sid != console_sid { return Err(-25); }
+                match request {
+                    TIOCGSID => output(&(sid as i32).to_ne_bytes()),
+                    TIOCGPGRP => {
+                        let group = CONSOLE_SETTINGS.exclusive_access().foreground.as_ref()
+                            .map_or(sid, |pgid| pgid.0);
+                        output(&(group as i32).to_ne_bytes())
+                    }
+                    _ => {
+                        let group = i32::from_ne_bytes(ioctl_input(arg)?);
+                        if group <= 0 { return Err(-22); }
+                        let group = crate::task::ProcessControlBlock::group_in_session(group as usize, sid)?;
+                        CONSOLE_SETTINGS.exclusive_access().foreground = Some(group);
+                        Ok(())
+                    }
+                }
+            }
+            _ => Err(-25),
+        }
+    })();
+    result.err().unwrap_or(0)
 }
 
 fn resolve_at(dirfd: isize, path: &str) -> Result<String, isize> {
@@ -213,7 +307,7 @@ fn resolve_at_with(dirfd: isize, path: &str, follow_final: bool) -> Result<Strin
 }
 
 /// openat(56)：解析 cwd 或目录 fd，并把 Linux flags 翻译成内核 OpenFlags。
-pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isize {
+pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize {
     const O_NOFOLLOW: u32 = 0o400000;
     const O_DIRECTORY: u32 = 0o200000;
     const O_PATH: u32 = 0o10000000;
@@ -268,7 +362,8 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, _mode: u32) -> isiz
                 else { Ok(Arc::new(fs::PathFile(link, flags & !O_CLOEXEC))) };
             }
         }
-        let file = fs::open_dyn(&path, open_flags)?;
+        let permissions = creation_permissions(mode);
+        let file = fs::open_dyn_with_mode(&path, open_flags, permissions)?;
         if path_only { Ok(Arc::new(fs::PathFile(file, flags & !O_CLOEXEC))) } else { Ok(file) }
     })();
     let file = match result {
@@ -383,10 +478,14 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
     count as isize
 }
 
-pub fn sys_mkdirat(dirfd: isize, path: *const u8) -> isize {
+fn creation_permissions(mode: u32) -> u16 {
+    (mode & 0o7777 & !current_process().inner_exclusive_access().umask) as u16
+}
+
+pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
     translated_path(current_user_token(), path)
         .and_then(|raw| resolve_at_with(dirfd, &raw, false))
-        .and_then(|path| fs::mkdir(&path))
+        .and_then(|path| fs::mkdir(&path, creation_permissions(mode)))
         .err()
         .unwrap_or(0)
 }
@@ -584,6 +683,28 @@ fn stat_file_at(
         fs::require_directory(&path)?;
     }
     fs::open_dyn(&path, OpenFlags::RDONLY).map(|file| (file, 0))
+}
+
+pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, flags: usize) -> isize {
+    const AT_EACCESS: usize = 0x200;
+    if mode & !7 != 0 || flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH) != 0 {
+        return -22;
+    }
+    translated_path(current_user_token(), path)
+        .and_then(|raw| stat_file_at(dirfd, &raw, flags))
+        .and_then(|(file, _)| {
+            let permissions = file.mode();
+            // Real and effective credentials are root. A regular file still needs
+            // at least one execute bit, even when checked by root.
+            if mode & 1 != 0 && permissions & 0o170000 == 0o100000 && permissions & 0o111 == 0 {
+                return Err(-13);
+            }
+            if mode & 2 != 0 && file.space_usage().map_or(false, |(_, readonly)| readonly) {
+                return Err(-30);
+            }
+            Ok(())
+        })
+        .err().unwrap_or(0)
 }
 
 pub fn sys_newfstatat(dirfd: isize, path: *const u8, st: *mut u8, flags: usize) -> isize {
@@ -798,7 +919,7 @@ pub fn sys_utimensat(path: *const u8) -> isize {
             } else if fs::exists(&path) {
                 Ok(())
             } else {
-                fs::open_dyn(&path, OpenFlags::CREATE | OpenFlags::RDWR).map(|_| ())
+                fs::open_dyn_with_mode(&path, OpenFlags::CREATE | OpenFlags::RDWR, creation_permissions(0o666)).map(|_| ())
             }
         })
         .err()

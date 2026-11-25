@@ -80,6 +80,25 @@ pub fn remove_timer(task: Arc<TaskControlBlock>) {
     timers.append(&mut temp);
 }
 
+pub(crate) fn interrupt_sleep(task: &Arc<TaskControlBlock>) {
+    let mut woken = false;
+    {
+        let mut timers = TIMERS.exclusive_access();
+        let mut temp = BinaryHeap::with_capacity(timers.len());
+        for condvar in timers.drain() {
+            if Arc::ptr_eq(&condvar.task, task) {
+                woken = true;
+            } else {
+                temp.push(condvar);
+            }
+        }
+        *timers = temp;
+    }
+    if woken {
+        crate::task::wake_blocked_task(Arc::clone(task));
+    }
+}
+
 pub fn check_timer() {
     crate::net::poll();
     crate::syscall::signal::check_alarm();

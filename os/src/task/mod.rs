@@ -26,7 +26,9 @@ pub use processor::{
     current_user_token, run_tasks, schedule, take_current_task,
 };
 pub use signal::SignalFlags;
+pub(crate) use manager::wake_blocked_task;
 pub use task::{TaskControlBlock, TaskStatus};
+pub(crate) use task::TaskControlBlockInner;
 pub(crate) use wait_queue::WaitQueue;
 
 pub fn suspend_current_and_run_next() {
@@ -117,7 +119,6 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
             #[cfg(target_arch = "riscv64")]
             crate::board::qemu_exit(exit_code == 0);
         }
-        remove_from_pid2process(pid);
         let mut process_inner = process.inner_exclusive_access();
         crate::syscall::signal::cancel_alarm(pid, &mut process_inner);
         // mark this process as a zombie process
@@ -128,7 +129,13 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
         // libc-test 的 runtest 在 fork 之后用 sigtimedwait(SIGCHLD) 等子进程结束，
         // 不投递的话每次测试都要空等 5s 超时。
         if let Some(parent) = process_inner.parent.as_ref().and_then(|p| p.upgrade()) {
-            crate::syscall::signal::queue_process_signal(&mut parent.inner_exclusive_access(), 17);
+            let (code, status) = if wait_status & 0x7f == 0 {
+                (1, (wait_status >> 8) & 0xff) // CLD_EXITED
+            } else {
+                (2, wait_status & 0x7f) // CLD_KILLED
+            };
+            let info = crate::syscall::signal::SignalInfo::child(pid, code, status);
+            crate::syscall::signal::queue_process_signal(&mut parent.inner_exclusive_access(), info);
         }
 
         {
@@ -241,6 +248,7 @@ pub fn add_initproc(oscomp_group: Option<&str>) {
 /// 进程被 kill(SIGKILL) 后，在内核里的轮询/等待循环中尽快退出。
 /// （用户态循环靠时钟中断里的信号检查退出；内核态等待循环必须主动检查）
 pub fn check_kill_current() {
+    crate::syscall::signal::park_while_stopped();
     crate::syscall::signal::check_fatal_current();
 }
 
@@ -254,6 +262,7 @@ pub fn current_has_handler(signo: usize) -> bool {
 }
 
 /// 给当前进程置“待投递信号”位（用于 SIGSEGV handler 投递）
+#[allow(dead_code)]
 pub fn current_set_pending(signo: usize) -> bool {
     if (1..=64).contains(&signo) {
         crate::syscall::signal::queue_current(signo);
@@ -269,6 +278,7 @@ pub fn check_signals_of_current() -> Option<(i32, &'static str)> {
     process_inner.signals.check_error()
 }
 
+#[allow(dead_code)]
 pub fn current_add_signal(signal: SignalFlags) {
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();

@@ -133,19 +133,53 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
     0
 }
 
+fn sleep_until_ms(expire_ms: usize, rem: usize) -> isize {
+    loop {
+        crate::task::check_kill_current();
+        let now = get_time_ms();
+        if now >= expire_ms {
+            return 0;
+        }
+        if super::signal::current_wait_interrupted() {
+            if rem != 0 {
+                let left_ms = expire_ms.saturating_sub(get_time_ms());
+                let token = crate::task::current_user_token();
+                let _ = crate::mm::try_write_user(token, rem as *mut u64, (left_ms / 1000) as u64);
+                let _ = crate::mm::try_write_user(
+                    token,
+                    (rem + 8) as *mut u64,
+                    ((left_ms % 1000) * 1_000_000) as u64,
+                );
+            }
+            return -4;
+        }
+        let task = current_task().unwrap();
+        add_timer(expire_ms, task);
+        block_current_and_run_next();
+    }
+}
+
 /// Linux nanosleep(101)：参数是 struct timespec { i64 sec; i64 nsec; }
 /// 兼容旧写法：参数很小（< 4096）时按毫秒处理
-pub fn sys_nanosleep(req: usize, _rem: usize) -> isize {
-    let ms = if req < 4096 {
-        req
-    } else {
-        let token = crate::task::current_user_token();
-        let sec = crate::mm::read_user(token, req as *const usize) as i64;
-        let nsec = crate::mm::read_user(token, (req + 8) as *const usize) as i64;
-        (sec * 1000 + nsec / 1_000_000) as usize
+pub fn sys_nanosleep(req: usize, rem: usize) -> isize {
+    if req < 4096 {
+        sys_sleep(req);
+        return 0;
+    }
+    let token = crate::task::current_user_token();
+    let Some(sec) = crate::mm::try_read_user(token, req as *const i64) else {
+        return -14;
     };
-    sys_sleep(ms);
-    0
+    let Some(nsec) = req.checked_add(8).and_then(|p| crate::mm::try_read_user(token, p as *const i64)) else {
+        return -14;
+    };
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return -22;
+    }
+    let ms = (sec as usize)
+        .saturating_mul(1000)
+        .saturating_add((nsec as usize + 999_999) / 1_000_000);
+    sleep_until_ms(get_time_ms().saturating_add(ms), rem)
 }
 
 /// clock_gettime(113)：只填 timespec 的秒/纳秒
@@ -173,17 +207,35 @@ pub fn sys_clock_getres(ts: *mut u8) -> isize {
     0
 }
 
-/// clock_nanosleep(115)：用轮询定时器实现
-pub fn sys_clock_nanosleep(req: *const u8) -> isize {
-    if req.is_null() {
+/// clock_nanosleep(115)：支持相对睡眠与 TIMER_ABSTIME，可被信号唤醒中断
+pub fn sys_clock_nanosleep(flags: usize, req: *const u8, rem: usize) -> isize {
+    const TIMER_ABSTIME: usize = 1;
+    if flags & !TIMER_ABSTIME != 0 {
         return -22;
     }
-    let token = crate::task::current_user_token();
-    let sec = crate::mm::read_user(token, req as *const u64) as usize;
-    let nsec = crate::mm::read_user(token, (req as usize + 8) as *const u64) as usize;
-    let deadline = crate::timer::get_time_ms() + sec * 1000 + (nsec + 999_999) / 1_000_000;
-    while crate::timer::get_time_ms() < deadline {
-        crate::task::suspend_current_and_run_next();
+    if req.is_null() {
+        return -14;
     }
-    0
+    let token = crate::task::current_user_token();
+    let Some(sec) = crate::mm::try_read_user(token, req as *const i64) else {
+        return -14;
+    };
+    let Some(nsec) = (req as usize)
+        .checked_add(8)
+        .and_then(|p| crate::mm::try_read_user(token, p as *const i64))
+    else {
+        return -14;
+    };
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return -22;
+    }
+    let target_ms = (sec as usize)
+        .saturating_mul(1000)
+        .saturating_add((nsec as usize + 999_999) / 1_000_000);
+    let (deadline, out_rem) = if flags & TIMER_ABSTIME != 0 {
+        (target_ms, 0)
+    } else {
+        (get_time_ms().saturating_add(target_ms), rem)
+    };
+    sleep_until_ms(deadline, out_rem)
 }

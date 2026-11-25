@@ -76,6 +76,9 @@ pub trait File: Send + Sync {
             0o100644
         }
     }
+    fn is_tty(&self) -> bool {
+        false
+    }
     fn path_flags(&self) -> Option<u32> {
         None
     }
@@ -485,6 +488,7 @@ fn open_memfs(
     full_name: &str,
     rel: &str,
     flags: OpenFlags,
+    permissions: u16,
 ) -> Result<Arc<dyn File + Send + Sync>, isize> {
     let create = flags.contains(OpenFlags::CREATE);
     let exclusive = flags.contains(OpenFlags::CREATE | OpenFlags::EXCL);
@@ -508,13 +512,21 @@ fn open_memfs(
             if !create || directory {
                 return Err(-2);
             }
-            open_overlay(fs.create(rel, None)?, flags)
+            open_overlay(fs.create(rel, None, permissions)?, flags)
         }
     }
 }
 
 /// 打开文件并返回统一的 File 对象（供系统调用使用）
 pub fn open_dyn(name: &str, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sync>, isize> {
+    open_dyn_with_mode(name, flags, 0o644)
+}
+
+pub fn open_dyn_with_mode(
+    name: &str,
+    flags: OpenFlags,
+    permissions: u16,
+) -> Result<Arc<dyn File + Send + Sync>, isize> {
     let create = flags.contains(OpenFlags::CREATE);
     let exclusive = flags.contains(OpenFlags::CREATE | OpenFlags::EXCL);
     let directory = flags.contains(OpenFlags::DIRECTORY);
@@ -530,11 +542,11 @@ pub fn open_dyn(name: &str, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sy
         if let Some((mount, _)) = resolve_mount(name) {
             return match mount.backend {
                 MountBackend::Procfs | MountBackend::Devfs | MountBackend::Persistent(_) => Err(-95),
-                MountBackend::Memfs(fs) => open_overlay(fs.new_file(None, false)?, flags),
-                MountBackend::RootOverlay => open_overlay(overlay_new_file(None, false)?, flags),
+                MountBackend::Memfs(fs) => open_overlay(fs.new_file(None, false, permissions)?, flags),
+                MountBackend::RootOverlay => open_overlay(overlay_new_file(None, false, permissions)?, flags),
             };
         }
-        return open_overlay(overlay_new_file(None, false)?, flags);
+        return open_overlay(overlay_new_file(None, false, permissions)?, flags);
     }
 
     if let Some((mount, rel)) = resolve_mount(name) {
@@ -573,7 +585,7 @@ pub fn open_dyn(name: &str, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sy
                 return Err(if create { -30 } else { -2 });
             }
             MountBackend::Memfs(fs) => {
-                return open_memfs(&fs, name, rel, flags);
+                return open_memfs(&fs, name, rel, flags, permissions);
             }
             MountBackend::Persistent(fs) => return fs.open(rel, name, flags),
             MountBackend::RootOverlay => {}
@@ -629,15 +641,16 @@ pub fn open_dyn(name: &str, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sy
             if !inode.is_file() {
                 return Err(-30);
             }
+            let permissions = inode.mode & 0o7777;
             let lower = (!flags.contains(OpenFlags::TRUNC))
                 .then(|| ext4::Ext4File::new(Arc::clone(fs), inode));
-            return open_overlay(overlay_create(name, lower)?, flags);
+            return open_overlay(overlay_create(name, lower, permissions)?, flags);
         }
         require_parent_directories(name)?;
         if !create || directory {
             return Err(-2);
         }
-        open_overlay(overlay_create(name, None)?, flags)
+        open_overlay(overlay_create(name, None, permissions)?, flags)
     } else {
         let exists = || open_file(name, OpenFlags::RDONLY).is_some();
         if directory {
@@ -830,7 +843,7 @@ pub fn init_runtime_dirs() {
     mount_tmpfs_at_boot("dev/shm");
     for name in ["tmp", "var", "var/tmp"] {
         if let Ok(path) = resolve_from(name, "", true) {
-            let _ = mkdir(&path);
+            let _ = mkdir(&path, 0o755);
         }
     }
     for name in ["tmp", "var/tmp"] {
@@ -849,7 +862,7 @@ pub fn init_runtime_dirs() {
     }
 }
 
-pub fn mkdir(name: &str) -> Result<(), isize> {
+pub fn mkdir(name: &str, permissions: u16) -> Result<(), isize> {
     if let Some((mount, rel)) = resolve_mount(name) {
         match mount.backend {
             MountBackend::Procfs | MountBackend::Devfs => {
@@ -863,7 +876,7 @@ pub fn mkdir(name: &str) -> Result<(), isize> {
                 if exists(name) {
                     return Err(-17);
                 }
-                return fs.mkdir(rel);
+                return fs.mkdir(rel, permissions);
             }
             MountBackend::Persistent(fs) => return fs.mkdir(rel),
             MountBackend::RootOverlay => {}
@@ -879,7 +892,7 @@ pub fn mkdir(name: &str) -> Result<(), isize> {
     if exists(name) {
         return Err(-17); // EEXIST
     }
-    overlay_mkdir(name)
+    overlay_mkdir(name, permissions)
 }
 
 pub fn unlink(name: &str, remove_directory: bool) -> Result<(), isize> {
@@ -1033,9 +1046,11 @@ pub fn rename_overlay(old: &str, new: &str, no_replace: bool) -> Result<(), isiz
                 }
                 OverlayEntry::Symlink(link)
             } else if inode.is_file() {
+                let permissions = inode.mode & 0o7777;
                 OverlayEntry::File(overlay_new_file(
                     Some(ext4::Ext4File::new(fs.clone(), inode)),
                     true,
+                    permissions,
                 )?)
             } else {
                 return Err(-30);

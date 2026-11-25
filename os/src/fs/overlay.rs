@@ -33,6 +33,7 @@ fn next_device() -> u64 {
 }
 
 pub(super) struct OverlayDirectory {
+    pub(super) mode: u16,
     dev: u64,
     mount_prefix: String,
     mounted: Arc<AtomicBool>,
@@ -208,6 +209,7 @@ impl MemFs {
     fn new_root_overlay() -> Self {
         let mounted = Arc::new(AtomicBool::new(true));
         let root = Arc::new(OverlayDirectory {
+            mode: 0o40755,
             dev: OVERLAY_DEVICE,
             mount_prefix: String::new(),
             mounted: Arc::clone(&mounted),
@@ -231,6 +233,7 @@ impl MemFs {
         let dev = next_device();
         let mounted = Arc::new(AtomicBool::new(true));
         let root = Arc::new(OverlayDirectory {
+            mode: 0o40755,
             dev,
             mount_prefix: String::from(mount_prefix),
             mounted: Arc::clone(&mounted),
@@ -277,25 +280,26 @@ impl MemFs {
         self.entries.exclusive_access().entries.get(name).cloned()
     }
 
-    pub(super) fn new_file(&self, lower: Option<Ext4File>, linked: bool) -> Result<OverlayData, isize> {
-        new_file_with_dev(self.dev, lower, linked)
+    pub(super) fn new_file(&self, lower: Option<Ext4File>, linked: bool, permissions: u16) -> Result<OverlayData, isize> {
+        new_file_with_dev(self.dev, lower, linked, permissions)
     }
 
-    pub(super) fn create(&self, name: &str, lower: Option<Ext4File>) -> Result<OverlayData, isize> {
+    pub(super) fn create(&self, name: &str, lower: Option<Ext4File>, permissions: u16) -> Result<OverlayData, isize> {
         let mut entries = self.entries.exclusive_access();
         if let Some(OverlayEntry::File(data)) = entries.entries.get(name) {
             return Ok(data.clone());
         }
         entries.check_insert(name)?;
-        let data = new_file_with_dev(self.dev, lower, true)?;
+        let data = new_file_with_dev(self.dev, lower, true, permissions)?;
         entries.insert(String::from(name), OverlayEntry::File(data.clone()));
         Ok(data)
     }
 
-    pub(super) fn mkdir(&self, name: &str) -> Result<(), isize> {
+    pub(super) fn mkdir(&self, name: &str, permissions: u16) -> Result<(), isize> {
         let mut entries = self.entries.exclusive_access();
         entries.check_insert(name)?;
         let directory = Arc::new(OverlayDirectory {
+            mode: 0o40000 | permissions,
             dev: self.dev,
             mount_prefix: self.mount_prefix.clone(),
             mounted: Arc::clone(&self.mounted),
@@ -428,23 +432,25 @@ pub(super) fn overlay_get(name: &str) -> Option<OverlayEntry> {
     OVERLAY.get(name)
 }
 
-pub(super) fn overlay_create(name: &str, lower: Option<Ext4File>) -> Result<OverlayData, isize> {
-    OVERLAY.create(name, lower)
+pub(super) fn overlay_create(name: &str, lower: Option<Ext4File>, permissions: u16) -> Result<OverlayData, isize> {
+    OVERLAY.create(name, lower, permissions)
 }
 
-pub(super) fn new_file(lower: Option<Ext4File>, linked: bool) -> Result<OverlayData, isize> {
-    new_file_with_dev(OVERLAY_DEVICE, lower, linked)
+pub(super) fn new_file(lower: Option<Ext4File>, linked: bool, permissions: u16) -> Result<OverlayData, isize> {
+    new_file_with_dev(OVERLAY_DEVICE, lower, linked, permissions)
 }
 
 fn new_file_with_dev(
     dev: u64,
     lower: Option<Ext4File>,
     linked: bool,
+    permissions: u16,
 ) -> Result<OverlayData, isize> {
     let charge = InodeCharge::new()?;
     let len = lower.as_ref().map_or(0, Ext4File::len);
     Ok(Arc::new(unsafe {
         UPSafeCell::new(OverlayContents {
+            mode: 0o100000 | permissions,
             dev,
             ino: next_inode(),
             linked,
@@ -459,8 +465,8 @@ fn new_file_with_dev(
     }))
 }
 
-pub(super) fn overlay_mkdir(name: &str) -> Result<(), isize> {
-    OVERLAY.mkdir(name)
+pub(super) fn overlay_mkdir(name: &str, permissions: u16) -> Result<(), isize> {
+    OVERLAY.mkdir(name, permissions)
 }
 
 pub(super) fn overlay_symlink(name: &str, target: Vec<u8>) -> Result<(), isize> {
@@ -507,6 +513,7 @@ pub(super) fn overlay_children(directory: &str) -> BTreeMap<String, OverlayEntry
 
 /// The in-memory file owns its pages. MAP_SHARED takes another reference to the same frames.
 pub(super) struct OverlayContents {
+    mode: u16,
     dev: u64,
     ino: u32,
     linked: bool,
@@ -699,6 +706,10 @@ impl OverlayFile {
 }
 
 impl File for OverlayFile {
+    fn mode(&self) -> u16 {
+        self.data.exclusive_access().mode
+    }
+
     fn readable(&self) -> bool {
         !self.flags.contains(OpenFlags::WRONLY)
     }

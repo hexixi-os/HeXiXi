@@ -3,8 +3,7 @@ mod context;
 use crate::arch::{self, TrapCause, REG_A0, REG_FP, REG_SP, REG_SYSCALL};
 use crate::syscall::syscall;
 use crate::task::{
-    check_signals_of_current, current_add_signal, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, SignalFlags,
+    check_signals_of_current, current_trap_cx, current_trap_cx_user_va, current_user_token,
 };
 use crate::timer::{check_timer, set_next_trigger};
 
@@ -30,15 +29,11 @@ fn report_user_fault(cause: TrapCause, stval: usize) {
     );
 }
 
-fn handle_user_fault(cause: TrapCause, stval: usize, signal: SignalFlags) {
-    report_user_fault(cause, stval);
-    let signo = signal.bits().trailing_zeros() as usize;
-    if crate::task::current_has_handler(signo) {
-        // 用户 handler：投递后由 deliver_signal 跳到 handler，返回后指令重试
-        crate::task::current_set_pending(signo);
-    } else {
-        current_add_signal(signal);
+fn handle_user_fault(cause: TrapCause, stval: usize, signo: usize, code: i32) {
+    if !crate::task::current_has_handler(signo) {
+        report_user_fault(cause, stval);
     }
+    crate::syscall::signal::queue_fault(signo, code, stval);
 }
 
 #[no_mangle]
@@ -47,11 +42,13 @@ pub fn trap_handler() -> ! {
     crate::sync::enter_kernel();
     // 在别人的内核栈上析构已退出线程（不能在自己的栈上析构）
     crate::task::drain_recycled_tasks();
-    let (cause, address, _) = arch::trap_info();
+    let (cause, address, pc) = arch::trap_info();
+    let mut restart = None;
     match cause {
         TrapCause::Syscall => {
             // jump to next instruction anyway
             let mut cx = current_trap_cx();
+            let syscall_pc = cx.sepc;
             cx.sepc += 4;
             // get system call return value
             let id = cx.x[REG_SYSCALL];
@@ -73,6 +70,12 @@ pub fn trap_handler() -> ! {
                 // Successful execve and rt_sigreturn have installed the full context.
                 cx.x[REG_A0] = result as usize;
             }
+            if result == -4 && crate::syscall::restartable_syscall(id, args) {
+                restart = Some(crate::syscall::signal::Restart {
+                    pc: syscall_pc,
+                    args,
+                });
+            }
         }
         TrapCause::StorePageFault | TrapCause::LoadPageFault | TrapCause::InstructionPageFault => {
             use crate::mm::{MapPermission, PageFault};
@@ -86,22 +89,20 @@ pub fn trap_handler() -> ! {
                     arch::local_flush_tlb_page(address);
                     trap_return();
                 }
-                PageFault::FileUnavailable => {
-                    handle_user_fault(cause, address, SignalFlags::SIGBUS)
-                }
-                PageFault::Invalid => handle_user_fault(cause, address, SignalFlags::SIGSEGV),
+                PageFault::FileUnavailable => handle_user_fault(cause, address, 7, 2),
+                PageFault::Invalid => handle_user_fault(cause, address, 11, 1),
             }
         }
         TrapCause::AccessFault => {
-            handle_user_fault(cause, address, SignalFlags::SIGSEGV);
+            handle_user_fault(cause, address, 11, 1);
         }
         TrapCause::IllegalInstruction => {
-            current_add_signal(SignalFlags::SIGILL);
+            handle_user_fault(cause, pc, 4, 1);
         }
         #[cfg(target_arch = "loongarch64")]
-        TrapCause::Breakpoint => handle_user_fault(cause, address, SignalFlags::SIGTRAP),
+        TrapCause::Breakpoint => handle_user_fault(cause, pc, 5, 1),
         #[cfg(target_arch = "loongarch64")]
-        TrapCause::FloatingPoint => handle_user_fault(cause, address, SignalFlags::SIGFPE),
+        TrapCause::FloatingPoint => handle_user_fault(cause, pc, 8, 1),
         TrapCause::Timer => {
             set_next_trigger();
             check_timer();
@@ -114,7 +115,7 @@ pub fn trap_handler() -> ! {
             panic!("Unsupported trap {:#x}, stval = {:#x}!", raw, address);
         }
     }
-    crate::syscall::signal::deliver_signal();
+    crate::syscall::signal::deliver_signal(restart);
     // check signals
     if let Some((errno, msg)) = check_signals_of_current() {
         println!("[kernel] {}", msg);

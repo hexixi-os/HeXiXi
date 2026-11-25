@@ -17,7 +17,7 @@ use core::cell::RefMut;
 
 pub struct ProcessControlBlock {
     // immutable
-    pub pid: PidHandle,
+    pub pid: Arc<PidHandle>,
     #[cfg(feature = "smp")]
     hart: usize,
     // mutable
@@ -30,6 +30,13 @@ pub struct ProcessControlBlockInner {
     pub parent: Option<Weak<ProcessControlBlock>>,
     pub children: Vec<Arc<ProcessControlBlock>>,
     pub wait_status: i32,
+    // Keep IDs reserved after the original group or session leader has exited.
+    pub(crate) pgid: Arc<PidHandle>,
+    pub(crate) sid: Arc<PidHandle>,
+    pub(crate) execed: bool,
+    pub(crate) job_stopped: bool,
+    pub(crate) job_wait_status: Option<i32>,
+    pub(crate) umask: u32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     pub close_on_exec: BTreeSet<usize>,
     pub signals: SignalFlags,
@@ -54,6 +61,7 @@ pub struct ProcessControlBlockInner {
     pub signal_actions: [crate::syscall::signal::SignalAction; 64],
     /// 待投递信号位图（bit = signo）
     pub signal_pending: u64,
+    pub(crate) signal_info: crate::syscall::signal::PendingInfo,
     pub legacy_thread_exit: bool,
     /// RLIMIT_NOFILE 的当前上限（fd 表硬上限；setrlimit/prlimit64 会改）
     pub nofile_limit: usize,
@@ -108,6 +116,16 @@ impl ProcessControlBlockInner {
 }
 
 impl ProcessControlBlock {
+    pub(crate) fn group_in_session(pgid: usize, sid: usize) -> Result<Arc<PidHandle>, isize> {
+        for process in super::process_ids().into_iter().filter_map(super::pid2process) {
+            let inner = process.inner_exclusive_access();
+            if inner.pgid.0 == pgid {
+                return if inner.sid.0 == sid { Ok(inner.pgid.clone()) } else { Err(-1) };
+            }
+        }
+        Err(-3)
+    }
+
     pub(crate) fn affinity_hart(&self) -> usize {
         #[cfg(feature = "smp")]
         { self.hart }
@@ -125,9 +143,15 @@ impl ProcessControlBlock {
     }
 
     pub fn new(source: Executable, executable: Option<&str>) -> Arc<Self> {
-        let (memory_set, elf) = MemorySet::from_elf(source).expect("invalid initial executable");
-        // allocate a pid
-        let pid_handle = pid_alloc();
+        let (mut memory_set, elf) = MemorySet::from_elf(source).expect("invalid initial executable");
+        crate::syscall::signal::setup_signal_pages(&mut memory_set);
+        // allocate a pid, and reserve a positive ID for the initial session/process group
+        let pid_handle = Arc::new(pid_alloc());
+        let group_handle = if pid_handle.0 == 0 {
+            Arc::new(pid_alloc())
+        } else {
+            pid_handle.clone()
+        };
         let process = Arc::new(Self {
             pid: pid_handle,
             #[cfg(feature = "smp")]
@@ -139,6 +163,12 @@ impl ProcessControlBlock {
                     parent: None,
                     children: Vec::new(),
                     wait_status: 0,
+                    pgid: group_handle.clone(),
+                    sid: group_handle,
+                    execed: false,
+                    job_stopped: false,
+                    job_wait_status: None,
+                    umask: 0o022,
                     fd_table: vec![
                         // 0 -> stdin
                         Some(Arc::new(Stdin)),
@@ -163,6 +193,7 @@ impl ProcessControlBlock {
                     alarm_deadline: 0,
                     signal_actions: [Default::default(); 64],
                     signal_pending: 0,
+                    signal_info: Default::default(),
                     legacy_thread_exit: true,
                     nofile_limit: 1024,
                     #[cfg(feature = "elf_startup_stats")]
@@ -282,7 +313,7 @@ impl ProcessControlBlock {
         let task = self.inner_exclusive_access().get_task(0);
         let mut task_inner = task.inner_exclusive_access();
         task_inner.clear_child_tid = 0;
-        task_inner.signal_context = None;
+        task_inner.alt_stack = Default::default();
         task_inner.res.as_mut().unwrap().ustack_base = elf.stack_base;
         task_inner.res.as_mut().unwrap().alloc_user_res();
         task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
@@ -295,6 +326,7 @@ impl ProcessControlBlock {
             pinner.cmdline = Some(args.iter().flat_map(|arg| arg.iter().copied().chain(core::iter::once(0)))
                 .take(PAGE_SIZE).collect::<Vec<_>>().into());
             pinner.legacy_thread_exit = true;
+            pinner.execed = true;
             for fd in core::mem::take(&mut pinner.close_on_exec) {
                 pinner.fd_table[fd] = None;
             }
@@ -429,7 +461,7 @@ impl ProcessControlBlock {
         let kstack = try_kstack_alloc().ok_or(-12isize)?;
         let memory_set = parent.memory_set.fork()?;
         // alloc a pid
-        let pid = pid_alloc();
+        let pid = Arc::new(pid_alloc());
         // copy fd table
         let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
         for fd in parent.fd_table.iter() {
@@ -451,6 +483,12 @@ impl ProcessControlBlock {
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
                     wait_status: 0,
+                    pgid: parent.pgid.clone(),
+                    sid: parent.sid.clone(),
+                    execed: false,
+                    job_stopped: false,
+                    job_wait_status: None,
+                    umask: parent.umask,
                     fd_table: new_fd_table,
                     close_on_exec: parent.close_on_exec.clone(),
                     signals: SignalFlags::empty(),
@@ -468,6 +506,7 @@ impl ProcessControlBlock {
                     alarm_deadline: 0,
                     signal_actions: parent.signal_actions,
                     signal_pending: 0,
+                    signal_info: Default::default(),
                     legacy_thread_exit: parent.legacy_thread_exit,
                     nofile_limit: 1024,
                     #[cfg(feature = "elf_startup_stats")]
@@ -506,10 +545,7 @@ impl ProcessControlBlock {
         let parent_thread = parent_task.inner_exclusive_access();
         let parent_cx = *parent_thread.get_trap_cx();
         task_inner.signal_mask = parent_thread.signal_mask;
-        task_inner.signal_context = parent_thread.signal_context.map(|(mut context, mask)| {
-            context.kernel_sp = task.kstack.get_top();
-            (context, mask)
-        });
+        task_inner.alt_stack = parent_thread.alt_stack;
         drop(parent_thread);
         task_inner.set_child_tid = set_child_tid;
         task_inner.clear_child_tid = clear_child_tid.unwrap_or(0);

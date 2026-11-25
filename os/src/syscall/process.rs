@@ -7,9 +7,10 @@ use crate::mm::{
     try_write_user, write_user, UserBuffer,
 };
 use crate::task::{
-    current_process, current_task, current_user_token, exit_current_and_run_next,
-    suspend_current_and_run_next,
+    current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
+    process_ids, remove_from_pid2process, suspend_current_and_run_next, ProcessControlBlock,
 };
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 pub fn sys_exit(exit_code: i32) -> ! {
@@ -148,44 +149,68 @@ fn script_interpreter(
     Ok((source, new_args, interpreter_path))
 }
 
-/// If there is not a child process whose pid is same as given, return -1.
-/// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize {
+    const WNOHANG: usize = 1;
+    const WUNTRACED: usize = 2;
+    const WCONTINUED: usize = 8;
+    const WALL: usize = 0x4000_0000;
+    if options & !(WNOHANG | WUNTRACED | WCONTINUED | WALL) != 0 {
+        return -22;
+    }
+    let pid = pid as i32;
+    if pid == i32::MIN {
+        return -3;
+    }
+    let group = match pid {
+        0 => Some(current_process().inner_exclusive_access().pgid.0),
+        p if p < -1 => Some(p.unsigned_abs() as usize),
+        _ => None,
+    };
     loop {
         let process = current_process();
         let inner = process.inner_exclusive_access();
-        if !inner
-            .children
-            .iter()
-            .any(|p| pid == -1 || pid as usize == p.getpid())
-        {
-            return -1;
-        }
-        let pair = inner.children.iter().enumerate().find(|(_, p)| {
-            p.inner_exclusive_access().is_zombie && (pid == -1 || pid as usize == p.getpid())
-        });
-        if let Some((idx, child)) = pair {
-            let found_pid = child.getpid();
-            let status = child.inner_exclusive_access().wait_status;
-            let token = inner.memory_set.token();
-            drop(inner);
-            if !exit_code_ptr.is_null() && try_write_user(token, exit_code_ptr, status).is_none() {
-                return -14; // EFAULT
+        let mut has_child = false;
+        let event = inner.children.iter().enumerate().find_map(|(idx, child)| {
+            let state = child.inner_exclusive_access();
+            if (pid > 0 && child.getpid() != pid as usize)
+                || group.map_or(false, |group| state.pgid.0 != group) {
+                return None;
             }
-            process.inner_exclusive_access().children.remove(idx);
+            has_child = true;
+            if state.is_zombie {
+                return Some((idx, child.getpid(), state.wait_status, true));
+            }
+            let status = state.job_wait_status?;
+            let flag = if status == 0xffff { WCONTINUED } else { WUNTRACED };
+            (options & flag != 0).then_some((idx, child.getpid(), status, false))
+        });
+        let token = inner.get_user_token();
+        drop(inner); // Copyout may fault in a page through the calling PCB.
+        if let Some((idx, found_pid, status, exited)) = event {
+            if !exit_code_ptr.is_null() && try_write_user(token, exit_code_ptr, status).is_none() {
+                return -14;
+            }
+            let mut inner = process.inner_exclusive_access();
+            if exited {
+                remove_from_pid2process(found_pid);
+                inner.children.remove(idx);
+            } else {
+                inner.children[idx].inner_exclusive_access().job_wait_status = None;
+            }
             return found_pid as isize;
         }
-        drop(inner);
         drop(process);
-        if options & 1 != 0 { // WNOHANG
+        if !has_child {
+            return -10; // ECHILD
+        }
+        if options & WNOHANG != 0 {
             return 0;
         }
         // 父进程在内核里忙等，时钟中断不会到来，
         // 必须主动轮询定时器，否则子进程的 sleep 永远醒不了。
         crate::timer::check_timer();
         crate::task::check_kill_current();
-        // SIGALRM 到期（LTP / busybox timeout 的超时）：返回 EINTR 让用户态 handler 先跑
-        if crate::syscall::signal::alarm_interrupts() {
+        if super::signal::current_wait_interrupted() {
             return -4; // EINTR
         }
         suspend_current_and_run_next();
@@ -199,6 +224,82 @@ pub fn sys_getppid() -> isize {
         Some(p) => p.upgrade().map(|p| p.getpid() as isize).unwrap_or(0),
         None => 0,
     }
+}
+
+fn process_by_pid_or_self(pid: i32) -> Option<Arc<ProcessControlBlock>> {
+    if pid == 0 { Some(current_process()) } else { pid2process(pid as usize) }
+}
+
+pub fn sys_getpgid(pid: i32) -> isize {
+    process_by_pid_or_self(pid).map_or(-3, |p| p.inner_exclusive_access().pgid.0 as isize)
+}
+
+pub fn sys_getsid(pid: i32) -> isize {
+    process_by_pid_or_self(pid).map_or(-3, |p| p.inner_exclusive_access().sid.0 as isize)
+}
+
+pub fn sys_setpgid(pid: i32, pgid: i32) -> isize {
+    if pgid < 0 {
+        return -22;
+    }
+    let caller = current_process();
+    let target = match process_by_pid_or_self(pid) {
+        Some(process) => process,
+        None => return -3,
+    };
+    let sid = caller.inner_exclusive_access().sid.0;
+    {
+        let inner = target.inner_exclusive_access();
+        if !Arc::ptr_eq(&target, &caller) {
+            let parent = inner.parent.as_ref().and_then(|p| p.upgrade());
+            if !parent.map_or(false, |p| Arc::ptr_eq(&caller, &p)) {
+                return -3; // Only a direct child can be moved.
+            }
+            if inner.sid.0 != sid {
+                return -1; // EPERM
+            }
+            if inner.execed {
+                return -13; // EACCES
+            }
+        }
+        if target.getpid() == inner.sid.0 {
+            return -1;
+        }
+    }
+    let group = if pgid == 0 || pgid as usize == target.getpid() {
+        target.pid.clone()
+    } else {
+        match ProcessControlBlock::group_in_session(pgid as usize, sid) {
+            Ok(group) => group,
+            Err(_) => return -1,
+        }
+    };
+    target.inner_exclusive_access().pgid = group;
+    0
+}
+
+pub fn sys_setsid() -> isize {
+    let caller = current_process();
+    if caller.getpid() == crate::task::IDLE_PID {
+        return -1;
+    }
+    let (sid, is_leader) = {
+        let inner = caller.inner_exclusive_access();
+        (inner.sid.0, inner.pgid.0 == caller.getpid() || inner.sid.0 == caller.getpid())
+    };
+    if is_leader || ProcessControlBlock::group_in_session(caller.getpid(), sid).is_ok() {
+        return -1; // EPERM, including when other members still occupy that group.
+    }
+    let mut inner = caller.inner_exclusive_access();
+    inner.sid = caller.pid.clone();
+    inner.pgid = caller.pid.clone();
+    caller.getpid() as isize
+}
+
+pub fn sys_umask(mask: u32) -> isize {
+    let caller = current_process();
+    let mut inner = caller.inner_exclusive_access();
+    core::mem::replace(&mut inner.umask, mask & 0o777) as isize
 }
 
 /// uname(2)：填 6 个 65 字节字段
@@ -230,8 +331,60 @@ pub fn sys_times(buf: *mut u8) -> isize {
     (crate::timer::get_time_ms() / 10) as isize
 }
 
+pub fn sys_sysinfo(buf: *mut u8) -> isize {
+    // Linux's LP64 struct sysinfo has two padding gaps and is 112 bytes long.
+    let mut data = [0u8; 112];
+    let buffers = match translated_byte_buffer(current_user_token(), buf, data.len(), MapPermission::W) {
+        Some(buffers) => UserBuffer::new(buffers),
+        None => return -14,
+    };
+    let uptime = (crate::timer::get_time_ms() / 1000) as i64;
+    let totalram = crate::mm::ram_end().saturating_sub(crate::arch::RAM_BASE);
+    let freeram = crate::mm::free_frame_count() * PAGE_SIZE;
+    let procs = process_ids().len().min(u16::MAX as usize) as u16;
+    data[0..8].copy_from_slice(&uptime.to_ne_bytes());
+    data[32..40].copy_from_slice(&totalram.to_ne_bytes());
+    data[40..48].copy_from_slice(&freeram.to_ne_bytes());
+    data[80..82].copy_from_slice(&procs.to_ne_bytes());
+    data[104..108].copy_from_slice(&1u32.to_ne_bytes());
+    buffers.copy_from(&data);
+    0
+}
+
 pub fn sys_kill(pid: usize, signal: u32) -> isize {
-    super::signal::kill_process(pid, signal as usize)
+    if signal > 64 {
+        return -22;
+    }
+    let selector = pid as i32;
+    let caller = current_process();
+    let sender = caller.getpid();
+    let send = |target: &Arc<ProcessControlBlock>| {
+        if signal != 0 && !target.inner_exclusive_access().is_zombie {
+            // All tasks currently run with real and effective UID 0.
+            super::signal::send_process_signal(target, signal as usize, sender, 0);
+        }
+    };
+    if selector > 0 {
+        return pid2process(selector as usize).map_or(-3, |target| { send(&target); 0 });
+    }
+    let group = if selector == 0 {
+        caller.inner_exclusive_access().pgid.0
+    } else {
+        selector.unsigned_abs() as usize
+    };
+    let mut found = false;
+    for target in process_ids().into_iter().filter_map(pid2process) {
+        if selector == -1 {
+            if target.getpid() == crate::task::IDLE_PID || target.getpid() == sender {
+                continue;
+            }
+        } else if target.inner_exclusive_access().pgid.0 != group {
+            continue;
+        }
+        found = true;
+        send(&target);
+    }
+    if found { 0 } else { -3 }
 }
 
 pub fn sys_exit_group(exit_code: i32) -> ! {
@@ -613,34 +766,40 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> isize {
 /// rt_sigtimedwait(137)：简化版——有挂起信号就取走并返回信号号，
 /// 否则睡眠等待（每 5ms 查一次），超时返回 -EAGAIN。
 /// libc-test 的 runtest 用它等 SIGCHLD（子进程退出），是 5s 看门狗的核心。
-pub fn sys_rt_sigtimedwait(set: *const u8, info: *mut u8, timeout: *const u8) -> isize {
-    if set.is_null() {
-        return -14;
+pub fn sys_rt_sigtimedwait(set: *const u8, info: *mut u8, timeout: *const u8, size: usize) -> isize {
+    if size != core::mem::size_of::<u64>() {
+        return -22;
     }
     let token = current_user_token();
     let setbits = match try_read_user(token, set as *const u64) {
-        Some(set) => set,
+        Some(set) => set & !((1 << (9 - 1)) | (1 << (19 - 1))),
         None => return -14,
     };
     let deadline = if timeout.is_null() {
         usize::MAX
     } else {
-        let sec = read_user(token, timeout as *const usize) as usize;
-        let nsec = read_user(token, (timeout as usize + 8) as *const usize) as usize;
-        crate::timer::get_time_ms() + sec * 1000 + (nsec + 999_999) / 1_000_000
+        let sec = try_read_user(token, timeout.cast::<usize>());
+        let nsec = try_read_user(token, timeout.wrapping_add(8).cast::<usize>());
+        let (sec, nsec) = match (sec, nsec) {
+            (Some(s), Some(ns)) if s <= isize::MAX as usize && ns < 1_000_000_000 => (s, ns),
+            (Some(_), Some(_)) => return -22,
+            _ => return -14,
+        };
+        crate::timer::get_time_ms().saturating_add(sec.saturating_mul(1000))
+            .saturating_add((nsec + 999_999) / 1_000_000)
     };
     loop {
-        if let Some(signo) = super::signal::take_pending(setbits) {
-            if !info.is_null() {
-                for i in 0..128usize {
-                    write_user(token, (info as usize + i) as *mut u8, 0);
-                }
-                write_user(token, info.cast::<i32>(), signo as i32);
+        if let Some(pending) = super::signal::take_pending_info(setbits) {
+            if !info.is_null() && pending.write_to(token, info as usize).is_none() {
+                return -14;
             }
-            return signo as isize;
+            return pending.signo as isize;
         }
         if crate::timer::get_time_ms() >= deadline {
             return -11; // EAGAIN
+        }
+        if super::signal::current_wait_interrupted() {
+            return -4;
         }
         crate::syscall::sync::sys_sleep(5);
     }

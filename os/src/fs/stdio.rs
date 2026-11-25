@@ -11,6 +11,7 @@ pub struct Stdout;
 pub struct ConsoleFile(pub bool, pub bool, pub u64);
 
 impl File for ConsoleFile {
+    fn is_tty(&self) -> bool { true }
     fn readable(&self) -> bool { self.0 }
     fn writable(&self) -> bool { self.1 }
     fn read(&self, buf: UserBuffer) -> usize { Stdin.read(buf) }
@@ -22,6 +23,8 @@ impl File for ConsoleFile {
 }
 
 impl File for Stdin {
+    fn mode(&self) -> u16 { 0o20666 }
+    fn is_tty(&self) -> bool { true }
     fn readable(&self) -> bool {
         true
     }
@@ -53,6 +56,8 @@ impl File for Stdin {
 }
 
 impl File for Stdout {
+    fn mode(&self) -> u16 { 0o20666 }
+    fn is_tty(&self) -> bool { true }
     fn readable(&self) -> bool {
         false
     }

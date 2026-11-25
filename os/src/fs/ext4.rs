@@ -20,7 +20,11 @@ const EXTENT_MAGIC: u16 = 0xF30A;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 const SECTOR_SIZE: usize = 512;
 const LOOKUP_CACHE_CAPACITY: usize = 128;
+const DIRECTORY_CACHE_CAPACITY: usize = 8;
+const DIRECTORY_CACHE_MAX_BYTES: u64 = 128 * 1024;
 static SECTORS_READ: AtomicUsize = AtomicUsize::new(0);
+
+type DirectoryEntry = (String, u32, u8);
 
 pub(crate) fn sectors_read() -> usize {
     SECTORS_READ.load(Ordering::Relaxed)
@@ -85,6 +89,7 @@ pub struct Ext4Fs {
     group_desc_offset: u64,
     group_desc_size: usize,
     lookup_cache: UPSafeCell<VecDeque<(u32, String, Inode)>>,
+    directory_cache: UPSafeCell<VecDeque<(u32, Arc<Vec<DirectoryEntry>>)>>,
 }
 
 enum BlockMapping {
@@ -125,6 +130,7 @@ impl Ext4Fs {
             group_desc_offset: (first_data_block + 1) * block_size as u64,
             group_desc_size: desc_size,
             lookup_cache: unsafe { UPSafeCell::new(VecDeque::new()) },
+            directory_cache: unsafe { UPSafeCell::new(VecDeque::new()) },
         })
     }
 
@@ -323,6 +329,34 @@ impl Ext4Fs {
     }
 
     pub fn list_dir(&self, inode: &Inode) -> Vec<(String, u32, u8)> {
+        match Arc::try_unwrap(self.directory_entries(inode)) {
+            Ok(entries) => entries,
+            Err(entries) => (*entries).clone(),
+        }
+    }
+
+    fn directory_entries(&self, inode: &Inode) -> Arc<Vec<DirectoryEntry>> {
+        // An EXT4 image is read-only. Keep recently traversed directories so a walk
+        // can stat each sibling without reading and parsing the parent again.
+        if inode.size > DIRECTORY_CACHE_MAX_BYTES {
+            return Arc::new(self.read_directory(inode));
+        }
+        let mut cache = self.directory_cache.exclusive_access();
+        if let Some(index) = cache.iter().position(|(ino, _)| *ino == inode.ino) {
+            let entry = cache.remove(index).unwrap();
+            let entries = Arc::clone(&entry.1);
+            cache.push_back(entry);
+            return entries;
+        }
+        let entries = Arc::new(self.read_directory(inode));
+        if cache.len() == DIRECTORY_CACHE_CAPACITY {
+            cache.pop_front();
+        }
+        cache.push_back((inode.ino, Arc::clone(&entries)));
+        entries
+    }
+
+    fn read_directory(&self, inode: &Inode) -> Vec<DirectoryEntry> {
         let mut out = Vec::new();
         let data = self.read_file(inode);
         let mut off = 0usize;
@@ -353,7 +387,7 @@ impl Ext4Fs {
                 return None;
             }
             cur = self.lookup_cached(cur.ino, part, || {
-                let entries = self.list_dir(&cur);
+                let entries = self.directory_entries(&cur);
                 let (_, ino, _) = entries.iter().find(|(name, _, _)| name == part)?;
                 self.inode(*ino)
             })?;
@@ -439,6 +473,10 @@ impl Ext4File {
 }
 
 impl File for Ext4File {
+    fn mode(&self) -> u16 {
+        self.inode.mode
+    }
+
     fn stat_identity(&self) -> Option<(u64, u64)> {
         Some(self.fs.inode_identity(&self.inode))
     }

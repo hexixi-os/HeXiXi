@@ -110,7 +110,11 @@ pub(super) fn snapshot(path: &str) -> Option<Vec<u8>> {
         .and_then(|parent| parent.upgrade())
         .map_or(0, |parent| parent.getpid());
     let threads = inner.thread_count();
-    let state = if inner.tasks.iter().flatten().any(|task| {
+    let state = if inner.is_zombie {
+        'Z'
+    } else if inner.job_stopped {
+        'T'
+    } else if inner.tasks.iter().flatten().any(|task| {
         let task = task.inner_exclusive_access();
         task.exit_code.is_none()
             && matches!(task.task_status, TaskStatus::Running | TaskStatus::Ready)
@@ -127,8 +131,12 @@ pub(super) fn snapshot(path: &str) -> Option<Vec<u8>> {
     } else {
         let mut fields = ["0"; 49];
         let parent = format!("{}", parent);
+        let pgrp = format!("{}", inner.pgid.0);
+        let session = format!("{}", inner.sid.0);
         let threads = format!("{}", threads);
         fields[0] = &parent;
+        fields[1] = &pgrp;
+        fields[2] = &session;
         fields[16] = &threads;
         format!("{} ({}) {} {}\n", pid, name, state, fields.join(" "))
     };
