@@ -41,6 +41,22 @@ def select_groups(requested):
     return list(dict.fromkeys(selected)) if selected else names
 
 
+def matrix_failed(results, strict):
+    for row in results:
+        judge = row["judge"]
+        if judge["status"] == "error":
+            return True
+        if not strict:
+            continue
+        if row["status"] != "complete":
+            return True
+        if row["group"].startswith("basic-") and not (
+            judge["status"] == "scored" and judge.get("score") == judge.get("maximum") == 102
+        ):
+            return True
+    return False
+
+
 def inspect_serial(serial, name, qemu_exit, timed_out):
     lines = serial.replace(b"\r", b"").replace(b"\0", b"").decode(errors="replace").splitlines()
     starts = [i for i, line in enumerate(lines) if line == f"#### OS COMP TEST GROUP START {name} ####"]
@@ -148,8 +164,11 @@ def run_group(args, name, run, kernel):
     with tempfile.NamedTemporaryFile(dir=directory, prefix="scratch.", suffix=".img") as scratch:
         scratch.truncate(64 * 1024 * 1024)
         if args.arch == "riscv64":
+            bootargs = f"oscomp.group={name}"
+            if args.legacy_image:
+                bootargs += " oscomp.legacy=1"
             command.extend([
-                "-bios", "default", "-append", f"oscomp.group={name}",
+                "-bios", "default", "-append", bootargs,
                 "-snapshot", "-drive", drive(args.image, "x0"),
                 "-device", "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
                 "-device", "virtio-net-device,netdev=net", "-netdev", "user,id=net",
@@ -157,6 +176,8 @@ def run_group(args, name, run, kernel):
                 "-device", "virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1",
             ])
         else:
+            if args.legacy_image:
+                command.extend(["-fw_cfg", "name=opt/hexixi/oscomp.legacy,string=1"])
             command.extend([
                 "-fw_cfg", f"name=opt/hexixi/oscomp.group,string={name}",
                 "-drive", drive(args.image, "x0") + ",readonly=on",
@@ -209,6 +230,8 @@ def main():
     parser.add_argument("--memory", default=os.getenv("QEMU_MEM", "1G"))
     parser.add_argument("--smp", type=int, choices=range(1, 9), default=os.getenv("QEMU_SMP", "1"))
     parser.add_argument("--timeout", type=float, default=os.getenv("QEMU_TIMEOUT", "200"))
+    parser.add_argument("--legacy-image", action="store_true", help="显式启用旧评测镜像兼容")
+    parser.add_argument("--strict", action="store_true", help="要求各组正常完成，且 basic 为 102/102")
     args = parser.parse_intermixed_args()
     args.qemu = args.qemu or f"qemu-system-{args.arch}"
     if not 1 <= args.smp <= 8:
@@ -241,6 +264,8 @@ def main():
         "source": checkout(REPO),
         "arch": args.arch,
         "harts": args.smp,
+        "legacy_image": args.legacy_image,
+        "strict": args.strict,
         "suite": checkout(args.suite),
         "judge_checkout": checkout(args.judges) if args.judges else None,
         "qemu_version": subprocess.check_output([args.qemu, "--version"], text=True).splitlines()[0],
@@ -271,7 +296,7 @@ def main():
         if judge.get("maximum") is not None:
             score = f"{score}/{judge['maximum']}"
         print(f"{name:20} {result['status']:15} {result['elapsed_seconds']:7.2f}s  {score}", flush=True)
-    return int(any(row["judge"]["status"] == "error" for row in results))
+    return int(matrix_failed(results, args.strict))
 
 
 if __name__ == "__main__":

@@ -70,7 +70,7 @@ printf 'kernel=%q\nkernel_sha256=%s\n' "$kernel" "$kernel_hash" >> "$meta"
 truncate -s 64M "$scratch"
 qemu_cmd=(
     timeout --kill-after=5 "$time_limit" "$qemu" -machine virt -m "$memory" -smp 1
-    -nographic -bios default -kernel "$kernel" -append oscomp.group=basic-musl -no-reboot -snapshot
+    -nographic -bios default -kernel "$kernel" -append 'oscomp.group=basic-musl oscomp.legacy=1' -no-reboot -snapshot
     -drive "file=${image//,/,,},if=none,format=raw,id=x0"
     -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
     -device virtio-net-device,netdev=net -netdev user,id=net -rtc base=utc

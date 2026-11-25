@@ -6,7 +6,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 log=${1:-$WORK/basic-abi.log}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-mkdir -p "$tmp/root/basic/lower-dir" "$(dirname "$log")"
+mkdir -p "$tmp/root/basic/lower-dir" "$tmp/root/musl" "$(dirname "$log")"
 
 if [ -z "${USER_BIN_DIR:-}" ]; then
     (cd "$REPO/user" && cargo build --release --bin basic_abi_test --bin oscomp_runner)
@@ -19,6 +19,9 @@ fi
 cp "$USER_BIN_DIR/basic_abi_test" "$USER_BIN_DIR/oscomp_runner" "$tmp/root/"
 printf './basic_abi_test\n' > "$tmp/root/basic_testcode.sh"
 printf 'lower' > "$tmp/root/basic/lower-file"
+printf 'regular file' > "$tmp/root/basic/mnt"
+printf '#!/no-such-interpreter\n' > "$tmp/root/bad-shebang"
+printf 'not an ELF' > "$tmp/root/musl/busybox"
 truncate -s 32M "$tmp/disk.img"
 mkfs.ext4 -q -F -b 4096 -d "$tmp/root" "$tmp/disk.img"
 

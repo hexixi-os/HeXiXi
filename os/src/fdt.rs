@@ -3,6 +3,7 @@
 #[derive(Default)]
 pub struct BootInfo {
     pub ram_end: Option<usize>,
+    pub legacy_oscomp_image: bool,
     #[cfg(feature = "smp")]
     pub hart_mask: usize,
     oscomp_group: [u8; 32],
@@ -20,6 +21,7 @@ impl BootInfo {
         } else {
             group
         };
+        self.oscomp_group = [0; 32];
         self.oscomp_group[..group.len()].copy_from_slice(group);
     }
 
@@ -29,7 +31,8 @@ impl BootInfo {
         for arg in args.split(|byte| byte.is_ascii_whitespace()) {
             if let Some(group) = arg.strip_prefix(b"oscomp.group=") {
                 self.set_oscomp_group(group);
-                break;
+            } else if let Some(value) = arg.strip_prefix(b"oscomp.legacy=") {
+                self.legacy_oscomp_image = value == b"1";
             }
         }
     }

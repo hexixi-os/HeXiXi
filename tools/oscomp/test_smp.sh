@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boot a RISC-V SMP kernel with a cross-hart fork and mmap regression.
+# Boot a RISC-V SMP kernel and check cross-hart CoW, mmap and pipe I/O.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 

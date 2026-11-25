@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from run_official_matrix import inspect_serial, select_groups
+from run_official_matrix import inspect_serial, matrix_failed, select_groups
 
 
 class OfficialMatrixTests(unittest.TestCase):
@@ -49,6 +49,26 @@ class OfficialMatrixTests(unittest.TestCase):
         self.assertEqual(result["status"], "launcher_error")
         self.assertEqual(result["script_exit"], -11)
         self.assertEqual(body, "")
+
+    def test_strict_matrix_limits_basic_to_full_scores(self):
+        row = {"group": "basic-glibc", "status": "complete",
+               "judge": {"status": "scored", "score": 102, "maximum": 102}}
+        self.assertFalse(matrix_failed([row], strict=True))
+        self.assertTrue(matrix_failed([{**row, "judge": {"status": "unavailable"}}], strict=True))
+        row["judge"]["score"] = 99
+        self.assertTrue(matrix_failed([row], strict=True))
+        self.assertFalse(matrix_failed([row], strict=False))
+
+    def test_strict_matrix_rejects_failed_or_incomplete_groups(self):
+        for status in ("script_error", "timeout", "panic", "qemu_error", "incomplete"):
+            with self.subTest(status=status):
+                row = {"group": "ltp-musl", "status": status, "judge": {"status": "unavailable"}}
+                self.assertTrue(matrix_failed([row], strict=True))
+                self.assertFalse(matrix_failed([row], strict=False))
+
+    def test_matrix_allows_complete_group_without_a_public_judge(self):
+        row = {"group": "ltp-musl", "status": "complete", "judge": {"status": "unavailable"}}
+        self.assertFalse(matrix_failed([row], strict=True))
 
 
 if __name__ == "__main__":

@@ -28,17 +28,35 @@ pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
     panic!("Heap allocation error, layout = {:?}", layout);
 }
 
+#[cfg(target_arch = "riscv64")]
+core::arch::global_asm!(
+    ".section .text.entry, \"ax\"",
+    ".globl _start",
+    "_start:",
+    "mv a0, sp",
+    "tail __hexixi_user_start",
+);
+
+#[cfg(target_arch = "loongarch64")]
+core::arch::global_asm!(
+    ".section .text.entry, \"ax\"",
+    ".globl _start",
+    "_start:",
+    "move $a0, $sp",
+    "b __hexixi_user_start",
+);
+
 #[no_mangle]
-#[link_section = ".text.entry"]
-pub extern "C" fn _start(argc: usize, argv: usize) -> ! {
+extern "C" fn __hexixi_user_start(stack: *const usize) -> ! {
+    let argc = unsafe { stack.read() };
+    let argv = unsafe { stack.add(1) };
     unsafe {
         HEAP.lock()
-            .init(HEAP_SPACE.as_ptr() as usize, USER_HEAP_SIZE);
+            .init(core::ptr::addr_of!(HEAP_SPACE) as usize, USER_HEAP_SIZE);
     }
     let mut v: Vec<&'static str> = Vec::new();
     for i in 0..argc {
-        let str_start =
-            unsafe { ((argv + i * core::mem::size_of::<usize>()) as *const usize).read_volatile() };
+        let str_start = unsafe { argv.add(i).read() };
         let len = (0usize..)
             .find(|i| unsafe { ((str_start + *i) as *const u8).read_volatile() == 0 })
             .unwrap();

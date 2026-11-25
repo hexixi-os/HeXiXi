@@ -348,9 +348,10 @@ impl MemorySet {
             (_, None) => None,
             (None, Some(_)) => return Err(ENOEXEC), // Kernel-started init is static.
             (Some(path), Some(interpreter)) => {
-                match open_executable(&resolve_path(interpreter)?) {
+                match resolve_path(interpreter).and_then(|path| open_executable(&path)) {
                     Ok(source) => Some(source),
-                    Err(-2) if image.is_official_basic(path, &headers) => None,
+                    Err(-2) if crate::config::legacy_oscomp_image()
+                        && image.is_official_basic(path, &headers) => None,
                     Err(errno) => return Err(errno),
                 }
             }

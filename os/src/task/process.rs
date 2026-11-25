@@ -176,11 +176,16 @@ impl ProcessControlBlock {
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
+        let initial_sp = Self::initial_stack(
+            process.inner_exclusive_access().get_user_token(),
+            ustack_top,
+            &[],
+        );
         let kstack_top = task.kstack.get_top();
         drop(task_inner);
         *trap_cx = TrapContext::app_init_context(
             elf.entry,
-            ustack_top,
+            initial_sp,
             KERNEL_SPACE.exclusive_access().token(),
             kstack_top,
             trap_handler as usize,
@@ -202,7 +207,11 @@ impl ProcessControlBlock {
         let task = inner.get_task(0);
         drop(inner);
         let inner = task.inner_exclusive_access();
-        let mut sp = inner.res.as_ref().unwrap().ustack_top();
+        let stack_top = inner.res.as_ref().unwrap().ustack_top();
+        inner.get_trap_cx().set_sp(Self::initial_stack(token, stack_top, args));
+    }
+
+    fn initial_stack(token: usize, mut sp: usize, args: &[&str]) -> usize {
         let mut pointers = Vec::with_capacity(args.len());
         for arg in args {
             sp -= arg.len() + 1;
@@ -212,14 +221,16 @@ impl ProcessControlBlock {
             pointers.push(sp);
         }
         let word = core::mem::size_of::<usize>();
-        sp = (sp - (pointers.len() + 1) * word) & !15;
-        for (index, pointer) in pointers.into_iter().chain(core::iter::once(0)).enumerate() {
+        // argc, argv, argv NULL, envp NULL, AT_NULL and its value.
+        sp = (sp - (pointers.len() + 5) * word) & !15;
+        for (index, pointer) in core::iter::once(args.len())
+            .chain(pointers)
+            .chain([0; 4])
+            .enumerate()
+        {
             write_user(token, (sp + index * word) as *mut usize, pointer);
         }
-        let trap = inner.get_trap_cx();
-        trap.set_sp(sp);
-        trap.x[crate::arch::REG_A0] = args.len();
-        trap.x[crate::arch::REG_A0 + 1] = sp;
+        sp
     }
 
     /// Only support processes with a single thread.
@@ -381,16 +392,13 @@ impl ProcessControlBlock {
         }
         let user_sp = base;
         // initialize trap_cx
-        let mut trap_cx = TrapContext::app_init_context(
+        *task_inner.get_trap_cx() = TrapContext::app_init_context(
             elf.start_entry,
             user_sp,
             KERNEL_SPACE.exclusive_access().token(),
             task.kstack.get_top(),
             trap_handler as usize,
         );
-        trap_cx.x[crate::arch::REG_A0] = args.len();
-        trap_cx.x[crate::arch::REG_A0 + 1] = user_sp + core::mem::size_of::<usize>();
-        *task_inner.get_trap_cx() = trap_cx;
         Ok(())
     }
 

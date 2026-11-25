@@ -35,22 +35,21 @@ pub(super) fn fork_with_child_tid(
         .map(|pid| pid as isize).unwrap_or_else(|errno| errno)
 }
 
-fn open_busybox() -> Result<Executable, isize> {
+fn open_executable_path(path: &str) -> Result<(Executable, alloc::string::String), isize> {
+    let path = crate::fs::resolve_path(path)?;
+    open_executable(&path).map(|source| (source, path))
+}
+
+fn open_busybox() -> Result<(Executable, alloc::string::String), isize> {
     // 评测脚本可能已进入 basic 等子目录，继续查找根目录和官方盘的 musl 目录。
-    crate::fs::resolve_path("busybox")
-        .and_then(|path| open_executable(&path))
-        .or_else(|_| open_executable("busybox"))
-        .or_else(|_| open_executable("musl/busybox"))
+    open_executable_path("busybox")
+        .or_else(|_| open_executable_path("/busybox"))
+        .or_else(|_| open_executable_path("/musl/busybox"))
 }
 
 pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isize {
     let token = current_user_token();
     let raw_path = match translated_path(token, path) {
-        Ok(path) => path,
-        Err(errno) => return errno,
-    };
-    // exec 的路径同样要做归一化（busybox sh 传入的是 ./prog）
-    let path = match crate::fs::resolve_path(&raw_path) {
         Ok(path) => path,
         Err(errno) => return errno,
     };
@@ -62,8 +61,9 @@ pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isiz
         Ok(envs) => envs,
         Err(errno) => return errno,
     };
-    let source = match open_executable(&path).or_else(|errno| {
-        if errno == -2 && raw_path.rsplit('/').next() == Some("busybox") {
+    let (source, path) = match open_executable_path(&raw_path).or_else(|errno| {
+        if errno == -2 && crate::config::legacy_oscomp_image()
+            && raw_path.rsplit('/').next() == Some("busybox") {
             open_busybox()
         } else {
             Err(errno)
@@ -75,17 +75,16 @@ pub fn sys_exec(path: *const u8, args: *const usize, envp: *const usize) -> isiz
     let mut prefix = [0; 256];
     let prefix_len = source.read_at(0, &mut prefix);
     let prefix = &prefix[..prefix_len];
-    let (source, args) = if prefix.starts_with(b"#!") {
+    let (source, args, path) = if prefix.starts_with(b"#!") {
         match script_interpreter(prefix, prefix_len < source.len(), &raw_path, args) {
             Ok(interpreter) => interpreter,
             Err(errno) => return errno,
         }
     } else {
-        (source, args)
+        (source, args, path)
     };
-    let argc = args.len();
     match current_process().exec(source, &path, &raw_path, args, envs) {
-        Ok(()) => argc as isize, // trap_handler writes the syscall result to the new a0.
+        Ok(()) => 0,
         Err(errno) => errno,
     }
 }
@@ -122,7 +121,7 @@ fn script_interpreter(
     more_data: bool,
     path: &str,
     args: Vec<Vec<u8>>,
-) -> Result<(Executable, Vec<Vec<u8>>), isize> {
+) -> Result<(Executable, Vec<Vec<u8>>, alloc::string::String), isize> {
     let newline = prefix.iter().position(|&byte| byte == b'\n');
     let end = newline.unwrap_or(prefix.len());
     let line = core::str::from_utf8(&prefix[2..end]).map_err(|_| -8isize)?.trim_start();
@@ -132,12 +131,12 @@ fn script_interpreter(
         return Err(-8); // The window ended inside the interpreter name.
     }
     let argument = tokens.next();
-    let name = interpreter.trim_start_matches('/');
-    let (program, argument, source) = match open_executable(name) {
-        Ok(source) => (name, argument, source),
-        Err(_) => {
+    let (program, argument, (source, interpreter_path)) = match open_executable_path(interpreter) {
+        Ok(resolved) => (interpreter, argument, resolved),
+        Err(-2) if crate::config::legacy_oscomp_image() => {
             ("busybox", argument.or(Some("sh")), open_busybox()?)
         }
+        Err(errno) => return Err(errno),
     };
     let mut new_args = Vec::with_capacity(args.len() + 3);
     new_args.push(program.as_bytes().to_vec());
@@ -146,7 +145,7 @@ fn script_interpreter(
     }
     new_args.push(path.as_bytes().to_vec());
     new_args.extend(args.into_iter().skip(1));
-    Ok((source, new_args))
+    Ok((source, new_args, interpreter_path))
 }
 
 /// If there is not a child process whose pid is same as given, return -1.

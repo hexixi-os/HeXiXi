@@ -56,6 +56,7 @@ pub fn rust_main() -> ! {
     sync::enter_kernel();
     println!("[kernel] Hello, world!");
     let boot = arch::boot_info();
+    config::configure_legacy_oscomp_image(boot.legacy_oscomp_image);
     match boot.ram_end {
         Some(end) => {
             // 末尾留 1MB 余量，避免越过 RAM

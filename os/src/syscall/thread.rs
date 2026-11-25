@@ -166,8 +166,7 @@ pub fn sys_clone_thread(flags: usize, stack: usize, ptid: usize, tls: usize, cti
     // 关键：内核栈必须是新线程自己的，否则切换过去会踩父线程的栈
     new_cx.kernel_sp = new_task.kstack.get_top();
     // 子线程从 ecall 之后继续，返回 0；栈/线程指针由调用者给出
-    #[cfg(target_arch = "riscv64")]
-    let stack = stack & !0xf; // RISC-V 用户态调用约定要求栈指针按 16 字节对齐。
+    // libc may have placed a start record at this exact stack address.
     new_cx.x[crate::arch::REG_SP] = stack;
     if flags & CLONE_SETTLS != 0 {
         new_cx.x[crate::arch::REG_TP] = tls;

@@ -80,11 +80,11 @@ fn write_across_pages(vectored: bool) {
 
 fn directories() {
     assert_eq!(user_lib::chdir("/basic\0"), 0);
-    assert_eq!(mkdirat(AT_FDCWD, "tmp\0"), 0);
-    let dir = openat(AT_FDCWD, "./tmp\0", O_DIRECTORY);
+    assert_eq!(mkdirat(AT_FDCWD, "abi-dir\0"), 0);
+    let dir = openat(AT_FDCWD, "./abi-dir\0", O_DIRECTORY);
     assert!(dir >= 0, "mkdirat must create a directory relative to cwd");
-    assert_eq!(mkdirat(AT_FDCWD, "tmp\0"), -17);
-    assert_eq!(openat(AT_FDCWD, "/tmp\0", O_DIRECTORY), -2);
+    assert_eq!(mkdirat(AT_FDCWD, "abi-dir\0"), -17);
+    assert_eq!(openat(AT_FDCWD, "/abi-dir\0", O_DIRECTORY), -2);
     assert_eq!(mkdirat(-99, "child\0"), -9);
     let dup = syscall(23, [dir as usize, 0, 0, 0]);
     assert!(dup >= 0);
@@ -263,6 +263,13 @@ fn check(name: &str, test: impl FnOnce()) -> bool {
     status == 0
 }
 
+fn default_paths() {
+    assert_eq!(openat(AT_FDCWD, "/basic/mnt\0", O_DIRECTORY), -20);
+    let argv = [core::ptr::null()];
+    assert_eq!(user_lib::exec("/bad-shebang\0", &argv), -2);
+    assert_eq!(user_lib::exec("/missing/busybox\0", &argv), -2);
+}
+
 #[no_mangle]
 fn main() -> i32 {
     let write = check("write", || write_across_pages(false));
@@ -273,7 +280,8 @@ fn main() -> i32 {
     let components = check("path-components", path_components);
     let invalid = check("invalid-path", invalid_path);
     let dir = check("removed-directory-fd", removed_directory_fd);
-    assert!(write && writev && mkdir && unlink && clone && components && invalid && dir);
+    let default_paths = check("default-paths", default_paths);
+    assert!(write && writev && mkdir && unlink && clone && components && invalid && dir && default_paths);
     println!("basic-abi-test-ok");
     0
 }

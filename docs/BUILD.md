@@ -76,6 +76,8 @@ make kernel-la                   # 产出 ELF 格式 kernel-la
 
 ## 3. 运行 easy-fs `usertests`
 
+教学程序与评测 runner 从 ELF 初始栈读取参数。升级内核时请重新构建教学程序和 easy-fs 镜像。内核直启的 `initproc` 使用教学启动栈，经 `execve` 启动的程序会收到 ELF 加载器使用的 auxv 条目。
+
 本分支在 `fs.img` 包含 `oscomp_runner` 时会优先启动 runner，导致 `make -C os run TEST=1` 直接退出。可用独立 easy-fs 镜像将 `usertests` 作为 `initproc` 启动：
 
 ```bash

@@ -305,7 +305,7 @@ pub fn open_dyn(name: &str, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sy
             }
             if directory {
                 // 旧版评测盘曾把 basic 的 mnt 打包成普通文件，test_openat 仍用它打开同级文件。
-                if inode.is_file() {
+                if crate::config::legacy_oscomp_image() && inode.is_file() {
                     let script = match name {
                         "mnt" | "basic/mnt" => "basic_testcode.sh",
                         "musl/basic/mnt" => "musl/basic_testcode.sh",

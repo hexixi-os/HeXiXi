@@ -39,7 +39,13 @@ fn reject_bad_argv() {
     for pointer in [INVALID, with_bad_string.as_ptr() as usize] {
         let result: isize;
         unsafe {
-            asm!("ecall", in("a7") 221, inlateout("a0") path.as_ptr() => result, in("a1") pointer);
+            asm!(
+                "ecall",
+                in("a7") 221,
+                inlateout("a0") path.as_ptr() => result,
+                in("a1") pointer,
+                in("a2") 0usize,
+            );
         }
         assert_eq!(result, -14);
     }

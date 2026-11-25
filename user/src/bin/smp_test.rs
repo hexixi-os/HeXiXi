@@ -8,7 +8,7 @@ use core::arch::asm;
 use core::hint::spin_loop;
 use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
-use user_lib::{close, exit, fork, open, waitpid, OpenFlags};
+use user_lib::{close, exit, fork, open, pipe, read, waitpid, write, OpenFlags};
 
 const PAGE: usize = 4096;
 const MAP_SHARED: usize = 1;
@@ -200,6 +200,56 @@ fn cross_hart_round(fd: usize, parent_cpu: u32) -> Option<u32> {
     }
 }
 
+fn pipe_byte(offset: usize) -> u8 {
+    (offset * 17 + (offset >> 8)) as u8
+}
+
+fn check_cross_hart_pipe(parent_cpu: u32) {
+    // Exceed the ring capacity and compare bytes independently of stdout ordering.
+    const LEN: usize = 5 * PAGE + 13;
+    for _ in 0..2 {
+        let mut ends = [0; 2];
+        assert_eq!(pipe(&mut ends), 0);
+        let [read_fd, write_fd] = ends.map(|fd| fd as usize);
+        let pid = fork();
+        assert!(pid >= 0);
+        if pid == 0 {
+            let same_hart = cpu_id(ptr::null_mut()) == parent_cpu;
+            assert_eq!(close(write_fd), 0);
+            let mut received = 0;
+            let mut buffer = [0; 1024];
+            loop {
+                let count = read(read_fd, &mut buffer);
+                assert!(count >= 0);
+                if count == 0 {
+                    break;
+                }
+                for &byte in &buffer[..count as usize] {
+                    assert_eq!(byte, pipe_byte(received));
+                    received += 1;
+                }
+            }
+            assert_eq!(received, LEN);
+            exit(i32::from(same_hart));
+        }
+
+        assert_eq!(close(read_fd), 0);
+        let mut payload = [0; LEN];
+        for (offset, byte) in payload.iter_mut().enumerate() {
+            *byte = pipe_byte(offset);
+        }
+        assert_eq!(write(write_fd, &payload), LEN as isize);
+        assert_eq!(close(write_fd), 0);
+        let status = wait_for_child(pid);
+        if status == 0 {
+            println!("smp-pipe-test-ok");
+            return;
+        }
+        assert_eq!(status, 1, "pipe reader failed");
+    }
+    panic!("pipe reader did not run on a different hart");
+}
+
 #[no_mangle]
 fn main() -> i32 {
     let mut node = NO_CPU;
@@ -225,6 +275,7 @@ fn main() -> i32 {
     }
     assert_eq!(completed, ROUNDS, "insufficient forks on a second hart");
     assert_eq!(close(fd), 0);
+    check_cross_hart_pipe(parent_cpu);
     println!("smp-test-ok");
     0
 }

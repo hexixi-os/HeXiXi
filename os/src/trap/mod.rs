@@ -65,8 +65,12 @@ pub fn trap_handler() -> ! {
             }
             // cx is changed during sys_exec, so we have to call it again
             cx = current_trap_cx();
-            if id != 139 || result < 0 {
-                // 139 = rt_sigreturn，已恢复完整上下文，不能覆盖 a0
+            let replaced_context = matches!(
+                id,
+                crate::syscall::SYSCALL_RT_SIGRETURN | crate::syscall::SYSCALL_EXEC
+            );
+            if !replaced_context || result < 0 {
+                // Successful execve and rt_sigreturn have installed the full context.
                 cx.x[REG_A0] = result as usize;
             }
         }
