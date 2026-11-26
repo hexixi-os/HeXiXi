@@ -222,6 +222,42 @@ impl PersistentFile {
             flags,
         })
     }
+
+    fn read_buffer(&self, start: usize, buffer: UserBuffer) -> usize {
+        let mut offset = start;
+        let mut scratch = Vec::new();
+        for part in &buffer.buffers {
+            let count = part.write_with(&mut scratch, |bytes| self.node.read_at(offset, bytes));
+            offset += count;
+            if count != part.len() {
+                break;
+            }
+        }
+        offset - start
+    }
+
+    fn write_buffer(&self, offset: usize, buffer: UserBuffer) -> Result<(usize, usize), isize> {
+        let start = if self.flags.contains(OpenFlags::APPEND) {
+            self.size()
+        } else {
+            offset
+        };
+        let mut cursor = start;
+        let mut scratch = Vec::new();
+        for part in &buffer.buffers {
+            match part.read_with(&mut scratch, |bytes| self.node.write_at(cursor, bytes)) {
+                Ok(count) => {
+                    cursor += count;
+                    if count < part.len() {
+                        break;
+                    }
+                }
+                Err(error) if cursor == start => return Err(error),
+                Err(_) => break,
+            }
+        }
+        Ok((cursor, cursor - start))
+    }
 }
 
 impl Drop for PersistentFile {
@@ -260,43 +296,34 @@ impl File for PersistentFile {
 
     fn read(&self, buffer: UserBuffer) -> usize {
         let mut offset = self.offset.exclusive_access();
-        let start = *offset;
-        let mut scratch = Vec::new();
-        for part in &buffer.buffers {
-            let count = part.write_with(&mut scratch, |bytes| self.node.read_at(*offset, bytes));
-            *offset += count;
-            if count != part.len() {
-                break;
-            }
-        }
-        *offset - start
+        let count = self.read_buffer(*offset, buffer);
+        *offset += count;
+        count
     }
 
     fn write(&self, buffer: UserBuffer) -> isize {
         let mut offset = self.offset.exclusive_access();
-        let start = if self.flags.contains(OpenFlags::APPEND) {
-            self.size()
-        } else {
-            *offset
-        };
-        let mut cursor = start;
-        let mut scratch = Vec::new();
-        for part in &buffer.buffers {
-            match part.read_with(&mut scratch, |bytes| self.node.write_at(cursor, bytes)) {
-                Ok(count) => {
-                    cursor += count;
-                    if count < part.len() {
-                        break;
-                    }
+        match self.write_buffer(*offset, buffer) {
+            Ok((end, count)) => {
+                if count != 0 {
+                    *offset = end;
                 }
-                Err(error) if cursor == start => return error,
-                Err(_) => break,
+                count as isize
             }
+            Err(error) => error,
         }
-        if cursor != start {
-            *offset = cursor;
-        }
-        (cursor - start) as isize
+    }
+
+    fn supports_positioned_io(&self) -> bool {
+        true
+    }
+
+    fn read_positioned(&self, offset: usize, buffer: UserBuffer) -> isize {
+        self.read_buffer(offset, buffer) as isize
+    }
+
+    fn write_positioned(&self, offset: usize, buffer: UserBuffer) -> isize {
+        self.write_buffer(offset, buffer).map_or_else(|error| error, |(_, count)| count as isize)
     }
 
     fn set_len(&self, len: usize) -> isize {

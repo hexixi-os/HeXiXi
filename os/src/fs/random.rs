@@ -69,4 +69,12 @@ impl File for RandomFile {
         let _ = COUNTER.fetch_add((buf.len() as u64) | 1, Ordering::Relaxed);
         buf.len() as isize
     }
+
+    fn seek(&self, _offset: isize) -> isize {
+        0
+    }
+
+    fn seek_to(&self, _pos: isize) -> isize {
+        0
+    }
 }

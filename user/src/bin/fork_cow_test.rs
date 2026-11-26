@@ -5,7 +5,7 @@
 extern crate user_lib;
 
 use core::arch::asm;
-use user_lib::{close, exec, exit, fork, open, pipe, read, waitpid, write, yield_, OpenFlags};
+use user_lib::{close, exec, exit, fork, getpid, open, pipe, read, waitpid, write, yield_, OpenFlags};
 
 const PAGE: usize = 4096;
 const READ: usize = 1;
@@ -180,7 +180,7 @@ fn verify_signal_context_isolation() {
                 syscall(134, [SIGUSR1, action.as_ptr() as usize, 0, 8, 0, 0]),
                 0
             );
-            assert_eq!(syscall(129, [0, SIGUSR1, 0, 0, 0, 0]), 0);
+            assert_eq!(syscall(129, [getpid() as usize, SIGUSR1, 0, 0, 0, 0]), 0);
             exit(99);
         }
         // Saved registers belong to the task. Protecting the old user context

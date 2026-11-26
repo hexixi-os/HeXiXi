@@ -13,7 +13,7 @@ use self::id::TaskUserRes;
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 use manager::fetch_task;
-pub(crate) use process::{ProcessControlBlock, ProcessControlBlockInner};
+pub(crate) use process::{ProcessControlBlock, ProcessControlBlockInner, MAX_OPEN_FILES, RLIMIT_NOFILE};
 use switch::__switch;
 use crate::timer::remove_timer;
 
@@ -77,18 +77,21 @@ pub fn exit_current_by_signal(signal: i32) {
 fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
-    let (tid, clear_child_tid) = {
+    let (tid, clear_child_tid, has_robust) = {
         let inner = task.inner_exclusive_access();
-        (inner.res.as_ref().unwrap().tid, inner.clear_child_tid)
+        (inner.res.as_ref().unwrap().tid, inner.clear_child_tid, inner.robust_list != 0)
     };
     let (legacy_exit, last_thread) = {
         let inner = process.inner_exclusive_access();
         (inner.legacy_thread_exit, inner.thread_count() == 1)
     };
-    // A shared mapping or multi-threaded exit may have a waiter on clear_child_tid.
-    if clear_child_tid != 0 {
+    if has_robust || clear_child_tid != 0 {
         let token = process.inner_exclusive_access().memory_set.token();
-        if crate::mm::try_write_user(token, clear_child_tid as *mut i32, 0).is_some() {
+        if has_robust {
+            crate::syscall::futex::exit_robust_list(&task, token);
+        }
+        // A shared mapping or multi-threaded exit may have a waiter on clear_child_tid.
+        if clear_child_tid != 0 && crate::mm::try_write_user(token, clear_child_tid as *mut i32, 0).is_some() {
             crate::syscall::futex::wake_one(token, clear_child_tid);
         }
     }

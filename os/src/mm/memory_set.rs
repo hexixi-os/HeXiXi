@@ -163,6 +163,74 @@ impl MemorySet {
         Ok(())
     }
 
+    pub fn mremap(
+        &mut self,
+        old_range: Range<VirtPageNum>,
+        new_pages: usize,
+        fixed_dest: Option<VirtPageNum>,
+        may_move: bool,
+        mmap_base: VirtPageNum,
+    ) -> Result<VirtPageNum, isize> {
+        if let Some(dest) = fixed_dest {
+            let target = dest..VirtPageNum(dest.0 + new_pages);
+            if self.framed_overlap_end(&target).is_some() || self.vmas.overlaps_executable(&target) {
+                return Err(-22);
+            }
+        }
+        let framed = &self.areas;
+        let vmas_ptr = &self.vmas as *const VmaSpace;
+        let check_vacant = |range: &Range<VirtPageNum>| {
+            framed.iter().all(|area| {
+                let end = area.vpn_range.get_end();
+                !(area.vpn_range.get_start() < range.end && range.start < end)
+            }) && unsafe { (*vmas_ptr).overlap_end(range).is_none() }
+        };
+        let find_slot = |hint: VirtPageNum, pages: usize| {
+            let search_from = |mut start: VirtPageNum| -> Option<Range<VirtPageNum>> {
+                loop {
+                    let end = VirtPageNum(start.0.checked_add(pages)?);
+                    if end.0 > USER_END / PAGE_SIZE {
+                        return None;
+                    }
+                    let range = start..end;
+                    let framed_end = framed.iter().filter_map(|area| {
+                        let a_end = area.vpn_range.get_end();
+                        (area.vpn_range.get_start() < range.end && range.start < a_end).then_some(a_end)
+                    }).max();
+                    let vma_end = unsafe { (*vmas_ptr).overlap_end(&range) };
+                    match framed_end.into_iter().chain(vma_end).max() {
+                        Some(next) => start = next,
+                        None => return Some(range),
+                    }
+                }
+            };
+            search_from(hint.max(mmap_base)).or_else(|| search_from(mmap_base))
+        };
+        let mut tables = Vec::new();
+        let remapped = self.vmas.mremap(
+            &mut self.page_table,
+            old_range,
+            new_pages,
+            fixed_dest,
+            may_move,
+            find_slot,
+            check_vacant,
+            &mut tables,
+        );
+        if remapped.is_ok() || !tables.is_empty() {
+            crate::arch::local_flush_tlb();
+        }
+        let (start, retired) = remapped?;
+        drop((retired, tables));
+        Ok(start)
+    }
+
+    pub(crate) fn maps_snapshot(&self) -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        self.vmas.format_maps(&mut out);
+        out
+    }
+
     pub(crate) fn invalidate_file_pages(&mut self, identity: (u64, u64), first_invalid: usize) {
         let mut tables = Vec::new();
         let retired = self.vmas.invalidate_file_pages(
@@ -190,6 +258,21 @@ impl MemorySet {
                         && cursor < area.vpn_range.get_end()
                 }).map(|area| area.vpn_range.get_end()).ok_or(-12isize)?
             };
+        }
+        Ok(())
+    }
+
+    pub fn madvise(&self, range: Range<VirtPageNum>, advice: usize) -> Result<(), isize> {
+        self.check_user_range(&range, MapPermission::U)?;
+        if matches!(advice, 9 | 18 | 19) {
+            if self.areas.iter().any(|area| {
+                area.map_perm.contains(MapPermission::U)
+                    && area.vpn_range.get_start() <= range.start
+                    && range.end <= area.vpn_range.get_end()
+            }) {
+                return if advice == 9 { Err(-22) } else { Ok(()) };
+            }
+            self.vmas.madvise_check(range, advice)?;
         }
         Ok(())
     }
@@ -370,6 +453,19 @@ impl MemorySet {
                     Ok(source) => Some(source),
                     Err(-2) if crate::config::legacy_oscomp_image()
                         && image.is_official_basic(path, &headers) => None,
+                    Err(-2) if crate::config::legacy_oscomp_image() => {
+                        let source = match interpreter {
+                            crate::arch::OFFICIAL_MUSL_INTERPRETER if path.starts_with("musl/ltp/") => {
+                                open_executable("musl/lib/libc.so")
+                            }
+                            crate::arch::OFFICIAL_BASIC_INTERPRETER if path.starts_with("glibc/ltp/") => {
+                                let name = interpreter.rsplit('/').next().ok_or(ENOEXEC)?;
+                                open_executable(&alloc::format!("glibc/lib/{}", name))
+                            }
+                            _ => return Err(-2),
+                        }?;
+                        Some(source)
+                    }
                     Err(errno) => return Err(errno),
                 }
             }

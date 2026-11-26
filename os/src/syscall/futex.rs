@@ -84,6 +84,124 @@ pub(crate) fn remove_task(task: &Arc<TaskControlBlock>) {
         .retain(|waiter| !Arc::ptr_eq(&waiter.task, task));
 }
 
+pub(crate) fn sys_set_robust_list(head: usize, len: usize) -> isize {
+    if len != 3 * core::mem::size_of::<usize>() {
+        return -22;
+    }
+    current_task().unwrap().inner_exclusive_access().robust_list = head;
+    0
+}
+
+pub(crate) fn sys_get_robust_list(pid: i32, head_ptr: usize, len_ptr: usize) -> isize {
+    use crate::mm::try_write_user;
+    if pid < 0 {
+        return -22;
+    }
+    let caller = current_process();
+    let (caller_pid, caller_euid) = {
+        let inner = caller.inner_exclusive_access();
+        (caller.getpid(), inner.euid)
+    };
+    let task = if pid == 0 {
+        current_task().unwrap()
+    } else if let Some(task) = crate::task::tid2task(pid as usize) {
+        if task.inner_exclusive_access().exit_code.is_some() {
+            return -3;
+        }
+        task
+    } else if let Some(proc) = crate::task::pid2process(pid as usize) {
+        let inner = proc.inner_exclusive_access();
+        if inner.is_zombie {
+            return -3;
+        }
+        inner.get_task(0)
+    } else {
+        return -3;
+    };
+    if let Some(target_proc) = task.process.upgrade() {
+        let target_inner = target_proc.inner_exclusive_access();
+        if caller_euid != 0
+            && target_proc.getpid() != caller_pid
+            && caller_euid != target_inner.uid
+            && caller_euid != target_inner.euid
+        {
+            return -1;
+        }
+    } else {
+        return -3;
+    }
+    let head = task.inner_exclusive_access().robust_list;
+    let token = current_user_token();
+    let size = 3 * core::mem::size_of::<usize>();
+    if head_ptr == 0
+        || len_ptr == 0
+        || try_write_user(token, head_ptr as *mut usize, head).is_none()
+        || try_write_user(token, len_ptr as *mut usize, size).is_none()
+    {
+        return -14;
+    }
+    0
+}
+
+pub(crate) fn exit_robust_list(task: &Arc<TaskControlBlock>, token: usize) {
+    const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+    const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+    const FUTEX_WAITERS: u32 = 0x8000_0000;
+    const ROBUST_LIST_LIMIT: usize = 1024;
+
+    let head = {
+        let mut inner = task.inner_exclusive_access();
+        core::mem::replace(&mut inner.robust_list, 0)
+    };
+    if head == 0 {
+        return;
+    }
+    let tid = task.linux_tid() as u32;
+    let word_size = core::mem::size_of::<usize>();
+    let Some(mut entry) = try_read_user(token, head as *const usize) else { return };
+    let Some(futex_offset) = head
+        .checked_add(word_size)
+        .and_then(|p| try_read_user(token, p as *const usize).map(|v| v as isize))
+    else {
+        return;
+    };
+    let pending = head
+        .checked_add(2 * word_size)
+        .and_then(|p| try_read_user(token, p as *const usize))
+        .unwrap_or(0);
+
+    let handle_entry = |node: usize| {
+        let futex_addr = (node as isize).wrapping_add(futex_offset) as usize;
+        if futex_addr % 4 != 0 {
+            return;
+        }
+        let Some(pa) = futex_phys_addr(token, futex_addr) else { return };
+        let ptr = pa.kernel_address() as *mut u32;
+        let current = unsafe { u32::load(ptr) };
+        if (current & FUTEX_TID_MASK) == tid {
+            let next_val = (current & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+            let _ = crate::mm::try_write_user(token, futex_addr as *mut u32, next_val);
+            if current & FUTEX_WAITERS != 0 {
+                wake_one(token, futex_addr);
+            }
+        }
+    };
+
+    let mut count = 0;
+    while entry != 0 && entry != head && count < ROBUST_LIST_LIMIT {
+        let next = try_read_user(token, entry as *const usize);
+        if entry != pending {
+            handle_entry(entry);
+        }
+        let Some(next_entry) = next else { break };
+        entry = next_entry;
+        count += 1;
+    }
+    if pending != 0 && pending != head {
+        handle_entry(pending);
+    }
+}
+
 pub(crate) fn interrupt_waiter(task: &Arc<TaskControlBlock>) {
     let mut waiters = WAITERS.exclusive_access();
     if let Some(index) = waiters.iter().position(|waiter| Arc::ptr_eq(&waiter.task, task)) {

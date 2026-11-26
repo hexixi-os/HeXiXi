@@ -48,6 +48,7 @@ pub struct TaskControlBlockInner {
     /// CLONE_CHILD_CLEARTID 的地址：线程退出时把它清零
     pub clear_child_tid: usize,
     pub(crate) set_child_tid: Option<usize>,
+    pub(crate) robust_list: usize,
     pub(crate) futex_result: isize,
     pub(crate) signal_mask: u64,
     pub(crate) saved_signal_mask: Option<u64>,
@@ -128,6 +129,7 @@ impl TaskControlBlock {
                     exit_code: None,
                     clear_child_tid: 0,
                     set_child_tid: None,
+                    robust_list: 0,
                     futex_result: 0,
                     signal_mask: 0,
                     saved_signal_mask: None,

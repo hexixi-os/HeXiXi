@@ -372,4 +372,183 @@ impl VmaSpace {
             }
         }
     }
+
+    pub(super) fn mremap(
+        &mut self,
+        table: &mut PageTable,
+        old_range: Range<VirtPageNum>,
+        new_pages: usize,
+        fixed_dest: Option<VirtPageNum>,
+        may_move: bool,
+        vacant_at: impl FnOnce(VirtPageNum, usize) -> Option<Range<VirtPageNum>>,
+        check_vacant: impl Fn(&Range<VirtPageNum>) -> bool,
+        tables: &mut Vec<FrameTracker>,
+    ) -> Result<(VirtPageNum, Vec<Arc<FrameTracker>>), isize> {
+        let old_pages = old_range.end.0 - old_range.start.0;
+        let check_end = VirtPageNum(old_range.start.0 + old_pages.max(1));
+        // Verify [old_range.start, check_end) is contiguously mapped with uniform VMA properties.
+        let (first_start, first_area) = Self::covering(&self.areas, old_range.start).ok_or(-14isize)?;
+        let perms = first_area.permissions;
+        let mut base_backing = first_area.backing.clone();
+        base_backing.advance((old_range.start.0 - first_start.0) * PAGE_SIZE);
+        if matches!(base_backing, VmaBacking::Executable { .. }) {
+            return Err(-22);
+        }
+        let mut cursor = first_area.end;
+        while cursor < check_end {
+            let (_, next) = Self::covering(&self.areas, cursor).ok_or(-14isize)?;
+            if next.permissions != perms {
+                return Err(-14);
+            }
+            cursor = next.end;
+        }
+        if old_pages == 0 {
+            if !base_backing.is_shared() || (!may_move && fixed_dest.is_none()) {
+                return Err(-22);
+            }
+            let dest = if let Some(dest) = fixed_dest {
+                let target = dest..VirtPageNum(dest.0 + new_pages);
+                let retired = self.unmap(table, target.clone(), tables);
+                self.insert(target, perms, base_backing);
+                return Ok((dest, retired));
+            } else {
+                vacant_at(old_range.start, new_pages).ok_or(-12isize)?
+            };
+            let start = dest.start;
+            self.insert(dest, perms, base_backing);
+            return Ok((start, Vec::new()));
+        }
+
+        if fixed_dest.is_none() {
+            if new_pages <= old_pages {
+                let unmap_range = VirtPageNum(old_range.start.0 + new_pages)..old_range.end;
+                let retired = if unmap_range.start < unmap_range.end {
+                    self.unmap(table, unmap_range, tables)
+                } else {
+                    Vec::new()
+                };
+                return Ok((old_range.start, retired));
+            }
+            let extra = old_range.end..VirtPageNum(old_range.start.0 + new_pages);
+            if extra.end.0 <= USER_END / PAGE_SIZE && check_vacant(&extra) {
+                let mut ext_backing = base_backing;
+                ext_backing.advance(old_pages * PAGE_SIZE);
+                self.insert(extra, perms, ext_backing);
+                return Ok((old_range.start, Vec::new()));
+            }
+            if !may_move {
+                return Err(-12);
+            }
+        }
+
+        let target = if let Some(dest) = fixed_dest {
+            dest..VirtPageNum(dest.0 + new_pages)
+        } else {
+            vacant_at(old_range.end, new_pages).ok_or(-12isize)?
+        };
+        let copy_pages = old_pages.min(new_pages);
+        let old_vpns: Vec<_> = self.pages.range(old_range.clone()).map(|(&vpn, _)| vpn).collect();
+        let dest_for = |vpn: VirtPageNum| VirtPageNum(target.start.0 + (vpn.0 - old_range.start.0));
+        let resident_to_move = old_vpns.partition_point(|vpn| vpn.0 - old_range.start.0 < copy_pages);
+        let move_vpns = &old_vpns[..resident_to_move];
+        // Prepare the destination page tables before altering either mapping.
+        for (index, &vpn) in move_vpns.iter().enumerate() {
+            if !table.prepare_mapping(dest_for(vpn)) {
+                for &prepared in &move_vpns[..index] {
+                    table.reclaim_empty_path(dest_for(prepared), tables);
+                }
+                return Err(-12);
+            }
+        }
+
+        self.split(old_range.start);
+        self.split(old_range.end);
+        let old_starts: Vec<_> = self.areas.range(old_range.clone()).map(|(&s, _)| s).collect();
+        for s in old_starts {
+            self.areas.remove(&s);
+        }
+        let mut retired = Vec::new();
+        let mut moved_pages = Vec::with_capacity(resident_to_move);
+        for &vpn in move_vpns {
+            let page = self.pages.remove(&vpn).unwrap();
+            let dest = dest_for(vpn);
+            table.install_prepared(dest, page.frame.ppn, page.flags(perms));
+            if let Some(previous) = self.pages.remove(&dest) {
+                retired.push(previous.frame);
+            }
+            moved_pages.push((dest, page));
+        }
+        // The new PTEs keep their page tables alive during teardown of either range.
+        for vpn in old_vpns {
+            table.unmap_and_reclaim(vpn, tables);
+            if let Some(page) = self.pages.remove(&vpn) {
+                retired.push(page.frame);
+            }
+        }
+        if fixed_dest.is_some() {
+            retired.extend(self.unmap(table, target.clone(), tables));
+        }
+        for (new_vpn, page) in moved_pages {
+            self.pages.insert(new_vpn, page);
+        }
+        let dest_start = target.start;
+        self.insert(target, perms, base_backing);
+        Ok((dest_start, retired))
+    }
+
+    pub(super) fn format_maps(&self, out: &mut alloc::string::String) {
+        use core::fmt::Write;
+        for (&start, area) in &self.areas {
+            let r = if area.permissions.contains(MapPermission::R) { 'r' } else { '-' };
+            let w = if area.permissions.contains(MapPermission::W) { 'w' } else { '-' };
+            let x = if area.permissions.contains(MapPermission::X) { 'x' } else { '-' };
+            let s = if area.backing.is_shared() { 's' } else { 'p' };
+            let offset = match &area.backing {
+                VmaBacking::File { offset, .. } | VmaBacking::SharedAnonymous { offset, .. } => *offset,
+                VmaBacking::Executable { address, .. } => *address,
+                VmaBacking::Anonymous => 0,
+            };
+            let (dev, ino) = match &area.backing {
+                VmaBacking::File { file, .. } => file.stat_identity().unwrap_or((0, 0)),
+                _ => (0, 0),
+            };
+            let _ = writeln!(
+                out,
+                "{:012x}-{:012x} {}{}{}{} {:08x} {:02x}:{:02x} {}",
+                start.0 * PAGE_SIZE,
+                area.end.0 * PAGE_SIZE,
+                r, w, x, s,
+                offset,
+                (dev >> 8) & 0xff,
+                dev & 0xff,
+                ino,
+            );
+        }
+    }
+
+    pub(super) fn madvise_check(&self, range: Range<VirtPageNum>, advice: usize) -> Result<(), isize> {
+        let mut cursor = range.start;
+        while cursor < range.end {
+            let Some((_, area)) = self.areas.range(..=cursor).next_back() else {
+                return Err(-12); // ENOMEM
+            };
+            if area.end <= cursor {
+                return Err(-12); // ENOMEM
+            }
+            if advice == 9 {
+                if !area.backing.is_shared() {
+                    return Err(-22);
+                }
+                if !area.permissions.contains(MapPermission::W) {
+                    return Err(-13);
+                }
+            } else if (advice == 18 || advice == 19)
+                && (area.backing.is_shared() || !matches!(area.backing, VmaBacking::Anonymous))
+            {
+                return Err(-22);
+            }
+            cursor = area.end;
+        }
+        Ok(())
+    }
 }

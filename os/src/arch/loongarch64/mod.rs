@@ -13,6 +13,7 @@ global_asm!(include_str!("switch.S"));
 pub const NAME: &str = "loongarch64";
 pub const ELF_MACHINE: u16 = 258;
 pub const OFFICIAL_BASIC_INTERPRETER: &str = "/lib64/ld-linux-loongarch-lp64d.so.1";
+pub const OFFICIAL_MUSL_INTERPRETER: &str = "/lib64/ld-musl-loongarch-lp64d.so.1";
 pub const CLONE_CHILD_TID_FIRST: bool = true;
 pub const RAM_BASE: usize = 0;
 pub const PA_BITS: usize = 48;

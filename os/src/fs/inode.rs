@@ -144,6 +144,44 @@ impl File for OSInode {
         self.inner.exclusive_access().inode.size()
     }
 
+    fn supports_positioned_io(&self) -> bool {
+        true
+    }
+
+    fn read_positioned(&self, offset: usize, buf: UserBuffer) -> isize {
+        let inner = self.inner.exclusive_access();
+        let mut count = 0;
+        let mut scratch = Vec::new();
+        for part in buf.buffers {
+            let read = part.write_with(&mut scratch, |slice| inner.inode.read_at(offset + count, slice));
+            count += read;
+            if read < part.len() {
+                break;
+            }
+        }
+        count as isize
+    }
+
+    fn write_positioned(&self, offset: usize, buf: UserBuffer) -> isize {
+        let inner = self.inner.exclusive_access();
+        let mut count = 0;
+        let mut scratch = Vec::new();
+        for part in buf.buffers {
+            let written = match part.read_with(&mut scratch, |slice| {
+                inner.inode.try_write_at_sync(offset + count, slice)
+            }) {
+                Ok(written) => written,
+                Err(error) if count == 0 => return super::persistent::errno(error),
+                Err(_) => break,
+            };
+            count += written;
+            if written < part.len() {
+                break;
+            }
+        }
+        count as isize
+    }
+
     fn read(&self, buf: UserBuffer) -> usize {
         let mut inner = self.inner.exclusive_access();
         let mut total_read_size = 0usize;
@@ -173,5 +211,16 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size as isize
+    }
+    fn seek_to(&self, pos: isize) -> isize {
+        if pos < 0 {
+            return -22;
+        }
+        self.inner.exclusive_access().offset = pos as usize;
+        pos
+    }
+    fn seek(&self, delta: isize) -> isize {
+        let cur = self.inner.exclusive_access().offset as isize;
+        cur.checked_add(delta).map_or(-75, |pos| self.seek_to(pos))
     }
 }

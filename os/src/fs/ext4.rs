@@ -19,9 +19,9 @@ pub const EXT4_MAGIC: u16 = 0xEF53;
 const EXTENT_MAGIC: u16 = 0xF30A;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 const SECTOR_SIZE: usize = 512;
-const LOOKUP_CACHE_CAPACITY: usize = 128;
-const DIRECTORY_CACHE_CAPACITY: usize = 8;
-const DIRECTORY_CACHE_MAX_BYTES: u64 = 128 * 1024;
+const LOOKUP_CACHE_CAPACITY: usize = 512;
+const DIRECTORY_CACHE_CAPACITY: usize = 16;
+const DIRECTORY_CACHE_MAX_BYTES: u64 = 512 * 1024;
 static SECTORS_READ: AtomicUsize = AtomicUsize::new(0);
 
 type DirectoryEntry = (String, u32, u8);
@@ -59,6 +59,8 @@ fn read_at(mut offset: u64, mut buf: &mut [u8]) {
 pub struct Inode {
     pub ino: u32,
     pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
     pub size: u64,
     pub blocks: [u8; 60],
     pub flags: u32,
@@ -172,9 +174,13 @@ impl Ext4Fs {
         let sectors = u64::from(le32(&b, 28)) | (u64::from(le16(&b, 116)) << 32);
         let external_xattr = le32(&b, 104) != 0 || le16(&b, 118) != 0;
         let xattr_sectors = if external_xattr { self.block_size as u64 / 512 } else { 0 };
+        let uid_hi = if b.len() >= 122 { u32::from(le16(&b, 120)) << 16 } else { 0 };
+        let gid_hi = if b.len() >= 124 { u32::from(le16(&b, 122)) << 16 } else { 0 };
         Some(Inode {
             ino,
             mode: le16(&b, 0),
+            uid: u32::from(le16(&b, 2)) | uid_hi,
+            gid: u32::from(le16(&b, 24)) | gid_hi,
             size,
             blocks,
             flags: le32(&b, 32),
@@ -396,15 +402,23 @@ impl Ext4Fs {
     }
 
     fn lookup_cached(&self, parent: u32, name: &str, load: impl FnOnce() -> Option<Inode>) -> Option<Inode> {
-        let mut cache = self.lookup_cache.exclusive_access();
-        if let Some((_, _, inode)) = cache.iter().find(|(dir, child, _)| *dir == parent && child == name) {
-            return Some(inode.clone());
+        {
+            let mut cache = self.lookup_cache.exclusive_access();
+            if let Some(idx) = cache.iter().position(|(dir, child, _)| *dir == parent && child == name) {
+                let entry = cache.remove(idx).unwrap();
+                let inode = entry.2.clone();
+                cache.push_back(entry);
+                return Some(inode);
+            }
         }
         let inode = load()?;
-        if cache.len() == LOOKUP_CACHE_CAPACITY {
-            cache.pop_front();
+        let mut cache = self.lookup_cache.exclusive_access();
+        if !cache.iter().any(|(dir, child, _)| *dir == parent && child == name) {
+            if cache.len() == LOOKUP_CACHE_CAPACITY {
+                cache.pop_front();
+            }
+            cache.push_back((parent, String::from(name), inode.clone()));
         }
-        cache.push_back((parent, String::from(name), inode.clone()));
         Some(inode)
     }
 }
@@ -477,6 +491,14 @@ impl File for Ext4File {
         self.inode.mode
     }
 
+    fn owner(&self) -> (u32, u32) {
+        (self.inode.uid, self.inode.gid)
+    }
+
+    fn link_count(&self) -> u32 {
+        u32::from(self.inode.link_count).max(1)
+    }
+
     fn stat_identity(&self) -> Option<(u64, u64)> {
         Some(self.fs.inode_identity(&self.inode))
     }
@@ -490,20 +512,15 @@ impl File for Ext4File {
     fn read(&self, buf: UserBuffer) -> usize {
         let mut off = self.offset.exclusive_access();
         let mut stream = self.stream.exclusive_access();
-        let mut total = 0;
-        let mut scratch = Vec::new();
-        for buffer in buf.buffers {
-            let read = buffer.write_with(&mut scratch, |chunk| {
-                self.fs
-                    .read_cached_at(&self.inode, *off as u64, chunk, Some(&mut stream))
-            });
-            *off += read;
-            total += read;
-            if read < buffer.len() {
-                break;
-            }
-        }
-        total
+        let count = self.read_buffer(*off, buf, Some(&mut stream));
+        *off += count;
+        count
+    }
+    fn supports_positioned_io(&self) -> bool {
+        self.inode.is_file()
+    }
+    fn read_positioned(&self, offset: usize, buf: UserBuffer) -> isize {
+        self.read_buffer(offset, buf, None) as isize
     }
     fn size(&self) -> usize {
         self.len()
@@ -516,25 +533,33 @@ impl File for Ext4File {
     }
     fn seek_to(&self, pos: isize) -> isize {
         if pos < 0 {
-            return -1;
+            return -22;
         }
-        let len = self.inode.size as isize;
-        let new = if pos > len { len } else { pos };
-        *self.offset.exclusive_access() = new as usize;
-        new
+        *self.offset.exclusive_access() = pos as usize;
+        pos
     }
     fn seek(&self, offset: isize) -> isize {
-        let len = self.inode.size as isize;
-        let mut off = self.offset.exclusive_access();
-        let new = (*off as isize).saturating_add(offset);
-        if new < 0 {
-            return -1;
-        }
-        let new = if new > len { len } else { new };
-        *off = new as usize;
-        new
+        let cur = *self.offset.exclusive_access() as isize;
+        cur.checked_add(offset).map_or(-75, |pos| self.seek_to(pos))
     }
     fn write(&self, _buf: UserBuffer) -> isize {
         panic!("EXT4 root is read-only");
+    }
+}
+
+impl Ext4File {
+    fn read_buffer(&self, offset: usize, buf: UserBuffer, mut stream: Option<&mut ReadStream>) -> usize {
+        let mut total = 0;
+        let mut scratch = Vec::new();
+        for buffer in buf.buffers {
+            let read = buffer.write_with(&mut scratch, |chunk| {
+                self.fs.read_cached_at(&self.inode, (offset + total) as u64, chunk, stream.as_deref_mut())
+            });
+            total += read;
+            if read < buffer.len() {
+                break;
+            }
+        }
+        total
     }
 }

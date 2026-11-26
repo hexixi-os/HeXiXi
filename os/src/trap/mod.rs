@@ -79,6 +79,7 @@ pub fn trap_handler() -> ! {
                 restart = Some(crate::syscall::signal::Restart {
                     pc: syscall_pc,
                     args,
+                    when_caught: id != crate::syscall::SYSCALL_RT_SIGSUSPEND,
                 });
             }
         }

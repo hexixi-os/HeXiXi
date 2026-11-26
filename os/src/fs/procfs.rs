@@ -2,7 +2,8 @@ use super::DirectoryIdentity;
 use crate::task::TaskStatus;
 use alloc::{format, string::String, sync::Arc, vec::Vec};
 
-const PROCESS_FILES: &[&str] = &["stat", "status", "cmdline", "cwd", "exe"];
+const PROCESS_FILES: &[&str] = &["stat", "status", "cmdline", "mounts", "maps", "cwd", "exe"];
+const PROCESS_DIRS: &[&str] = &["fd", "task"];
 
 pub(super) fn memory_info() -> Vec<u8> {
     let total = crate::mm::ram_end().saturating_sub(crate::arch::RAM_BASE) / 1024;
@@ -32,16 +33,53 @@ pub(super) fn cpu_info() -> Vec<u8> {
     info.into_bytes()
 }
 
-fn pid_path(path: &str) -> Option<(usize, &str)> {
-    let rest = path.strip_prefix("proc/")?;
-    let (pid, entry) = rest.split_once('/').unwrap_or((rest, ""));
-    if pid.is_empty()
-        || !pid.bytes().all(|byte| byte.is_ascii_digit())
-        || (pid.len() > 1 && pid.starts_with('0'))
+fn parse_decimal(s: &str) -> Option<usize> {
+    if s.is_empty()
+        || !s.bytes().all(|byte| byte.is_ascii_digit())
+        || (s.len() > 1 && s.starts_with('0'))
     {
         return None;
     }
-    Some((pid.parse().ok()?, entry))
+    s.parse().ok()
+}
+
+fn pid_path(path: &str) -> Option<(usize, &str)> {
+    let rest = path.strip_prefix("proc/")?;
+    let (pid, entry) = rest.split_once('/').unwrap_or((rest, ""));
+    Some((parse_decimal(pid)?, entry))
+}
+
+fn resolve_task_entry(pid: usize, entry: &str) -> Option<(usize, &str)> {
+    if let Some(rest) = entry.strip_prefix("task/") {
+        let (tid_str, sub) = rest.split_once('/').unwrap_or((rest, ""));
+        let tid = parse_decimal(tid_str)?;
+        let process = crate::task::pid2process(pid)?;
+        let inner = process.inner_exclusive_access();
+        let has_tid = inner.tasks.iter().flatten().any(|t| {
+            t.linux_tid() == tid && t.inner_exclusive_access().exit_code.is_none()
+        });
+        has_tid.then_some((tid, sub))
+    } else {
+        Some((pid, entry))
+    }
+}
+
+fn sysctl_value(path: &str) -> Option<&'static str> {
+    match path {
+        "proc/sys/kernel/pid_max" => Some("32768\n"),
+        "proc/sys/kernel/threads-max" => Some("4096\n"),
+        "proc/sys/kernel/tainted" => Some("0\n"),
+        "proc/sys/kernel/osrelease" => Some("6.0.0-rcore\n"),
+        "proc/sys/kernel/ostype" => Some("Linux\n"),
+        "proc/sys/kernel/ngroups_max" => Some("65536\n"),
+        "proc/sys/kernel/overflowuid" => Some("65534\n"),
+        "proc/sys/kernel/overflowgid" => Some("65534\n"),
+        "proc/sys/fs/file-max" => Some("65536\n"),
+        "proc/sys/fs/pipe-max-size" => Some("1048576\n"),
+        "proc/sys/vm/overcommit_memory" => Some("0\n"),
+        "proc/sys/vm/max_map_count" => Some("65530\n"),
+        _ => None,
+    }
 }
 
 pub(super) fn is_directory(path: &str) -> bool {
@@ -49,16 +87,22 @@ pub(super) fn is_directory(path: &str) -> bool {
 }
 
 pub(super) fn directory_identity(path: &str) -> Option<DirectoryIdentity> {
-    if path == "proc" {
+    if matches!(
+        path,
+        "proc" | "proc/sys" | "proc/sys/kernel" | "proc/sys/fs" | "proc/sys/vm"
+    ) {
         return Some(DirectoryIdentity::Permanent);
     }
     let (pid, entry) = pid_path(path)?;
-    if !entry.is_empty() {
-        return None;
+    let process = crate::task::pid2process(pid)?;
+    if entry.is_empty() || entry == "fd" || entry == "task" {
+        return Some(DirectoryIdentity::Proc(Arc::downgrade(&process)));
     }
-    Some(DirectoryIdentity::Proc(Arc::downgrade(
-        &crate::task::pid2process(pid)?,
-    )))
+    let (_, sub) = resolve_task_entry(pid, entry)?;
+    if sub.is_empty() || sub == "fd" {
+        return Some(DirectoryIdentity::Proc(Arc::downgrade(&process)));
+    }
+    None
 }
 
 pub(super) fn symlink_target(path: &str) -> Option<Vec<u8>> {
@@ -66,12 +110,47 @@ pub(super) fn symlink_target(path: &str) -> Option<Vec<u8>> {
         let task = crate::task::current_task()?;
         return Some(format!("{}", task.process.upgrade()?.getpid()).into_bytes());
     }
-    let (pid, entry) = pid_path(path)?;
-    if !matches!(entry, "cwd" | "exe") {
-        return None;
+    if path == "proc/thread-self" {
+        let task = crate::task::current_task()?;
+        let pid = task.process.upgrade()?.getpid();
+        return Some(format!("{}/task/{}", pid, task.linux_tid()).into_bytes());
     }
+    let (pid, raw_entry) = pid_path(path)?;
+    let (_, entry) = resolve_task_entry(pid, raw_entry)?;
     let process = crate::task::pid2process(pid)?;
     let inner = process.inner_exclusive_access();
+    if let Some(fd_str) = entry.strip_prefix("fd/") {
+        let fd = parse_decimal(fd_str)?;
+        let file = inner.fd_table.get(fd)?.as_ref()?.clone();
+        drop(inner);
+        if let Some(dir) = file.directory() {
+            let p = dir.location().path();
+            return Some(format!("/{}", p.trim_start_matches('/')).into_bytes());
+        }
+        if file.is_tty() {
+            return Some(Vec::from(&b"/dev/console"[..]));
+        }
+        if let Some((dev, ino)) = file.stat_identity() {
+            if dev == super::DEV_DEVICE {
+                let dev_name = match ino {
+                    301 => Some("/dev/null"),
+                    302 => Some("/dev/zero"),
+                    303 => Some("/dev/tty"),
+                    304 => Some("/dev/console"),
+                    306 => Some("/dev/random"),
+                    307 => Some("/dev/urandom"),
+                    _ => None,
+                };
+                if let Some(name) = dev_name {
+                    return Some(Vec::from(name.as_bytes()));
+                }
+            }
+        }
+        if file.socket().is_some() || file.unix_socket().is_some() {
+            return Some(format!("socket:[{}]", fd).into_bytes());
+        }
+        return Some(format!("anon_inode:[fd-{}]", fd).into_bytes());
+    }
     match entry {
         "cwd" => {
             let cwd = inner.cwd.clone();
@@ -84,20 +163,36 @@ pub(super) fn symlink_target(path: &str) -> Option<Vec<u8>> {
 }
 
 pub(super) fn process_file_exists(path: &str) -> bool {
-    pid_path(path).map_or(false, |(pid, entry)| {
-        matches!(entry, "stat" | "status" | "cmdline") && crate::task::pid2process(pid).is_some()
+    if sysctl_value(path).is_some() {
+        return true;
+    }
+    pid_path(path).map_or(false, |(pid, raw_entry)| {
+        resolve_task_entry(pid, raw_entry).map_or(false, |(_, entry)| {
+            matches!(entry, "stat" | "status" | "cmdline" | "mounts" | "maps")
+                && crate::task::pid2process(pid).is_some()
+        })
     })
 }
 
 pub(super) fn snapshot(path: &str) -> Option<Vec<u8>> {
-    let (pid, entry) = pid_path(path)?;
-    if !matches!(entry, "stat" | "status" | "cmdline") {
+    if let Some(val) = sysctl_value(path) {
+        return Some(Vec::from(val.as_bytes()));
+    }
+    let (pid, raw_entry) = pid_path(path)?;
+    let (tid, entry) = resolve_task_entry(pid, raw_entry)?;
+    if !matches!(entry, "stat" | "status" | "cmdline" | "mounts" | "maps") {
         return None;
+    }
+    if entry == "mounts" {
+        return Some(super::mount::mounts_snapshot());
     }
     let process = crate::task::pid2process(pid)?;
     let inner = process.inner_exclusive_access();
     if entry == "cmdline" {
         return Some(inner.cmdline.as_deref().unwrap_or_default().to_vec());
+    }
+    if entry == "maps" {
+        return Some(inner.memory_set.maps_snapshot().into_bytes());
     }
     let name = inner
         .executable
@@ -124,9 +219,29 @@ pub(super) fn snapshot(path: &str) -> Option<Vec<u8>> {
         'S'
     };
     let text = if entry == "status" {
+        let groups = inner
+            .groups
+            .iter()
+            .map(|g| format!("{}", g))
+            .collect::<Vec<_>>()
+            .join(" ");
         format!(
-            "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nThreads:\t{}\n",
-            name, state, pid, pid, parent, threads
+            "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nGroups:\t{}\nThreads:\t{}\n",
+            name,
+            state,
+            pid,
+            tid,
+            parent,
+            inner.uid,
+            inner.euid,
+            inner.suid,
+            inner.fsuid,
+            inner.gid,
+            inner.egid,
+            inner.sgid,
+            inner.fsgid,
+            groups,
+            threads
         )
     } else {
         let mut fields = ["0"; 49];
@@ -138,33 +253,108 @@ pub(super) fn snapshot(path: &str) -> Option<Vec<u8>> {
         fields[1] = &pgrp;
         fields[2] = &session;
         fields[16] = &threads;
-        format!("{} ({}) {} {}\n", pid, name, state, fields.join(" "))
+        format!("{} ({}) {} {}\n", tid, name, state, fields.join(" "))
     };
     Some(text.into_bytes())
 }
 
 pub(super) fn entries(path: &str) -> Option<Vec<(String, u32, u8)>> {
-    if path == "proc" {
-        let mut entries: Vec<_> = super::PROC_FILES
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (String::from(*name), 100 + i as u32, 1))
-            .collect();
-        entries.push((String::from("self"), 120, 7));
-        entries.extend(
-            crate::task::process_ids()
-                .into_iter()
-                .map(|pid| (format!("{}", pid), 1000 + pid as u32, 2)),
-        );
-        return Some(entries);
+    match path {
+        "proc" => {
+            let mut entries: Vec<_> = super::PROC_FILES
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (String::from(*name), 100 + i as u32, 1))
+                .collect();
+            entries.push((String::from("sys"), 118, 2));
+            entries.push((String::from("self"), 120, 7));
+            entries.push((String::from("thread-self"), 121, 7));
+            entries.extend(
+                crate::task::process_ids()
+                    .into_iter()
+                    .map(|pid| (format!("{}", pid), 1000 + pid as u32, 2)),
+            );
+            return Some(entries);
+        }
+        "proc/sys" => {
+            return Some(alloc::vec![
+                (String::from("."), 200, 2),
+                (String::from(".."), 1, 2),
+                (String::from("kernel"), 201, 2),
+                (String::from("fs"), 202, 2),
+                (String::from("vm"), 203, 2),
+            ]);
+        }
+        "proc/sys/kernel" => {
+            return Some(alloc::vec![
+                (String::from("."), 201, 2),
+                (String::from(".."), 200, 2),
+                (String::from("pid_max"), 210, 1),
+                (String::from("threads-max"), 211, 1),
+                (String::from("tainted"), 212, 1),
+                (String::from("osrelease"), 213, 1),
+                (String::from("ostype"), 214, 1),
+                (String::from("ngroups_max"), 215, 1),
+                (String::from("overflowuid"), 216, 1),
+                (String::from("overflowgid"), 217, 1),
+            ]);
+        }
+        "proc/sys/fs" => {
+            return Some(alloc::vec![
+                (String::from("."), 202, 2),
+                (String::from(".."), 200, 2),
+                (String::from("file-max"), 220, 1),
+                (String::from("pipe-max-size"), 221, 1),
+            ]);
+        }
+        "proc/sys/vm" => {
+            return Some(alloc::vec![
+                (String::from("."), 203, 2),
+                (String::from(".."), 200, 2),
+                (String::from("overcommit_memory"), 230, 1),
+                (String::from("max_map_count"), 231, 1),
+            ]);
+        }
+        _ => {}
     }
-    let (pid, entry) = pid_path(path)?;
+    let (pid, raw_entry) = pid_path(path)?;
+    let process = crate::task::pid2process(pid)?;
+    let inner = process.inner_exclusive_access();
+    if raw_entry == "task" {
+        let mut list = alloc::vec![
+            (String::from("."), 1300, 2),
+            (String::from(".."), 1000 + pid as u32, 2),
+        ];
+        for task in inner.tasks.iter().flatten() {
+            if task.inner_exclusive_access().exit_code.is_none() {
+                let tid = task.linux_tid();
+                list.push((format!("{}", tid), 3000 + tid as u32, 2));
+            }
+        }
+        return Some(list);
+    }
+    let (_, entry) = resolve_task_entry(pid, raw_entry)?;
+    if entry == "fd" {
+        let mut list = alloc::vec![
+            (String::from("."), 1400, 2),
+            (String::from(".."), 1000 + pid as u32, 2),
+        ];
+        for (fd, slot) in inner.fd_table.iter().enumerate() {
+            if slot.is_some() {
+                list.push((format!("{}", fd), 2000 + fd as u32, 7));
+            }
+        }
+        return Some(list);
+    }
     if !entry.is_empty() {
         return None;
     }
-    let process = crate::task::pid2process(pid)?;
-    let inner = process.inner_exclusive_access();
-    Some(
+    let mut out: Vec<(String, u32, u8)> = PROCESS_DIRS
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (String::from(*name), 1190 + i as u32, 2))
+        .collect();
+    out.extend(
         PROCESS_FILES
             .iter()
             .enumerate()
@@ -173,9 +363,9 @@ pub(super) fn entries(path: &str) -> Option<Vec<(String, u32, u8)>> {
                 (
                     String::from(*name),
                     1200 + i as u32,
-                    if i >= 3 { 7 } else { 1 },
+                    if matches!(*name, "cwd" | "exe") { 7 } else { 1 },
                 )
-            })
-            .collect(),
-    )
+            }),
+    );
+    Some(out)
 }

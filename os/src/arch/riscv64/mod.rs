@@ -29,6 +29,7 @@ global_asm!(include_str!("switch.S"));
 pub const NAME: &str = "riscv64";
 pub const ELF_MACHINE: u16 = 243;
 pub const OFFICIAL_BASIC_INTERPRETER: &str = "/lib/ld-linux-riscv64-lp64d.so.1";
+pub const OFFICIAL_MUSL_INTERPRETER: &str = "/lib/ld-musl-riscv64.so.1";
 pub const CLONE_CHILD_TID_FIRST: bool = false;
 pub const RAM_BASE: usize = 0x8000_0000;
 pub const PA_BITS: usize = 56;

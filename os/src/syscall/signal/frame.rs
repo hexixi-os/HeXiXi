@@ -23,7 +23,7 @@ const MINSIGSTKSZ: usize = 2048;
 #[cfg(target_arch = "loongarch64")]
 const MINSIGSTKSZ: usize = 4096;
 
-fn copy_in(token: usize, address: usize, len: usize) -> Option<Vec<u8>> {
+pub(super) fn copy_in(token: usize, address: usize, len: usize) -> Option<Vec<u8>> {
     let pages = translated_byte_buffer(token, address as *const u8, len, MapPermission::R)?;
     Some(UserBuffer::new(pages).into_iter().map(|byte| byte.read()).collect())
 }

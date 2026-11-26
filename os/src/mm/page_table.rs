@@ -134,6 +134,13 @@ impl PageTable {
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
         true
     }
+    pub(super) fn prepare_mapping(&mut self, vpn: VirtPageNum) -> bool {
+        self.find_pte_create(vpn).is_some()
+    }
+    /// Install a mapping after all required page-table frames have been prepared.
+    pub(super) fn install_prepared(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
+        *self.find_pte(vpn).unwrap() = PageTableEntry::new(ppn, flags | PTEFlags::V);
+    }
     pub fn unmap(&mut self, vpn: VirtPageNum) {
         let pte = self.find_pte(vpn).unwrap();
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
@@ -146,10 +153,21 @@ impl PageTable {
     }
     /// Unlink empty non-root tables. The caller holds their frames until after the TLB flush.
     pub fn unmap_and_reclaim(&mut self, vpn: VirtPageNum, retired: &mut Vec<FrameTracker>) {
-        let indexes = vpn.indexes();
-        let middle = self.root_ppn.get_pte_array()[indexes[0]].ppn();
-        let leaf = middle.get_pte_array()[indexes[1]].ppn();
         self.unmap(vpn);
+        self.reclaim_empty_path(vpn, retired);
+    }
+    pub(super) fn reclaim_empty_path(&mut self, vpn: VirtPageNum, retired: &mut Vec<FrameTracker>) {
+        let indexes = vpn.indexes();
+        let top_entry = self.root_ppn.get_pte_array()[indexes[0]];
+        if !top_entry.is_valid() {
+            return;
+        }
+        let middle = top_entry.ppn();
+        let middle_entry = middle.get_pte_array()[indexes[1]];
+        if !middle_entry.is_valid() {
+            return;
+        }
+        let leaf = middle_entry.ppn();
         for (parent, index, child) in [(middle, indexes[1], leaf), (self.root_ppn, indexes[0], middle)] {
             if child.get_pte_array().iter().any(PageTableEntry::is_valid) {
                 break;
@@ -276,14 +294,25 @@ pub fn translated_byte_buffer(
     len: usize,
     access: MapPermission,
 ) -> Option<Vec<UserSlice>> {
+    let (buffers, copied) = translated_byte_prefix(token, ptr, len, access);
+    (copied == len).then_some(buffers)
+}
+
+/// Translate through the first inaccessible page so callers can perform short I/O.
+pub(crate) fn translated_byte_prefix(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    access: MapPermission,
+) -> (Vec<UserSlice>, usize) {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
-    let end = start.checked_add(len)?;
     let mut buffers = Vec::new();
+    let Some(end) = start.checked_add(len) else { return (buffers, 0) };
     while start < end {
-        let ppn = resolve_user_page(&page_table, start, access)?;
+        let Some(ppn) = resolve_user_page(&page_table, start, access) else { break };
         let va = VirtAddr::from(start);
-        let pa = checked_phys_addr(token, start, ppn.into())?;
+        let Some(pa) = checked_phys_addr(token, start, ppn.into()) else { break };
         let first = va.page_offset();
         let count = (end - start).min(PAGE_SIZE - first);
         pin_user_page(token, va.floor());
@@ -293,7 +322,7 @@ pub fn translated_byte_buffer(
         });
         start += count;
     }
-    Some(buffers)
+    (buffers, start - ptr as usize)
 }
 
 /// Require a NUL terminator before returning a path to a filesystem operation.
@@ -471,6 +500,11 @@ pub struct UserBuffer {
 impl UserBuffer {
     pub fn new(buffers: Vec<UserSlice>) -> Self {
         Self { buffers }
+    }
+    pub(crate) unsafe fn from_kernel_slice(ptr: *mut u8, len: usize) -> Self {
+        Self {
+            buffers: alloc::vec![UserSlice { ptr, len }],
+        }
     }
     pub fn len(&self) -> usize {
         self.buffers.iter().map(UserSlice::len).sum()

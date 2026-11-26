@@ -1,6 +1,8 @@
 use core::arch::asm;
 
 const SYSCALL_DUP: usize = 23;
+const SYSCALL_MKDIRAT: usize = 34;
+const SYSCALL_SYMLINKAT: usize = 36;
 const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_OPEN: usize = 56;
 const SYSCALL_CLOSE: usize = 57;
@@ -11,6 +13,7 @@ const SYSCALL_EXIT: usize = 93;
 const SYSCALL_SLEEP: usize = 101;
 const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
+const SYSCALL_SETPGID: usize = 154;
 const SYSCALL_GET_TIME: usize = 169;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_FORK: usize = 220;
@@ -104,7 +107,11 @@ pub fn sys_exit(exit_code: i32) -> ! {
 }
 
 pub fn sys_sleep(sleep_ms: usize) -> isize {
-    syscall(SYSCALL_SLEEP, [sleep_ms, 0, 0])
+    let ts: [u64; 2] = [
+        (sleep_ms / 1000) as u64,
+        ((sleep_ms % 1000) * 1_000_000) as u64,
+    ];
+    syscall(SYSCALL_SLEEP, [ts.as_ptr() as usize, 0, 0])
 }
 
 pub fn sys_yield() -> isize {
@@ -113,6 +120,22 @@ pub fn sys_yield() -> isize {
 
 pub fn sys_kill(pid: usize, signal: i32) -> isize {
     syscall(SYSCALL_KILL, [pid, signal as usize, 0])
+}
+
+pub fn sys_kill_raw(pid: isize, signal: i32) -> isize {
+    syscall(SYSCALL_KILL, [pid as usize, signal as usize, 0])
+}
+
+pub fn sys_setpgid(pid: usize, pgid: usize) -> isize {
+    syscall(SYSCALL_SETPGID, [pid, pgid, 0])
+}
+
+pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
+    syscall(SYSCALL_MKDIRAT, [dirfd as usize, path as usize, mode as usize])
+}
+
+pub fn sys_symlinkat(target: *const u8, dirfd: isize, link: *const u8) -> isize {
+    syscall(SYSCALL_SYMLINKAT, [target as usize, dirfd as usize, link as usize])
 }
 
 pub fn sys_get_time(tv: *mut u8) -> isize {
@@ -131,6 +154,13 @@ pub fn sys_exec(path: &str, args: &[*const u8]) -> isize {
     syscall(
         SYSCALL_EXEC,
         [path.as_ptr() as usize, args.as_ptr() as usize, 0],
+    )
+}
+
+pub fn sys_execve(path: *const u8, args: &[*const u8], envp: &[*const u8]) -> isize {
+    syscall(
+        SYSCALL_EXEC,
+        [path as usize, args.as_ptr() as usize, envp.as_ptr() as usize],
     )
 }
 

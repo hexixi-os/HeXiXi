@@ -38,6 +38,26 @@ fn munmap(addr: usize, len: usize) -> isize {
     syscall(215, [addr, len, 0, 0, 0, 0])
 }
 
+fn check_fixed_remap() {
+    const MAY_MOVE: usize = 1;
+    const REMAP_FIXED: usize = 2;
+    let source = 0x2800_0000;
+    let target = 0x301f_f000; // The destination spans two leaf page tables.
+    let flags = PRIVATE | ANONYMOUS | FIXED_NOREPLACE;
+    for addr in [source, target] {
+        assert_eq!(mmap(addr, 2 * PAGE, READ | WRITE, flags, -1, 0), addr as isize);
+    }
+    store(source, b'A');
+    store(source + PAGE, b'B');
+    store(target, b'X');
+    assert_eq!(
+        syscall(216, [source, 2 * PAGE, 2 * PAGE, MAY_MOVE | REMAP_FIXED, target, 0]),
+        target as isize
+    );
+    assert_eq!((load(target), load(target + PAGE)), (b'A', b'B'));
+    assert_eq!(munmap(target, 2 * PAGE), 0);
+}
+
 fn load(addr: usize) -> u8 {
     unsafe { (addr as *const u8).read_volatile() }
 }
@@ -280,6 +300,7 @@ fn main() -> i32 {
         "thread exit cleared TID through a private file mapping"
     );
     assert_eq!(load(mirror), b'B');
+    check_fixed_remap();
     println!("mmap-vma-test-ok");
     0
 }

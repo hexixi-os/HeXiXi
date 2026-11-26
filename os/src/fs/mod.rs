@@ -83,6 +83,18 @@ pub trait File: Send + Sync {
             0o100644
         }
     }
+    fn owner(&self) -> (u32, u32) {
+        (0, 0)
+    }
+    fn set_mode(&self, _perm: u16) -> isize {
+        -30
+    }
+    fn set_owner(&self, _uid: Option<u32>, _gid: Option<u32>) -> isize {
+        -30
+    }
+    fn punch_hole(&self, _offset: usize, _len: usize) -> isize {
+        -95
+    }
     fn is_tty(&self) -> bool {
         false
     }
@@ -120,13 +132,22 @@ pub trait File: Send + Sync {
     fn size(&self) -> usize {
         0
     }
+    fn supports_positioned_io(&self) -> bool {
+        false
+    }
+    fn read_positioned(&self, _offset: usize, _buf: UserBuffer) -> isize {
+        -29
+    }
+    fn write_positioned(&self, _offset: usize, _buf: UserBuffer) -> isize {
+        -29
+    }
     /// 调整读写偏移（相对当前），返回新偏移
     fn seek(&self, _offset: isize) -> isize {
-        -1
+        -29
     }
     /// 绝对定位（SEEK_SET / SEEK_END），返回新偏移
     fn seek_to(&self, _pos: isize) -> isize {
-        -1
+        -29
     }
     /// 修改文件长度（truncate/ftruncate），返回 0 成功
     fn set_len(&self, _len: usize) -> isize {
@@ -162,6 +183,9 @@ impl File for PathFile {
     }
     fn mode(&self) -> u16 {
         self.0.mode()
+    }
+    fn owner(&self) -> (u32, u32) {
+        self.0.owner()
     }
     fn path_flags(&self) -> Option<u32> {
         Some(self.1)
@@ -237,6 +261,12 @@ impl File for NullFile {
     fn poll_writable(&self) -> bool {
         true
     }
+    fn seek(&self, _offset: isize) -> isize {
+        0
+    }
+    fn seek_to(&self, _pos: isize) -> isize {
+        0
+    }
 }
 
 /// /dev/zero：读返回全 0，写丢弃，且支持匿名语义的 mmap
@@ -266,6 +296,12 @@ impl File for ZeroFile {
     }
     fn write(&self, buf: UserBuffer) -> isize {
         buf.len() as isize
+    }
+    fn seek(&self, _offset: isize) -> isize {
+        0
+    }
+    fn seek_to(&self, _pos: isize) -> isize {
+        0
     }
 }
 
@@ -850,7 +886,8 @@ pub fn init_runtime_dirs() {
     mount_tmpfs_at_boot("dev/shm");
     for name in ["tmp", "var", "var/tmp"] {
         if let Ok(path) = resolve_from(name, "", true) {
-            let _ = mkdir(&path, 0o755);
+            let mode = if name == "var" { 0o755 } else { 0o1777 };
+            let _ = mkdir(&path, mode);
         }
     }
     for name in ["tmp", "var/tmp"] {
@@ -1203,6 +1240,7 @@ pub fn virtual_file(name: &str) -> Option<Vec<u8>> {
             return Some(alloc::format!("{}.{:02} 0.00\n", ms / 1000, (ms % 1000) / 10).into_bytes());
         }
         "proc/version" => "Linux version 6.0.0-rcore (rcore@local) #1\n",
+        "proc/cmdline" => "console=ttyS0\n",
         "proc/stat" => "cpu  0 0 0 0 0 0 0 0 0 0\n",
         "proc/cpuinfo" => return Some(procfs::cpu_info()),
         "proc/filesystems" => "nodev\tproc\nnodev\tdevtmpfs\nnodev\ttmpfs\nnodev\tsysfs\n\text4\n\tvfat\n",
@@ -1218,6 +1256,7 @@ pub const PROC_FILES: &[&str] = &[
     "loadavg",
     "uptime",
     "version",
+    "cmdline",
     "stat",
     "cpuinfo",
     "filesystems",
@@ -1331,4 +1370,222 @@ pub fn list_dir_path(name: &str) -> Vec<(String, u32, u8)> {
 pub fn is_root_path(name: &str) -> bool {
     let n = name.trim_start_matches("./").trim_start_matches('/');
     n.is_empty() || n == "."
+}
+
+pub fn path_mode_owner(name: &str) -> Result<(u16, u32, u32), isize> {
+    if is_root_path(name) {
+        return Ok((0o40755, 0, 0));
+    }
+    if let Some((mount, rel)) = resolve_mount(name) {
+        match mount.backend {
+            MountBackend::Procfs => {
+                let proc_path = proc_rel_path(rel);
+                if procfs::is_directory(&proc_path) {
+                    return Ok((0o40555, 0, 0));
+                }
+                if procfs::symlink_target(&proc_path).is_some() {
+                    return Ok((0o120777, 0, 0));
+                }
+                if procfs::process_file_exists(&proc_path) || PROC_FILES.contains(&rel) {
+                    return Ok((0o100444, 0, 0));
+                }
+                return Err(-2);
+            }
+            MountBackend::Devfs => {
+                if rel.is_empty() {
+                    return Ok((0o40755, 0, 0));
+                }
+                if dev_file_exists(rel) {
+                    return Ok((0o20666, 0, 0));
+                }
+                return Err(-2);
+            }
+            MountBackend::Memfs(fs) => {
+                if rel.is_empty() {
+                    let dir = fs.root_dir();
+                    let (u, g) = dir.owner();
+                    return Ok((dir.mode(), u, g));
+                }
+                return match fs.get(rel) {
+                    Some(OverlayEntry::File(data)) => {
+                        let d = data.exclusive_access();
+                        Ok((d.mode, d.uid, d.gid))
+                    }
+                    Some(OverlayEntry::Directory(dir)) => {
+                        let (u, g) = dir.owner();
+                        Ok((dir.mode(), u, g))
+                    }
+                    Some(OverlayEntry::Symlink(_)) => Ok((0o120777, 0, 0)),
+                    Some(OverlayEntry::Whiteout) | None => Err(-2),
+                };
+            }
+            MountBackend::Persistent(fs) => {
+                return fs
+                    .is_directory(rel)
+                    .map(|d| (if d { 0o40755 } else { 0o100644 }, 0, 0));
+            }
+            MountBackend::RootOverlay => {}
+        }
+    }
+    match overlay_get(name) {
+        Some(OverlayEntry::File(data)) => {
+            let d = data.exclusive_access();
+            return Ok((d.mode, d.uid, d.gid));
+        }
+        Some(OverlayEntry::Directory(dir)) => {
+            let (u, g) = dir.owner();
+            return Ok((dir.mode(), u, g));
+        }
+        Some(OverlayEntry::Symlink(_)) => return Ok((0o120777, 0, 0)),
+        Some(OverlayEntry::Whiteout) => return Err(-2),
+        None => {}
+    }
+    if EXT4.is_some() {
+        lower_inode(name)
+            .map(|inode| (inode.mode, inode.uid, inode.gid))
+            .ok_or(-2)
+    } else {
+        open_file(name, OpenFlags::RDONLY)
+            .map(|_| (0o100755, 0, 0))
+            .ok_or(-2)
+    }
+}
+
+pub fn mutate_path_meta(
+    name: &str,
+    update: impl FnOnce(u16, u32, u32) -> Result<(Option<u16>, Option<u32>, Option<u32>), isize>,
+) -> Result<(), isize> {
+    if is_root_path(name) {
+        let _ = update(0o40755, 0, 0)?;
+        return Ok(());
+    }
+    require_parent_directories(name)?;
+    if let Some((mount, rel)) = resolve_mount(name) {
+        match mount.backend {
+            MountBackend::Procfs | MountBackend::Devfs => {
+                let _ = path_mode_owner(name)?;
+                return Err(-30);
+            }
+            MountBackend::Memfs(fs) => {
+                if rel.is_empty() {
+                    let dir = fs.root_dir();
+                    let (u, g) = dir.owner();
+                    let (m, nu, ng) = update(dir.mode(), u, g)?;
+                    if let Some(perm) = m {
+                        dir.set_mode(perm);
+                    }
+                    dir.set_owner(nu, ng);
+                    return Ok(());
+                }
+                return match fs.get(rel) {
+                    Some(OverlayEntry::File(data)) => {
+                        let mut d = data.exclusive_access();
+                        let (m, nu, ng) = update(d.mode, d.uid, d.gid)?;
+                        if let Some(perm) = m {
+                            d.mode = (d.mode & !0o7777) | (perm & 0o7777);
+                        }
+                        if let Some(u) = nu {
+                            d.uid = u;
+                        }
+                        if let Some(g) = ng {
+                            d.gid = g;
+                        }
+                        if nu.is_some() || ng.is_some() {
+                            d.mode &= !0o6000;
+                        }
+                        Ok(())
+                    }
+                    Some(OverlayEntry::Directory(dir)) => {
+                        let (u, g) = dir.owner();
+                        let (m, nu, ng) = update(dir.mode(), u, g)?;
+                        if let Some(perm) = m {
+                            dir.set_mode(perm);
+                        }
+                        dir.set_owner(nu, ng);
+                        Ok(())
+                    }
+                    Some(OverlayEntry::Symlink(_)) => {
+                        let (m, _, _) = update(0o120777, 0, 0)?;
+                        if m.is_some() { Err(-95) } else { Ok(()) }
+                    }
+                    Some(OverlayEntry::Whiteout) | None => Err(-2),
+                };
+            }
+            MountBackend::Persistent(fs) => {
+                let is_dir = fs.is_directory(rel)?;
+                if fs.readonly() {
+                    return Err(-30);
+                }
+                let _ = update(if is_dir { 0o40755 } else { 0o100644 }, 0, 0)?;
+                return Ok(());
+            }
+            MountBackend::RootOverlay => {}
+        }
+    }
+    match overlay_get(name) {
+        Some(OverlayEntry::File(data)) => {
+            let mut d = data.exclusive_access();
+            let (m, nu, ng) = update(d.mode, d.uid, d.gid)?;
+            if let Some(perm) = m {
+                d.mode = (d.mode & !0o7777) | (perm & 0o7777);
+            }
+            if let Some(u) = nu {
+                d.uid = u;
+            }
+            if let Some(g) = ng {
+                d.gid = g;
+            }
+            if nu.is_some() || ng.is_some() {
+                d.mode &= !0o6000;
+            }
+            return Ok(());
+        }
+        Some(OverlayEntry::Directory(dir)) => {
+            let (u, g) = dir.owner();
+            let (m, nu, ng) = update(dir.mode(), u, g)?;
+            if let Some(perm) = m {
+                dir.set_mode(perm);
+            }
+            dir.set_owner(nu, ng);
+            return Ok(());
+        }
+        Some(OverlayEntry::Symlink(_)) => {
+            let (m, _, _) = update(0o120777, 0, 0)?;
+            return if m.is_some() { Err(-95) } else { Ok(()) };
+        }
+        Some(OverlayEntry::Whiteout) => return Err(-2),
+        None => {}
+    }
+    if let Some(fs) = EXT4.as_ref() {
+        let inode = lower_inode(name).ok_or(-2isize)?;
+        let (m, nu, ng) = update(inode.mode, inode.uid, inode.gid)?;
+        if inode.is_file() {
+            let data = overlay_create(
+                name,
+                Some(ext4::Ext4File::new(Arc::clone(fs), inode.clone())),
+                inode.mode & 0o7777,
+            )?;
+            let mut d = data.exclusive_access();
+            if let Some(perm) = m {
+                d.mode = (d.mode & !0o7777) | (perm & 0o7777);
+            }
+            if let Some(u) = nu {
+                d.uid = u;
+            }
+            if let Some(g) = ng {
+                d.gid = g;
+            }
+            if nu.is_some() || ng.is_some() {
+                d.mode &= !0o6000;
+            }
+            return Ok(());
+        }
+        if inode.is_symlink() && m.is_some() {
+            return Err(-95);
+        }
+        return Ok(());
+    }
+    let _ = open_file(name, OpenFlags::RDONLY).ok_or(-2isize)?;
+    let _ = update(0o100755, 0, 0)?;
+    Ok(())
 }

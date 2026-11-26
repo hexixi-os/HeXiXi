@@ -98,8 +98,41 @@ impl File for DirectoryFile {
 
     fn mode(&self) -> u16 {
         match &self.location.identity {
-            DirectoryIdentity::Upper(dir) => dir.mode,
+            DirectoryIdentity::Upper(dir) => dir.mode(),
             _ => 0o40755,
+        }
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        match &self.location.identity {
+            DirectoryIdentity::Upper(dir) => dir.owner(),
+            _ => (0, 0),
+        }
+    }
+
+    fn set_mode(&self, perm: u16) -> isize {
+        match &self.location.identity {
+            DirectoryIdentity::Upper(dir) => {
+                dir.set_mode(perm);
+                0
+            }
+            DirectoryIdentity::Persistent(fs, _) => {
+                if fs.readonly() { -30 } else { 0 }
+            }
+            _ => -30,
+        }
+    }
+
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> isize {
+        match &self.location.identity {
+            DirectoryIdentity::Upper(dir) => {
+                dir.set_owner(uid, gid);
+                0
+            }
+            DirectoryIdentity::Persistent(fs, _) => {
+                if fs.readonly() { -30 } else { 0 }
+            }
+            _ => -30,
         }
     }
 
@@ -137,5 +170,10 @@ impl File for DirectoryFile {
         }
         self.set_position(position as usize);
         position
+    }
+
+    fn seek(&self, delta: isize) -> isize {
+        let cur = self.position() as isize;
+        cur.checked_add(delta).map_or(-75, |pos| self.seek_to(pos))
     }
 }

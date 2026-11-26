@@ -129,6 +129,9 @@ fn on_any_socket<T>(
     action: impl FnOnce(AnySocket<'_>) -> Result<T, isize>,
 ) -> Result<T, isize> {
     let file = file_by_fd(fd)?;
+    if file.path_only() {
+        return Err(-9); // EBADF
+    }
     if file.socket().is_none() && file.unix_socket().is_none() {
         return Err(-88); // ENOTSOCK
     }
@@ -250,7 +253,7 @@ pub(super) fn accept([fd, address, len, flags, ..]: [usize; 6]) -> isize {
     let has_slot = || {
         let process = current_process();
         let inner = process.inner_exclusive_access();
-        inner.fd_table.iter().any(Option::is_none) || inner.fd_table.len() < inner.nofile_limit
+        inner.available_fd_from(0).is_some()
     };
     let result = on_any_socket(fd, |socket| match socket {
         AnySocket::Inet(s) => {

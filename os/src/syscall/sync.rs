@@ -162,7 +162,7 @@ fn sleep_until_ms(expire_ms: usize, rem: usize) -> isize {
 /// Linux nanosleep(101)：参数是 struct timespec { i64 sec; i64 nsec; }
 /// 兼容旧写法：参数很小（< 4096）时按毫秒处理
 pub fn sys_nanosleep(req: usize, rem: usize) -> isize {
-    if req < 4096 {
+    if (1..4096).contains(&req) {
         sys_sleep(req);
         return 0;
     }

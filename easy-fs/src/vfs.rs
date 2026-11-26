@@ -121,13 +121,13 @@ impl Inode {
     }
 
     pub fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
-        match self.try_write_at(offset, buf) {
-            Ok(written) => {
-                block_cache_sync_device(&self.fs.lock().block_device);
-                written
-            }
-            Err(_) => 0,
-        }
+        self.try_write_at_sync(offset, buf).unwrap_or(0)
+    }
+
+    pub fn try_write_at_sync(&self, offset: usize, buf: &[u8]) -> Result<usize, FsError> {
+        let written = self.try_write_at(offset, buf)?;
+        block_cache_sync_device(&self.fs.lock().block_device);
+        Ok(written)
     }
 
     pub fn resize(&self, size: usize) -> Result<(), FsError> {

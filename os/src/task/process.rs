@@ -13,6 +13,16 @@ use alloc::vec::Vec;
 use alloc::collections::BTreeSet;
 use core::cell::RefMut;
 
+pub(crate) const RLIMIT_NOFILE: usize = 7;
+pub(crate) const MAX_OPEN_FILES: usize = 1_048_576;
+const DEFAULT_LIMITS: [[usize; 2]; 16] = {
+    let mut limits = [[usize::MAX; 2]; 16];
+    limits[3] = [8 * 1024 * 1024; 2]; // RLIMIT_STACK
+    limits[4] = [8 * 1024 * 1024; 2]; // RLIMIT_CORE
+    limits[RLIMIT_NOFILE] = [1024; 2];
+    limits
+};
+
 pub struct ProcessControlBlock {
     // immutable
     pub pid: Arc<PidHandle>,
@@ -36,6 +46,15 @@ pub struct ProcessControlBlockInner {
     pub(crate) job_stopped: bool,
     pub(crate) job_wait_status: Option<i32>,
     pub(crate) umask: u32,
+    pub(crate) uid: u32,
+    pub(crate) euid: u32,
+    pub(crate) suid: u32,
+    pub(crate) fsuid: u32,
+    pub(crate) gid: u32,
+    pub(crate) egid: u32,
+    pub(crate) sgid: u32,
+    pub(crate) fsgid: u32,
+    pub(crate) groups: Vec<u32>,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     pub close_on_exec: BTreeSet<usize>,
     pub signals: SignalFlags,
@@ -54,16 +73,18 @@ pub struct ProcessControlBlockInner {
     pub brk: usize,
     /// mmap 分配起点（向上增长）
     pub mmap_top: usize,
-    /// SIGALRM 到期时间（ms，0 表示未设置）
-    pub alarm_deadline: usize,
+    /// Interval timers (ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF): [interval_us, deadline_us]
+    pub(crate) itimers: [[u64; 2]; 3],
+    /// RLIMIT_CPU soft/hard deadlines in us (0 = unarmed)
+    pub(crate) cpu_soft_deadline_us: u64,
+    pub(crate) cpu_hard_deadline_us: u64,
     /// 每个信号号的用户 handler（0 = SIG_DFL，1 = SIG_IGN）
     pub signal_actions: [crate::syscall::signal::SignalAction; 64],
     /// 待投递信号位图（bit = signo）
     pub signal_pending: u64,
     pub(crate) signal_info: crate::syscall::signal::PendingInfo,
     pub legacy_thread_exit: bool,
-    /// RLIMIT_NOFILE 的当前上限（fd 表硬上限；setrlimit/prlimit64 会改）
-    pub nofile_limit: usize,
+    pub(crate) resource_limits: [[usize; 2]; 16],
     #[cfg(feature = "elf_startup_stats")]
     pub(crate) pending_exec: Option<crate::exec_stats::PendingExec>,
 }
@@ -81,16 +102,36 @@ impl ProcessControlBlockInner {
         self.memory_set.token()
     }
 
-    /// 分配一个 fd；已到 RLIMIT_NOFILE 上限时返回 None（调用方返回 EMFILE）
+    pub fn nofile_limit(&self) -> usize {
+        self.resource_limits[RLIMIT_NOFILE][0]
+    }
+
+    pub fn available_fd_from(&self, minimum: usize) -> Option<usize> {
+        let limit = self.nofile_limit();
+        let occupied = self.fd_table.len().min(limit);
+        (minimum..occupied).find(|&fd| self.fd_table[fd].is_none())
+            .or_else(|| {
+                let fd = minimum.max(occupied);
+                (fd < limit).then_some(fd)
+            })
+    }
+
     pub fn alloc_fd(&mut self) -> Option<usize> {
-        if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
-            Some(fd)
-        } else if self.fd_table.len() < self.nofile_limit {
-            self.fd_table.push(None);
-            Some(self.fd_table.len() - 1)
-        } else {
-            None
+        self.alloc_fd_from(0)
+    }
+
+    pub fn alloc_fd_from(&mut self, minimum: usize) -> Option<usize> {
+        let fd = self.available_fd_from(minimum)?;
+        self.ensure_fd_slot(fd).ok()?;
+        Some(fd)
+    }
+
+    pub fn ensure_fd_slot(&mut self, fd: usize) -> Result<(), isize> {
+        if fd >= self.fd_table.len() {
+            self.fd_table.try_reserve(fd + 1 - self.fd_table.len()).map_err(|_| -12isize)?;
+            self.fd_table.resize(fd + 1, None);
         }
+        Ok(())
     }
 
     pub fn alloc_tid(&mut self) -> usize {
@@ -169,6 +210,15 @@ impl ProcessControlBlock {
                     job_stopped: false,
                     job_wait_status: None,
                     umask: 0o022,
+                    uid: 0,
+                    euid: 0,
+                    suid: 0,
+                    fsuid: 0,
+                    gid: 0,
+                    egid: 0,
+                    sgid: 0,
+                    fsgid: 0,
+                    groups: Vec::new(),
                     fd_table: vec![
                         // 0 -> stdin
                         Some(Arc::new(Stdin)),
@@ -190,12 +240,14 @@ impl ProcessControlBlock {
                     brk_base: 0,
                     brk: 0,
                     mmap_top: 0x1000_0000,
-                    alarm_deadline: 0,
+                    itimers: [[0; 2]; 3],
+                    cpu_soft_deadline_us: 0,
+                    cpu_hard_deadline_us: 0,
                     signal_actions: [Default::default(); 64],
                     signal_pending: 0,
                     signal_info: Default::default(),
                     legacy_thread_exit: true,
-                    nofile_limit: 1024,
+                    resource_limits: DEFAULT_LIMITS,
                     #[cfg(feature = "elf_startup_stats")]
                     pending_exec: None,
                 })
@@ -313,15 +365,20 @@ impl ProcessControlBlock {
         let task = self.inner_exclusive_access().get_task(0);
         let mut task_inner = task.inner_exclusive_access();
         task_inner.clear_child_tid = 0;
+        task_inner.robust_list = 0;
         task_inner.alt_stack = Default::default();
         task_inner.res.as_mut().unwrap().ustack_base = elf.stack_base;
         task_inner.res.as_mut().unwrap().alloc_user_res();
         task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
-        {
+        let (uid, euid, gid, egid) = {
             let mut pinner = self.inner_exclusive_access();
             pinner.brk_base = heap_base;
             pinner.brk = heap_base;
             pinner.mmap_top = 0x1000_0000;
+            pinner.suid = pinner.euid;
+            pinner.sgid = pinner.egid;
+            pinner.fsuid = pinner.euid;
+            pinner.fsgid = pinner.egid;
             pinner.executable = Some(String::from(path));
             pinner.cmdline = Some(args.iter().flat_map(|arg| arg.iter().copied().chain(core::iter::once(0)))
                 .take(PAGE_SIZE).collect::<Vec<_>>().into());
@@ -335,7 +392,8 @@ impl ProcessControlBlock {
                     *action = Default::default();
                 }
             }
-        }
+            (pinner.uid, pinner.euid, pinner.gid, pinner.egid)
+        };
         // ---- 构造 Linux 进程启动栈 ----
         // 低地址 -> 高地址：argc | argv[..] | NULL | envp[..] | NULL | auxv | 字符串/程序头/随机数
         let mut sp = task_inner.res.as_mut().unwrap().ustack_top();
@@ -402,10 +460,10 @@ impl ProcessControlBlock {
             (6, PAGE_SIZE),
             (7, elf.interpreter_base),
             (9, elf.entry),
-            (11, 0),
-            (12, 0),
-            (13, 0),
-            (14, 0),
+            (11, uid as usize),
+            (12, euid as usize),
+            (13, gid as usize),
+            (14, egid as usize),
             (23, 0),
             (25, random_addr),
             (31, execfn_addr),
@@ -458,19 +516,12 @@ impl ProcessControlBlock {
         {
             return Err(-11); // EAGAIN
         }
+        let mut new_fd_table = Vec::new();
+        new_fd_table.try_reserve_exact(parent.fd_table.len()).map_err(|_| -12isize)?;
+        new_fd_table.extend(parent.fd_table.iter().cloned());
         let kstack = try_kstack_alloc().ok_or(-12isize)?;
         let memory_set = parent.memory_set.fork()?;
-        // alloc a pid
         let pid = Arc::new(pid_alloc());
-        // copy fd table
-        let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
-        for fd in parent.fd_table.iter() {
-            if let Some(file) = fd {
-                new_fd_table.push(Some(file.clone()));
-            } else {
-                new_fd_table.push(None);
-            }
-        }
         // create child process pcb
         let child = Arc::new(Self {
             pid,
@@ -490,6 +541,15 @@ impl ProcessControlBlock {
                     job_stopped: false,
                     job_wait_status: None,
                     umask: parent.umask,
+                    uid: parent.uid,
+                    euid: parent.euid,
+                    suid: parent.suid,
+                    fsuid: parent.fsuid,
+                    gid: parent.gid,
+                    egid: parent.egid,
+                    sgid: parent.sgid,
+                    fsgid: parent.fsgid,
+                    groups: parent.groups.clone(),
                     fd_table: new_fd_table,
                     close_on_exec: parent.close_on_exec.clone(),
                     signals: SignalFlags::empty(),
@@ -504,24 +564,29 @@ impl ProcessControlBlock {
                     brk_base: 0,
                     brk: 0,
                     mmap_top: 0x1000_0000,
-                    alarm_deadline: 0,
+                    itimers: [[0; 2]; 3],
+                    cpu_soft_deadline_us: 0,
+                    cpu_hard_deadline_us: 0,
                     signal_actions: parent.signal_actions,
                     signal_pending: 0,
                     signal_info: Default::default(),
                     legacy_thread_exit: parent.legacy_thread_exit,
-                    nofile_limit: 1024,
+                    resource_limits: parent.resource_limits,
                     #[cfg(feature = "elf_startup_stats")]
                     pending_exec: None,
                 })
             },
         });
         // 子进程继承父进程的工作目录与堆/mmap 指针
+        let parent_cpu_limit = parent.resource_limits[0];
         {
             let mut ci = child.inner_exclusive_access();
             ci.brk_base = parent.brk_base;
             ci.brk = parent.brk;
             ci.mmap_top = parent.mmap_top;
-            ci.nofile_limit = parent.nofile_limit;
+        }
+        if parent_cpu_limit != [usize::MAX; 2] {
+            crate::syscall::signal::arm_cpu_limit(&child, parent_cpu_limit[0], parent_cpu_limit[1]);
         }
         // add child
         parent.children.push(Arc::clone(&child));

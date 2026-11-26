@@ -8,7 +8,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 
 pub(super) type OverlayData = Arc<UPSafeCell<OverlayContents>>;
@@ -32,8 +32,19 @@ fn next_device() -> u64 {
     NEXT_DEVICE.fetch_add(1, Ordering::Relaxed) << 32
 }
 
+fn current_fsuid_fsgid() -> (u32, u32) {
+    crate::task::current_task()
+        .and_then(|t| t.process.upgrade())
+        .map_or((0, 0), |p| {
+            let inner = p.inner_exclusive_access();
+            (inner.fsuid, inner.fsgid)
+        })
+}
+
 pub(super) struct OverlayDirectory {
-    pub(super) mode: u16,
+    mode: AtomicU16,
+    uid: AtomicU32,
+    gid: AtomicU32,
     dev: u64,
     mount_prefix: String,
     mounted: Arc<AtomicBool>,
@@ -44,6 +55,27 @@ pub(super) struct OverlayDirectory {
 }
 
 impl OverlayDirectory {
+    pub(super) fn mode(&self) -> u16 {
+        self.mode.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn owner(&self) -> (u32, u32) {
+        (self.uid.load(Ordering::Relaxed), self.gid.load(Ordering::Relaxed))
+    }
+
+    pub(super) fn set_mode(&self, perm: u16) {
+        self.mode.store(0o40000 | (perm & 0o7777), Ordering::Relaxed);
+    }
+
+    pub(super) fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) {
+        if let Some(u) = uid {
+            self.uid.store(u, Ordering::Relaxed);
+        }
+        if let Some(g) = gid {
+            self.gid.store(g, Ordering::Relaxed);
+        }
+    }
+
     pub(super) fn full_path(&self) -> String {
         let rel = self.path.exclusive_access();
         if self.mount_prefix.is_empty() {
@@ -209,7 +241,9 @@ impl MemFs {
     fn new_root_overlay() -> Self {
         let mounted = Arc::new(AtomicBool::new(true));
         let root = Arc::new(OverlayDirectory {
-            mode: 0o40755,
+            mode: AtomicU16::new(0o40755),
+            uid: AtomicU32::new(0),
+            gid: AtomicU32::new(0),
             dev: OVERLAY_DEVICE,
             mount_prefix: String::new(),
             mounted: Arc::clone(&mounted),
@@ -232,8 +266,12 @@ impl MemFs {
         let charge = InodeCharge::new()?;
         let dev = next_device();
         let mounted = Arc::new(AtomicBool::new(true));
+        let root_mode = if magic == 0x0102_1994 { 0o41777 } else { 0o40755 };
+        let (fsuid, fsgid) = current_fsuid_fsgid();
         let root = Arc::new(OverlayDirectory {
-            mode: 0o40755,
+            mode: AtomicU16::new(root_mode),
+            uid: AtomicU32::new(fsuid),
+            gid: AtomicU32::new(fsgid),
             dev,
             mount_prefix: String::from(mount_prefix),
             mounted: Arc::clone(&mounted),
@@ -296,10 +334,13 @@ impl MemFs {
     }
 
     pub(super) fn mkdir(&self, name: &str, permissions: u16) -> Result<(), isize> {
+        let (fsuid, fsgid) = current_fsuid_fsgid();
         let mut entries = self.entries.exclusive_access();
         entries.check_insert(name)?;
         let directory = Arc::new(OverlayDirectory {
-            mode: 0o40000 | permissions,
+            mode: AtomicU16::new(0o40000 | permissions),
+            uid: AtomicU32::new(fsuid),
+            gid: AtomicU32::new(fsgid),
             dev: self.dev,
             mount_prefix: self.mount_prefix.clone(),
             mounted: Arc::clone(&self.mounted),
@@ -448,9 +489,15 @@ fn new_file_with_dev(
 ) -> Result<OverlayData, isize> {
     let charge = InodeCharge::new()?;
     let len = lower.as_ref().map_or(0, Ext4File::len);
+    let (uid, gid) = match lower.as_ref() {
+        Some(f) => f.owner(),
+        None => current_fsuid_fsgid(),
+    };
     Ok(Arc::new(unsafe {
         UPSafeCell::new(OverlayContents {
             mode: 0o100000 | permissions,
+            uid,
+            gid,
             dev,
             ino: next_inode(),
             linked,
@@ -513,7 +560,9 @@ pub(super) fn overlay_children(directory: &str) -> BTreeMap<String, OverlayEntry
 
 /// The in-memory file owns its pages. MAP_SHARED takes another reference to the same frames.
 pub(super) struct OverlayContents {
-    mode: u16,
+    pub(super) mode: u16,
+    pub(super) uid: u32,
+    pub(super) gid: u32,
     dev: u64,
     ino: u32,
     linked: bool,
@@ -703,11 +752,116 @@ impl OverlayFile {
             flags,
         }
     }
+
+    fn read_buffer(&self, start: usize, buf: UserBuffer) -> usize {
+        let data = self.data.exclusive_access();
+        let mut offset = start;
+        let mut scratch = Vec::new();
+        for chunk in buf.buffers {
+            let n = unsafe {
+                data.contents.copy_out(
+                    offset,
+                    chunk.as_mut_ptr(),
+                    chunk.len(),
+                    Some(&mut scratch),
+                )
+            };
+            offset += n;
+            if n < chunk.len() {
+                break;
+            }
+        }
+        offset - start
+    }
+
+    fn write_buffer(&self, start: usize, buf: UserBuffer) -> Result<(usize, usize), isize> {
+        const EFBIG: isize = -27;
+        const ENOSPC: isize = -28;
+
+        let mut data = self.data.exclusive_access();
+        let data = &mut data.contents;
+        let mut position = if self.flags.contains(OpenFlags::APPEND) {
+            data.len
+        } else {
+            start
+        };
+        let first = position;
+        for chunk in buf.buffers {
+            let len = chunk.len();
+            if len == 0 {
+                continue;
+            }
+            let count = len.min((isize::MAX as usize).saturating_sub(position));
+            if count == 0 {
+                if position == first {
+                    return Err(EFBIG);
+                }
+                break;
+            }
+            let n = unsafe { data.copy_in(position, chunk.as_ptr(), count) };
+            if n == 0 && position == first {
+                return Err(ENOSPC);
+            }
+            position += n;
+            if n < len {
+                break;
+            }
+        }
+        Ok((position, position - first))
+    }
 }
 
 impl File for OverlayFile {
     fn mode(&self) -> u16 {
         self.data.exclusive_access().mode
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        let d = self.data.exclusive_access();
+        (d.uid, d.gid)
+    }
+
+    fn set_mode(&self, perm: u16) -> isize {
+        let mut d = self.data.exclusive_access();
+        d.mode = (d.mode & !0o7777) | (perm & 0o7777);
+        0
+    }
+
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> isize {
+        let mut d = self.data.exclusive_access();
+        if let Some(u) = uid {
+            d.uid = u;
+        }
+        if let Some(g) = gid {
+            d.gid = g;
+        }
+        if uid.is_some() || gid.is_some() {
+            d.mode &= !0o6000;
+        }
+        0
+    }
+
+    fn punch_hole(&self, offset: usize, len: usize) -> isize {
+        if !self.writable() {
+            return -9;
+        }
+        let mut d = self.data.exclusive_access();
+        let file_len = d.contents.len;
+        if offset >= file_len || len == 0 {
+            return 0;
+        }
+        let end = offset.saturating_add(len).min(file_len);
+        let zeros = [0u8; 256];
+        let mut pos = offset;
+        while pos < end {
+            let chunk = (end - pos).min(zeros.len());
+            let n = unsafe { d.contents.copy_in(pos, zeros.as_ptr(), chunk) };
+            if n == 0 {
+                return -28;
+            }
+            pos += n;
+        }
+        0
     }
 
     fn readable(&self) -> bool {
@@ -727,66 +881,35 @@ impl File for OverlayFile {
     }
 
     fn read(&self, buf: UserBuffer) -> usize {
-        let data = self.data.exclusive_access();
         let mut offset = self.offset.exclusive_access();
-        let start = *offset;
-        let mut scratch = Vec::new();
-        for chunk in buf.buffers {
-            let n = unsafe {
-                data.contents.copy_out(
-                    *offset,
-                    chunk.as_mut_ptr(),
-                    chunk.len(),
-                    Some(&mut scratch),
-                )
-            };
-            *offset += n;
-            if n < chunk.len() {
-                break;
-            }
-        }
-        *offset - start
+        let count = self.read_buffer(*offset, buf);
+        *offset += count;
+        count
     }
 
     fn write(&self, buf: UserBuffer) -> isize {
-        const EFBIG: isize = -27;
-        const ENOSPC: isize = -28;
-
-        let mut data = self.data.exclusive_access();
-        let data = &mut data.contents;
         let mut offset = self.offset.exclusive_access();
-        let start = *offset;
-        let mut position = if self.flags.contains(OpenFlags::APPEND) {
-            data.len
-        } else {
-            start
-        };
-        let first = position;
-        for chunk in buf.buffers {
-            let len = chunk.len();
-            if len == 0 {
-                continue;
-            }
-            let count = len.min((isize::MAX as usize).saturating_sub(position));
-            if count == 0 {
-                if position == first {
-                    return EFBIG;
+        match self.write_buffer(*offset, buf) {
+            Ok((end, count)) => {
+                if count != 0 {
+                    *offset = end;
                 }
-                break;
+                count as isize
             }
-            let n = unsafe { data.copy_in(position, chunk.as_ptr(), count) };
-            if n == 0 && position == first {
-                return ENOSPC;
-            }
-            position += n;
-            if n < len {
-                break;
-            }
+            Err(error) => error,
         }
-        if position != first {
-            *offset = position;
-        }
-        (position - first) as isize
+    }
+
+    fn supports_positioned_io(&self) -> bool {
+        true
+    }
+
+    fn read_positioned(&self, offset: usize, buf: UserBuffer) -> isize {
+        self.read_buffer(offset, buf) as isize
+    }
+
+    fn write_positioned(&self, offset: usize, buf: UserBuffer) -> isize {
+        self.write_buffer(offset, buf).map_or_else(|error| error, |(_, count)| count as isize)
     }
 
     fn size(&self) -> usize {

@@ -117,6 +117,13 @@ mod mm {
 
 mod fs {
     pub trait File {
+        fn mode(&self) -> u16;
+        fn owner(&self) -> (u32, u32) {
+            (0, 0)
+        }
+        fn link_count(&self) -> u32 {
+            1
+        }
         fn stat_identity(&self) -> Option<(u64, u64)> {
             None
         }
@@ -124,6 +131,8 @@ mod fs {
         fn writable(&self) -> bool;
         fn read(&self, buf: crate::mm::UserBuffer) -> usize;
         fn write(&self, buf: crate::mm::UserBuffer) -> isize;
+        fn supports_positioned_io(&self) -> bool;
+        fn read_positioned(&self, offset: usize, buf: crate::mm::UserBuffer) -> isize;
         fn size(&self) -> usize;
         fn mapping_size(&self) -> Option<usize>;
         fn mapping_page(
@@ -199,6 +208,13 @@ fn check_read_ranges(file: &ext4::Ext4File, block_size: usize, expected: &[u8]) 
         data.len()
     );
     assert_eq!(&data, &expected[start..start + data.len()]);
+
+    assert!(file.supports_positioned_io());
+    assert_eq!(
+        file.read_positioned(0, mm::UserBuffer::from_slices(vec![&mut data])),
+        data.len() as isize
+    );
+    assert_eq!(&data, &expected[..data.len()]);
 
     let mut following = [0; 16];
     let pos = start + data.len();

@@ -365,14 +365,36 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
     let selector = pid as i32;
     let caller = current_process();
     let sender = caller.getpid();
+    let (caller_uid, caller_euid, caller_sid) = {
+        let inner = caller.inner_exclusive_access();
+        (inner.uid, inner.euid, inner.sid.0)
+    };
+    let can_signal = |target: &Arc<ProcessControlBlock>| -> bool {
+        if caller_euid == 0 || target.getpid() == sender {
+            return true;
+        }
+        let inner = target.inner_exclusive_access();
+        if signal == 18 && inner.sid.0 == caller_sid {
+            return true;
+        }
+        caller_uid == inner.uid
+            || caller_uid == inner.suid
+            || caller_euid == inner.uid
+            || caller_euid == inner.suid
+    };
     let send = |target: &Arc<ProcessControlBlock>| {
         if signal != 0 && !target.inner_exclusive_access().is_zombie {
-            // All tasks currently run with real and effective UID 0.
-            super::signal::send_process_signal(target, signal as usize, sender, 0);
+            super::signal::send_process_signal(target, signal as usize, sender, caller_uid);
         }
     };
     if selector > 0 {
-        return pid2process(selector as usize).map_or(-3, |target| { send(&target); 0 });
+        return pid2process(selector as usize).map_or(-3, |target| {
+            if !can_signal(&target) {
+                return -1;
+            }
+            send(&target);
+            0
+        });
     }
     let group = if selector == 0 {
         caller.inner_exclusive_access().pgid.0
@@ -380,6 +402,7 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
         selector.unsigned_abs() as usize
     };
     let mut found = false;
+    let mut permitted = false;
     for target in process_ids().into_iter().filter_map(pid2process) {
         if selector == -1 {
             if target.getpid() == crate::task::IDLE_PID || target.getpid() == sender {
@@ -389,9 +412,12 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
             continue;
         }
         found = true;
-        send(&target);
+        if can_signal(&target) {
+            permitted = true;
+            send(&target);
+        }
     }
-    if found { 0 } else { -3 }
+    if !found { -3 } else if !permitted { -1 } else { 0 }
 }
 
 pub fn sys_exit_group(exit_code: i32) -> ! {
@@ -577,6 +603,84 @@ pub fn sys_munmap(addr: usize, len: usize) -> isize {
     }
 }
 
+pub fn sys_mremap(
+    old_addr: usize,
+    old_size: usize,
+    new_size: usize,
+    flags: usize,
+    new_addr: usize,
+) -> isize {
+    const MREMAP_MAYMOVE: usize = 1;
+    const MREMAP_FIXED: usize = 2;
+    const MMAP_BASE: usize = 0x1000_0000;
+
+    if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED) != 0
+        || (flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0)
+        || old_addr % PAGE_SIZE != 0
+        || old_addr == 0
+    {
+        return -22;
+    }
+    let Some(aligned_new) = round_mapping_size(new_size) else {
+        return -22;
+    };
+    if aligned_new > USER_END {
+        return -12;
+    }
+    let aligned_old = if old_size == 0 {
+        0
+    } else {
+        match round_mapping_size(old_size) {
+            Some(size) => size,
+            None => return -22,
+        }
+    };
+    let Some(old_end) = old_addr.checked_add(aligned_old) else {
+        return -22;
+    };
+    if old_end > USER_END {
+        return -22;
+    }
+    let old_range = VirtPageNum(old_addr / PAGE_SIZE)..VirtPageNum(old_end / PAGE_SIZE);
+    let new_pages = aligned_new / PAGE_SIZE;
+
+    let fixed_dest = if flags & MREMAP_FIXED != 0 {
+        let Some(new_end) = new_addr.checked_add(aligned_new) else {
+            return -22;
+        };
+        if new_addr % PAGE_SIZE != 0
+            || new_addr < PAGE_SIZE
+            || new_end > USER_END
+            || (old_addr < new_end && new_addr < old_end.max(old_addr + PAGE_SIZE))
+        {
+            return -22;
+        }
+        Some(VirtPageNum(new_addr / PAGE_SIZE))
+    } else {
+        None
+    };
+
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let mmap_base = VirtPageNum(MMAP_BASE / PAGE_SIZE);
+    match inner.memory_set.mremap(
+        old_range,
+        new_pages,
+        fixed_dest,
+        flags & MREMAP_MAYMOVE != 0,
+        mmap_base,
+    ) {
+        Ok(start) => {
+            let end_va = (start.0 + new_pages) * PAGE_SIZE;
+            if end_va > inner.mmap_top {
+                inner.mmap_top = end_va;
+            }
+            (start.0 * PAGE_SIZE) as isize
+        }
+        Err(errno) => errno,
+    }
+}
+
 pub fn sys_msync(addr: usize, len: usize, flags: usize) -> isize {
     const MS_ASYNC: usize = 1;
     const MS_INVALIDATE: usize = 2;
@@ -670,7 +774,7 @@ pub fn sys_pselect6(
     timeout: *const u8,
     sigmask_arg: usize,
 ) -> isize {
-    let limit = current_process().inner_exclusive_access().nofile_limit;
+    let limit = current_process().inner_exclusive_access().nofile_limit();
     if nfds > limit {
         return -22;
     }
@@ -860,31 +964,6 @@ pub fn sys_rt_sigtimedwait(set: *const u8, info: *mut u8, timeout: *const u8, si
     }
 }
 
-/// 当前进程对某个 resource 的 (rlim_cur, rlim_max)
-fn current_rlimit(resource: usize) -> (usize, usize) {
-    match resource {
-        3 => (8 * 1024 * 1024, 8 * 1024 * 1024), // RLIMIT_STACK
-        4 => (8 * 1024 * 1024, 8 * 1024 * 1024), // RLIMIT_CORE
-        7 => {
-            // RLIMIT_NOFILE：真正生效，限制 fd 表长度
-            let limit = current_process().inner_exclusive_access().nofile_limit;
-            (limit, limit)
-        }
-        _ => (usize::MAX, usize::MAX),
-    }
-}
-
-fn write_rlimit(token: usize, ptr: *mut u8, cur: usize, max: usize) {
-    write_user(token, ptr as *mut usize, cur);
-    write_user(token, (ptr as usize + 8) as *mut usize, max);
-}
-
-/// 应用一个 RLIMIT_NOFILE 设置（夹到 [16, 65536]，避免把 busybox 之类直接卡死）
-fn apply_nofile(cur: usize) {
-    let v = cur.clamp(16, 65536);
-    current_process().inner_exclusive_access().nofile_limit = v;
-}
-
 /// 把 Linux 的 prot 位翻译成 MapPermission
 fn prot_to_perm(prot: usize) -> Option<MapPermission> {
     if prot & !7 != 0 {
@@ -923,42 +1002,396 @@ pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     result.err().unwrap_or(0)
 }
 
-/// getrlimit(163)
-pub fn sys_getrlimit(resource: usize, ptr: *mut u8) -> isize {
-    if ptr.is_null() {
+pub fn sys_madvise(addr: usize, len: usize, advice: usize) -> isize {
+    if addr % PAGE_SIZE != 0 {
+        return -22;
+    }
+    if !matches!(advice, 0..=4 | 8..=11 | 14..=21) {
+        return -22;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(range) = round_mapping_size(len).and_then(|size| page_range(addr, size)) else {
+        return -22;
+    };
+    let process = current_process();
+    let result = process.inner_exclusive_access().memory_set.madvise(range, advice);
+    result.err().unwrap_or(0)
+}
+
+pub fn sys_capget(hdrp: *mut u32, datap: *mut u32) -> isize {
+    const CAP_V1: u32 = 0x1998_0330;
+    const CAP_V2: u32 = 0x2007_1026;
+    const CAP_V3: u32 = 0x2008_0522;
+    if hdrp.is_null() {
         return -14;
     }
     let token = current_user_token();
-    let (cur, max) = current_rlimit(resource);
-    write_rlimit(token, ptr, cur, max);
-    0
-}
-
-/// setrlimit(164)：目前只真正实现 RLIMIT_NOFILE，其它 resource 接受即成功
-pub fn sys_setrlimit(resource: usize, ptr: *const u8) -> isize {
-    if ptr.is_null() {
+    let Some(version) = try_read_user(token, hdrp as *const u32) else {
         return -14;
+    };
+    let Some(pid_ptr) = (hdrp as usize).checked_add(4) else {
+        return -14;
+    };
+    let Some(pid) = try_read_user(token, pid_ptr as *const i32) else {
+        return -14;
+    };
+    let words = match version {
+        CAP_V1 => 1usize,
+        CAP_V2 | CAP_V3 => 2usize,
+        _ => {
+            if try_write_user(token, hdrp, CAP_V3).is_none() {
+                return -14;
+            }
+            return if datap.is_null() { 0 } else { -22 };
+        }
+    };
+    if pid < 0 {
+        return -22;
     }
-    let token = current_user_token();
-    let cur = read_user(token, ptr as *const usize) as usize;
-    if resource == 7 {
-        apply_nofile(cur);
+    let euid = if pid == 0 {
+        current_process().inner_exclusive_access().euid
+    } else {
+        let Some(target) = pid2process(pid as usize).or_else(|| {
+            crate::task::tid2task(pid as usize).and_then(|t| t.process.upgrade())
+        }) else {
+            return -3;
+        };
+        let inner = target.inner_exclusive_access();
+        if inner.is_zombie {
+            return -3;
+        }
+        inner.euid
+    };
+    if datap.is_null() {
+        return 0;
     }
-    0
-}
-
-/// prlimit64(261)：new != NULL 时应用，old != NULL 时回填
-pub fn sys_prlimit64(_pid: usize, resource: usize, new: *const u8, old: *mut u8) -> isize {
-    let token = current_user_token();
-    if !new.is_null() {
-        let cur = read_user(token, new as *const usize) as usize;
-        if resource == 7 {
-            apply_nofile(cur);
+    let mask = if euid == 0 { u32::MAX } else { 0 };
+    for w in 0..words {
+        for (slot, val) in [(0usize, mask), (1, mask), (2, 0u32)] {
+            let Some(off) = (datap as usize).checked_add((w * 3 + slot) * 4) else {
+                return -14;
+            };
+            if try_write_user(token, off as *mut u32, val).is_none() {
+                return -14;
+            }
         }
     }
-    if !old.is_null() {
-        let (cur, max) = current_rlimit(resource);
-        write_rlimit(token, old, cur, max);
+    0
+}
+
+pub fn sys_getrlimit(resource: usize, ptr: *mut u8) -> isize {
+    update_rlimit(0, resource, None, Some(ptr)).err().unwrap_or(0)
+}
+
+pub fn sys_setrlimit(resource: usize, ptr: *const u8) -> isize {
+    update_rlimit(0, resource, Some(ptr), None).err().unwrap_or(0)
+}
+
+pub fn sys_prlimit64(pid: i32, resource: usize, new: *const u8, old: *mut u8) -> isize {
+    update_rlimit(pid, resource, (!new.is_null()).then_some(new), (!old.is_null()).then_some(old))
+        .err().unwrap_or(0)
+}
+
+fn update_rlimit(
+    pid: i32,
+    resource: usize,
+    new: Option<*const u8>,
+    old: Option<*mut u8>,
+) -> Result<(), isize> {
+    use crate::task::{MAX_OPEN_FILES, RLIMIT_NOFILE};
+
+    let token = current_user_token();
+    let new_limit = if let Some(ptr) = new {
+        let buffers = translated_byte_buffer(token, ptr, 16, MapPermission::R).ok_or(-14isize)?;
+        let mut values = [[0; 8]; 2];
+        for (dst, src) in values.iter_mut().flatten().zip(UserBuffer::new(buffers)) {
+            *dst = src.read();
+        }
+        Some(values.map(usize::from_ne_bytes))
+    } else {
+        None
+    };
+    let process = process_by_pid_or_self(pid).or_else(|| {
+        let task = crate::task::tid2task(pid as usize)?;
+        if task.inner_exclusive_access().exit_code.is_some() {
+            return None;
+        }
+        task.process.upgrade()
+    }).ok_or(-3isize)?;
+    let caller_euid = current_process().inner_exclusive_access().euid;
+    let mut arm_cpu = None;
+    let previous = {
+        let mut inner = process.inner_exclusive_access();
+        if caller_euid != 0 && process.getpid() != current_process().getpid() && caller_euid != inner.uid {
+            return Err(-1);
+        }
+        let limit = inner.resource_limits.get_mut(resource).ok_or(-22isize)?;
+        let previous = *limit;
+        if let Some(new) = new_limit {
+            if new[0] > new[1] {
+                return Err(-22);
+            }
+            if caller_euid != 0 && new[1] > previous[1] {
+                return Err(-1);
+            }
+            if resource == RLIMIT_NOFILE && new[1] > MAX_OPEN_FILES {
+                return Err(-1);
+            }
+            *limit = new;
+            if resource == 0 {
+                arm_cpu = Some((new[0], new[1]));
+            }
+        }
+        previous
+    };
+    if let Some((cur, max)) = arm_cpu {
+        super::signal::arm_cpu_limit(&process, cur, max);
     }
+    if let Some(ptr) = old {
+        let buffers = translated_byte_buffer(token, ptr, 16, MapPermission::W).ok_or(-14isize)?;
+        let values = previous.into_iter().flat_map(usize::to_ne_bytes);
+        for (dst, value) in UserBuffer::new(buffers).into_iter().zip(values) {
+            dst.write(value);
+        }
+    }
+    Ok(())
+}
+
+pub fn sys_getuid() -> isize { current_process().inner_exclusive_access().uid as isize }
+pub fn sys_geteuid() -> isize { current_process().inner_exclusive_access().euid as isize }
+pub fn sys_getgid() -> isize { current_process().inner_exclusive_access().gid as isize }
+pub fn sys_getegid() -> isize { current_process().inner_exclusive_access().egid as isize }
+
+pub fn sys_setuid(uid: u32) -> isize {
+    if uid == u32::MAX {
+        return -22;
+    }
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if inner.euid == 0 {
+        inner.uid = uid;
+        inner.euid = uid;
+        inner.suid = uid;
+        inner.fsuid = uid;
+        0
+    } else if uid == inner.uid || uid == inner.suid {
+        inner.euid = uid;
+        inner.fsuid = uid;
+        0
+    } else {
+        -1
+    }
+}
+
+pub fn sys_setgid(gid: u32) -> isize {
+    if gid == u32::MAX {
+        return -22;
+    }
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if inner.euid == 0 {
+        inner.gid = gid;
+        inner.egid = gid;
+        inner.sgid = gid;
+        inner.fsgid = gid;
+        0
+    } else if gid == inner.gid || gid == inner.sgid {
+        inner.egid = gid;
+        inner.fsgid = gid;
+        0
+    } else {
+        -1
+    }
+}
+
+pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if inner.euid != 0 {
+        if ruid != u32::MAX && ruid != inner.uid && ruid != inner.euid {
+            return -1;
+        }
+        if euid != u32::MAX && euid != inner.uid && euid != inner.euid && euid != inner.suid {
+            return -1;
+        }
+    }
+    let old_ruid = inner.uid;
+    let new_ruid = if ruid == u32::MAX { inner.uid } else { ruid };
+    let new_euid = if euid == u32::MAX { inner.euid } else { euid };
+    if ruid != u32::MAX || (euid != u32::MAX && euid != old_ruid) {
+        inner.suid = new_euid;
+    }
+    inner.uid = new_ruid;
+    inner.euid = new_euid;
+    inner.fsuid = new_euid;
+    0
+}
+
+pub fn sys_setregid(rgid: u32, egid: u32) -> isize {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if inner.euid != 0 {
+        if rgid != u32::MAX && rgid != inner.gid && rgid != inner.egid {
+            return -1;
+        }
+        if egid != u32::MAX && egid != inner.gid && egid != inner.egid && egid != inner.sgid {
+            return -1;
+        }
+    }
+    let old_rgid = inner.gid;
+    let new_rgid = if rgid == u32::MAX { inner.gid } else { rgid };
+    let new_egid = if egid == u32::MAX { inner.egid } else { egid };
+    if rgid != u32::MAX || (egid != u32::MAX && egid != old_rgid) {
+        inner.sgid = new_egid;
+    }
+    inner.gid = new_rgid;
+    inner.egid = new_egid;
+    inner.fsgid = new_egid;
+    0
+}
+
+pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> isize {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if inner.euid != 0 {
+        let allowed = [inner.uid, inner.euid, inner.suid];
+        for candidate in [ruid, euid, suid] {
+            if candidate != u32::MAX && !allowed.contains(&candidate) {
+                return -1;
+            }
+        }
+    }
+    if ruid != u32::MAX { inner.uid = ruid; }
+    if euid != u32::MAX { inner.euid = euid; }
+    if suid != u32::MAX { inner.suid = suid; }
+    inner.fsuid = inner.euid;
+    0
+}
+
+pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> isize {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if inner.euid != 0 {
+        let allowed = [inner.gid, inner.egid, inner.sgid];
+        for candidate in [rgid, egid, sgid] {
+            if candidate != u32::MAX && !allowed.contains(&candidate) {
+                return -1;
+            }
+        }
+    }
+    if rgid != u32::MAX { inner.gid = rgid; }
+    if egid != u32::MAX { inner.egid = egid; }
+    if sgid != u32::MAX { inner.sgid = sgid; }
+    inner.fsgid = inner.egid;
+    0
+}
+
+pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> isize {
+    let token = current_user_token();
+    let (r, e, s) = {
+        let p = current_process();
+        let inner = p.inner_exclusive_access();
+        (inner.uid, inner.euid, inner.suid)
+    };
+    if ruid.is_null() || euid.is_null() || suid.is_null()
+        || try_write_user(token, ruid, r).is_none()
+        || try_write_user(token, euid, e).is_none()
+        || try_write_user(token, suid, s).is_none()
+    {
+        return -14;
+    }
+    0
+}
+
+pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> isize {
+    let token = current_user_token();
+    let (r, e, s) = {
+        let p = current_process();
+        let inner = p.inner_exclusive_access();
+        (inner.gid, inner.egid, inner.sgid)
+    };
+    if rgid.is_null() || egid.is_null() || sgid.is_null()
+        || try_write_user(token, rgid, r).is_none()
+        || try_write_user(token, egid, e).is_none()
+        || try_write_user(token, sgid, s).is_none()
+    {
+        return -14;
+    }
+    0
+}
+
+pub fn sys_setfsuid(uid: u32) -> isize {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let prev = inner.fsuid;
+    if uid != u32::MAX && (inner.euid == 0 || uid == inner.uid || uid == inner.euid || uid == inner.suid) {
+        inner.fsuid = uid;
+    }
+    prev as isize
+}
+
+pub fn sys_setfsgid(gid: u32) -> isize {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    let prev = inner.fsgid;
+    if gid != u32::MAX && (inner.euid == 0 || gid == inner.gid || gid == inner.egid || gid == inner.sgid) {
+        inner.fsgid = gid;
+    }
+    prev as isize
+}
+
+pub fn sys_getgroups(size: isize, list: *mut u32) -> isize {
+    if size < 0 {
+        return -22;
+    }
+    let groups = current_process().inner_exclusive_access().groups.clone();
+    if size == 0 {
+        return groups.len() as isize;
+    }
+    if (size as usize) < groups.len() {
+        return -22;
+    }
+    if groups.is_empty() {
+        return 0;
+    }
+    if list.is_null() {
+        return -14;
+    }
+    let token = current_user_token();
+    for (idx, &gid) in groups.iter().enumerate() {
+        let Some(ptr) = (list as usize).checked_add(idx * 4) else {
+            return -14;
+        };
+        if try_write_user(token, ptr as *mut u32, gid).is_none() {
+            return -14;
+        }
+    }
+    groups.len() as isize
+}
+
+pub fn sys_setgroups(size: usize, list: *const u32) -> isize {
+    if size > 65536 {
+        return -22;
+    }
+    if current_process().inner_exclusive_access().euid != 0 {
+        return -1;
+    }
+    let mut next = Vec::with_capacity(size.min(256));
+    let token = current_user_token();
+    for idx in 0..size {
+        if list.is_null() {
+            return -14;
+        }
+        let Some(ptr) = (list as usize).checked_add(idx * 4) else {
+            return -14;
+        };
+        let Some(gid) = try_read_user(token, ptr as *const u32) else {
+            return -14;
+        };
+        next.push(gid);
+    }
+    current_process().inner_exclusive_access().groups = next;
     0
 }

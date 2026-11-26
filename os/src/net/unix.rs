@@ -74,10 +74,15 @@ pub struct UnixCred {
 }
 
 fn current_cred() -> UnixCred {
+    let process = current_process();
+    let (uid, gid) = {
+        let inner = process.inner_exclusive_access();
+        (inner.euid, inner.egid)
+    };
     UnixCred {
-        pid: current_process().getpid() as i32,
-        uid: 0,
-        gid: 0,
+        pid: process.getpid() as i32,
+        uid,
+        gid,
     }
 }
 
