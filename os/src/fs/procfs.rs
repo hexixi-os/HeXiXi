@@ -319,6 +319,15 @@ pub(super) fn entries(path: &str) -> Option<Vec<(String, u32, u8)>> {
     }
     let (pid, raw_entry) = pid_path(path)?;
     let process = crate::task::pid2process(pid)?;
+    // 注意：resolve_task_entry() 内部也会调 process.inner_exclusive_access()。
+    // 如果先拿锁再调它，同一个 UPSafeCell 会被二次 borrow_mut 直接 panic
+    // （busybox 的 ps/du 遍历 /proc/<pid>/fd 时就崩在这里）。
+    // 所以必须在拿锁之前先解析完，task 分支本身不需要它。
+    let resolved_entry = if raw_entry == "task" {
+        None
+    } else {
+        resolve_task_entry(pid, raw_entry)
+    };
     let inner = process.inner_exclusive_access();
     if raw_entry == "task" {
         let mut list = alloc::vec![
@@ -333,7 +342,7 @@ pub(super) fn entries(path: &str) -> Option<Vec<(String, u32, u8)>> {
         }
         return Some(list);
     }
-    let (_, entry) = resolve_task_entry(pid, raw_entry)?;
+    let (_, entry) = resolved_entry?;
     if entry == "fd" {
         let mut list = alloc::vec![
             (String::from("."), 1400, 2),
