@@ -7,6 +7,7 @@ use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
 use alloc::sync::{Arc, Weak};
 use alloc::{borrow::Cow, string::String};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Clone)]
 pub(super) enum DirectoryIdentity {
@@ -52,6 +53,7 @@ impl DirectoryLocation {
 pub struct DirectoryFile {
     location: DirectoryLocation,
     position: UPSafeCell<usize>,
+    extra_flags: AtomicU32,
 }
 
 impl DirectoryFile {
@@ -59,6 +61,7 @@ impl DirectoryFile {
         Self {
             location: DirectoryLocation::new(path, identity),
             position: unsafe { UPSafeCell::new(0) },
+            extra_flags: AtomicU32::new(0o200000), // O_DIRECTORY
         }
     }
 
@@ -82,6 +85,59 @@ impl File for DirectoryFile {
 
     fn writable(&self) -> bool {
         false
+    }
+
+    fn status_flags(&self) -> u32 {
+        self.extra_flags.load(Ordering::Relaxed)
+    }
+
+    fn set_status_flags(&self, flags: u32) {
+        const MUTABLE: u32 = 0o2000 | 0o4000 | 0o20000 | 0o40000 | 0o1000000;
+        self.extra_flags
+            .store(0o200000 | (flags & MUTABLE), Ordering::Relaxed);
+    }
+
+    fn timestamps(&self) -> ((i64, i64), (i64, i64), (i64, i64)) {
+        match &self.location.identity {
+            DirectoryIdentity::Upper(dir) => dir.timestamps(),
+            _ => ((0, 0), (0, 0), (0, 0)),
+        }
+    }
+
+    fn set_timestamps(&self, atime: Option<(i64, i64)>, mtime: Option<(i64, i64)>) -> isize {
+        match &self.location.identity {
+            DirectoryIdentity::Upper(dir) => {
+                dir.set_timestamps(atime, mtime);
+                0
+            }
+            DirectoryIdentity::Persistent(fs, _) => {
+                if fs.readonly() { -30 } else { 0 }
+            }
+            _ => 0,
+        }
+    }
+
+    fn xattr_op(
+        &self,
+        name: &str,
+        set_val: Option<(&[u8], usize)>,
+        remove: bool,
+    ) -> Result<alloc::vec::Vec<u8>, isize> {
+        match &self.location.identity {
+            DirectoryIdentity::Upper(dir) => {
+                super::overlay::apply_xattr_map(&mut dir.xattrs.exclusive_access(), name, set_val, remove)
+            }
+            DirectoryIdentity::Lower | DirectoryIdentity::Permanent => {
+                if set_val.is_some() || remove {
+                    Err(-95)
+                } else if name.is_empty() {
+                    Ok(alloc::vec::Vec::new())
+                } else {
+                    Err(-61)
+                }
+            }
+            _ => Err(-95),
+        }
     }
 
     fn read(&self, _buf: UserBuffer) -> usize {

@@ -3,8 +3,9 @@ use super::manager::insert_into_pid2process;
 use super::{add_task, pid_alloc, PidHandle, SignalFlags, TaskControlBlock, WaitQueue};
 use crate::config::{PAGE_SIZE, USER_STACK_SIZE};
 use crate::fs::{DirectoryLocation, Executable, File, Stdin, Stdout};
-use crate::mm::{write_user, MemorySet, KERNEL_SPACE};
+use crate::mm::{write_user, MemorySet, VirtPageNum, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
+use crate::syscall::sysvipc::{shm_detach_id, ShmAttachment};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::string::String;
@@ -12,6 +13,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use alloc::collections::BTreeSet;
 use core::cell::RefMut;
+use core::ops::Range;
 
 pub(crate) const RLIMIT_NOFILE: usize = 7;
 pub(crate) const MAX_OPEN_FILES: usize = 1_048_576;
@@ -65,8 +67,20 @@ pub struct ProcessControlBlockInner {
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
     /// 当前工作目录
     pub cwd: DirectoryLocation,
+    /// chroot 根目录前缀（空串代表真实根 "/"）
+    pub root: String,
     pub executable: Option<String>,
     pub cmdline: Option<Arc<[u8]>>,
+    pub(crate) nice: i8,
+    pub(crate) sched_policy: u32,
+    pub(crate) sched_priority: i32,
+    pub(crate) pdeathsig: u8,
+    pub(crate) dumpable: u8,
+    pub(crate) keepcaps: bool,
+    pub(crate) no_new_privs: bool,
+    pub(crate) timerslack_ns: u64,
+    pub(crate) caps: [[u32; 3]; 2],
+    pub(crate) shm_attachments: Vec<ShmAttachment>,
     /// 堆起始（可增长下界）
     pub brk_base: usize,
     /// 当前 program break
@@ -90,6 +104,43 @@ pub struct ProcessControlBlockInner {
 }
 
 impl ProcessControlBlockInner {
+    pub(crate) fn unmap(&mut self, range: Range<VirtPageNum>, pid: usize) -> Result<(), isize> {
+        self.memory_set.munmap(range.clone())?;
+        self.forget_shm_range(&range, pid);
+        Ok(())
+    }
+
+    pub(crate) fn forget_shm_range(&mut self, range: &Range<VirtPageNum>, pid: usize) {
+        self.shm_attachments.retain_mut(|attachment| {
+            attachment.unmap(range);
+            if attachment.ranges.is_empty() {
+                shm_detach_id(attachment.id, pid);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    pub(crate) fn update_uids(&mut self, uid: u32, euid: u32, suid: u32) {
+        let lost_root = [self.uid, self.euid, self.suid].contains(&0)
+            && ![uid, euid, suid].contains(&0);
+        for [effective, permitted, _] in &mut self.caps {
+            if lost_root && !self.keepcaps {
+                *permitted = 0;
+                *effective = 0;
+            } else if self.euid == 0 && euid != 0 {
+                *effective = 0;
+            } else if self.euid != 0 && euid == 0 {
+                *effective = *permitted;
+            }
+        }
+        self.uid = uid;
+        self.euid = euid;
+        self.suid = suid;
+        self.fsuid = euid;
+    }
+
     pub fn set_close_on_exec(&mut self, fd: usize, close: bool) {
         if close {
             self.close_on_exec.insert(fd);
@@ -235,8 +286,19 @@ impl ProcessControlBlock {
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
                     cwd: DirectoryLocation::root(),
+                    root: String::new(),
                     executable: executable.map(String::from),
                     cmdline: None,
+                    nice: 0,
+                    sched_policy: 0,
+                    sched_priority: 0,
+                    pdeathsig: 0,
+                    dumpable: 1,
+                    keepcaps: false,
+                    no_new_privs: false,
+                    timerslack_ns: 50_000,
+                    caps: [[u32::MAX, u32::MAX, 0]; 2],
+                    shm_attachments: Vec::new(),
                     brk_base: 0,
                     brk: 0,
                     mmap_top: 0x1000_0000,
@@ -358,6 +420,10 @@ impl ProcessControlBlock {
         }
         // 信号投递用的用户页：可执行 stub + 保存的 trap context
         crate::syscall::signal::setup_signal_pages(&mut memory_set);
+        let old_attachments = core::mem::take(&mut self.inner_exclusive_access().shm_attachments);
+        for attachment in old_attachments {
+            shm_detach_id(attachment.id, self.getpid());
+        }
         // substitute memory_set
         self.inner_exclusive_access().memory_set = memory_set;
         // then we alloc user resource for main thread again
@@ -367,10 +433,17 @@ impl ProcessControlBlock {
         task_inner.clear_child_tid = 0;
         task_inner.robust_list = 0;
         task_inner.alt_stack = Default::default();
+        {
+            let short = path.rsplit('/').next().unwrap_or(path).as_bytes();
+            let mut comm = [0u8; 16];
+            let n = short.len().min(15);
+            comm[..n].copy_from_slice(&short[..n]);
+            task_inner.comm = comm;
+        }
         task_inner.res.as_mut().unwrap().ustack_base = elf.stack_base;
         task_inner.res.as_mut().unwrap().alloc_user_res();
         task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
-        let (uid, euid, gid, egid) = {
+        let (uid, euid, gid, egid, close_fds) = {
             let mut pinner = self.inner_exclusive_access();
             pinner.brk_base = heap_base;
             pinner.brk = heap_base;
@@ -379,21 +452,35 @@ impl ProcessControlBlock {
             pinner.sgid = pinner.egid;
             pinner.fsuid = pinner.euid;
             pinner.fsgid = pinner.egid;
+            pinner.dumpable = 1;
+            pinner.keepcaps = false;
+            if pinner.uid != 0 && pinner.euid != 0 {
+                for [effective, permitted, _] in &mut pinner.caps {
+                    *effective = 0;
+                    *permitted = 0;
+                }
+            }
             pinner.executable = Some(String::from(path));
             pinner.cmdline = Some(args.iter().flat_map(|arg| arg.iter().copied().chain(core::iter::once(0)))
                 .take(PAGE_SIZE).collect::<Vec<_>>().into());
             pinner.legacy_thread_exit = true;
             pinner.execed = true;
+            let mut closed = Vec::new();
             for fd in core::mem::take(&mut pinner.close_on_exec) {
-                pinner.fd_table[fd] = None;
+                if let Some(f) = pinner.fd_table[fd].take() {
+                    closed.push(f);
+                }
             }
             for action in &mut pinner.signal_actions {
                 if action.handler != 1 {
                     *action = Default::default();
                 }
             }
-            (pinner.uid, pinner.euid, pinner.gid, pinner.egid)
+            (pinner.uid, pinner.euid, pinner.gid, pinner.egid, closed)
         };
+        for f in close_fds {
+            crate::syscall::lock::on_file_closed(self.getpid(), &f);
+        }
         // ---- 构造 Linux 进程启动栈 ----
         // 低地址 -> 高地址：argc | argv[..] | NULL | envp[..] | NULL | auxv | 字符串/程序头/随机数
         let mut sp = task_inner.res.as_mut().unwrap().ustack_top();
@@ -522,6 +609,10 @@ impl ProcessControlBlock {
         let kstack = try_kstack_alloc().ok_or(-12isize)?;
         let memory_set = parent.memory_set.fork()?;
         let pid = Arc::new(pid_alloc());
+        let shm_cloned = parent.shm_attachments.clone();
+        for attachment in &shm_cloned {
+            crate::syscall::sysvipc::shm_attach_id(attachment.id);
+        }
         // create child process pcb
         let child = Arc::new(Self {
             pid,
@@ -559,8 +650,19 @@ impl ProcessControlBlock {
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
                     cwd: parent.cwd.clone(),
+                    root: parent.root.clone(),
                     executable: parent.executable.clone(),
                     cmdline: parent.cmdline.clone(),
+                    nice: parent.nice,
+                    sched_policy: parent.sched_policy,
+                    sched_priority: parent.sched_priority,
+                    pdeathsig: 0,
+                    dumpable: parent.dumpable,
+                    keepcaps: parent.keepcaps,
+                    no_new_privs: parent.no_new_privs,
+                    timerslack_ns: parent.timerslack_ns,
+                    caps: parent.caps,
+                    shm_attachments: shm_cloned,
                     brk_base: 0,
                     brk: 0,
                     mmap_top: 0x1000_0000,

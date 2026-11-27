@@ -114,8 +114,16 @@ def write_fixtures(root):
     (root / "elf-overlap-loader").write_bytes(executable(
         [load(5, 0x1000, TEXT, len(warmup), len(warmup))], [(0x1000, warmup)],
     ))
+    bundled_lib = root / "musl" / "lib"
+    bundled_lib.mkdir(parents=True, exist_ok=True)
+    loader_entry = 0x30000
+    (bundled_lib / "libc.so").write_bytes(executable(
+        [load(5, 0x1000, loader_entry, len(warmup), len(warmup))],
+        [(0x1000, warmup)], entry=loader_entry,
+    ))
     for name, interpreter in [
         ("elf-missing-pt-interp", b"/lib/missing-interpreter.so\0"),
+        ("elf-missing-musl-loader", b"/lib/ld-musl-riscv64.so.1\0"),
         ("elf-invalid-pt-interp", b"/lib/unterminated.so"),
         ("elf-non-elf-pt-interp", b"/elf-short-header\0"),
         ("elf-overlap-pt-interp", b"/elf-overlap-loader\0"),

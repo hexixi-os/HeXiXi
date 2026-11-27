@@ -7,7 +7,7 @@ extern crate user_lib;
 use core::arch::asm;
 use core::convert::TryInto;
 use core::sync::atomic::{AtomicU32, Ordering};
-use user_lib::{close, exit, fork, read, sleep, waitpid, write};
+use user_lib::{close, exit, fork, get_monotonic_ms, read, sleep, waitpid, write};
 
 const CWD: usize = (-100isize) as usize;
 const PAGE: usize = 4096;
@@ -55,6 +55,171 @@ fn syscall6(id: usize, [a0, a1, a2, a3, a4, a5]: [usize; 6]) -> isize {
 
 fn syscall(id: usize, [a, b, c, d]: [usize; 4]) -> isize {
     syscall6(id, [a, b, c, d, 0, 0])
+}
+
+fn test_capability_drop() {
+    let child = fork();
+    assert!(child >= 0);
+    if child == 0 {
+        assert_eq!(syscall(146, [65534, 0, 0, 0]), 0); // setuid
+        let mut header = [0x2008_0522_u32, 0];
+        let mut caps = [[0u32; 3]; 2];
+        assert_eq!(
+            syscall(90, [header.as_mut_ptr() as usize, caps.as_mut_ptr() as usize, 0, 0]),
+            0
+        );
+        assert!(caps.iter().all(|word| word[0] == 0 && word[1] == 0));
+        exit(0);
+    }
+    let mut status = 0;
+    assert_eq!(waitpid(child as usize, &mut status), child);
+    assert_eq!(status, 0);
+}
+
+fn test_splice_backpressure() {
+    let mut source = [0i32; 2];
+    let mut dest = [0i32; 2];
+    for pipe in [&mut source, &mut dest] {
+        assert_eq!(syscall(59, [pipe.as_mut_ptr() as usize, 0o4000, 0, 0]), 0);
+    }
+    let [source_read, source_write] = source.map(|fd| fd as usize);
+    let [dest_read, dest_write] = dest.map(|fd| fd as usize);
+    let padding = [0u8; 4096];
+    let capacity = syscall(25, [dest_write, 1032, 0, 0]) as usize;
+    assert!(capacity > 0 && capacity <= 4 * 1024 * 1024);
+    for _ in 0..capacity / padding.len() {
+        assert_eq!(write(dest_write, &padding), padding.len() as isize);
+    }
+    assert_eq!(write(source_write, b"abc"), 3);
+    assert_eq!(syscall6(76, [source_read, 0, dest_write, 0, 3, 2]), -11);
+    let mut byte = [0u8; 1];
+    assert_eq!(read(dest_read, &mut byte), 1);
+    assert_eq!(syscall6(76, [source_read, 0, dest_write, 0, 3, 2]), 1);
+    let mut remaining = [0u8; 2];
+    assert_eq!(read(source_read, &mut remaining), 2);
+    assert_eq!(&remaining, b"bc");
+    for fd in [source_read, source_write, dest_read, dest_write] {
+        assert_eq!(close(fd), 0);
+    }
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+fn expect_poll_wakeup(fd: usize) {
+    let mut watch = PollFd { fd: fd as i32, events: 1, revents: 0 };
+    let timeout = [0i64, 500_000_000];
+    let start = get_monotonic_ms();
+    assert_eq!(
+        syscall6(73, [&mut watch as *mut PollFd as usize, 1, timeout.as_ptr() as usize, 0, 0, 0]),
+        1
+    );
+    assert_eq!(watch.revents, 1);
+    assert!(get_monotonic_ms() - start < 400, "poll waited until its own timeout");
+}
+
+fn test_timerfd_poll() {
+    let fd = syscall(85, [1, 0, 0, 0]);
+    assert!(fd >= 0);
+    let timer = [0i64, 0, 0, 25_000_000];
+    assert_eq!(syscall(86, [fd as usize, 0, timer.as_ptr() as usize, 0]), 0);
+    expect_poll_wakeup(fd as usize);
+    assert_eq!(close(fd as usize), 0);
+}
+
+fn test_signalfd_poll() {
+    const SIGUSR1: usize = 10;
+    let mask = 1u64 << (SIGUSR1 - 1);
+    let mask_ptr = &mask as *const u64 as usize;
+    let mut old_mask = 0u64;
+    let old_mask_ptr = &mut old_mask as *mut u64 as usize;
+    assert_eq!(syscall(135, [0, mask_ptr, old_mask_ptr, 8]), 0);
+    let fd = syscall(74, [usize::MAX, mask_ptr, 8, 0]);
+    assert!(fd >= 0);
+    let parent = syscall(172, [0; 4]);
+    let child = fork();
+    assert!(child >= 0);
+    if child == 0 {
+        sleep(25);
+        assert_eq!(syscall(129, [parent as usize, SIGUSR1, 0, 0]), 0);
+        exit(0);
+    }
+    expect_poll_wakeup(fd as usize);
+    let mut info = [0u8; 128];
+    assert_eq!(read(fd as usize, &mut info), 128);
+    assert_eq!(u32::from_ne_bytes(info[..4].try_into().unwrap()), SIGUSR1 as u32);
+    assert_eq!(close(fd as usize), 0);
+    assert_eq!(syscall(135, [2, &old_mask as *const u64 as usize, 0, 8]), 0);
+    let mut status = 0;
+    assert_eq!(waitpid(child as usize, &mut status), child);
+    assert_eq!(status, 0);
+}
+
+fn attachment_count(id: usize) -> u64 {
+    let mut stat = [0u8; 112];
+    assert_eq!(syscall(195, [id, 2, stat.as_mut_ptr() as usize, 0]), 0);
+    u64::from_ne_bytes(stat[88..96].try_into().unwrap())
+}
+
+fn test_shm_replacement() {
+    let old = syscall(194, [0, 2 * PAGE, 0o600, 0]);
+    let new = syscall(194, [0, 2 * PAGE, 0o600, 0]);
+    assert!(old > 0 && new > 0);
+    let (old, new) = (old as usize, new as usize);
+    let addr = syscall(196, [old, 0, 0, 0]);
+    assert!(addr > 0);
+    assert_eq!(syscall(196, [new, addr as usize, 0o40000, 0]), addr);
+    assert_eq!(attachment_count(old), 0);
+    assert_eq!(attachment_count(new), 1);
+    let second_page = addr as usize + PAGE;
+    assert_eq!(
+        syscall6(222, [second_page, PAGE, PROT_READ | PROT_WRITE, 0x32, usize::MAX, 0]),
+        second_page as isize
+    );
+    assert_eq!(syscall(197, [addr as usize, 0, 0, 0]), 0);
+    assert_eq!(attachment_count(new), 0);
+    let mut residency = 0u8;
+    assert_eq!(syscall(232, [second_page, PAGE, &mut residency as *mut u8 as usize, 0]), 0);
+    assert_eq!(syscall(215, [second_page, PAGE, 0, 0]), 0);
+    for id in [old, new] {
+        assert_eq!(syscall(195, [id, 0, 0, 0]), 0);
+    }
+}
+
+fn test_flock_release() {
+    let name = "/tmp/flock-release\0";
+    let fd = open_at(CWD, name, O_CREAT | O_RDWR);
+    assert!(fd >= 0);
+    let fd = fd as usize;
+    let duplicate = syscall(23, [fd, 0, 0, 0]);
+    assert!(duplicate > fd as isize);
+    assert_eq!(syscall(32, [fd, 2, 0, 0]), 0);
+    assert_eq!(syscall(436, [fd, duplicate as usize, 0, 0]), 0);
+
+    let independent = open_at(CWD, name, O_RDWR);
+    assert!(independent >= 0);
+    assert_eq!(syscall(32, [independent as usize, 2 | 4, 0, 0]), 0);
+    assert_eq!(close(independent as usize), 0);
+    let child = fork();
+    assert!(child >= 0);
+    if child == 0 {
+        let fd = open_at(CWD, name, O_RDWR);
+        assert!(fd >= 0);
+        assert_eq!(syscall(32, [fd as usize, 2 | 4, 0, 0]), 0);
+        exit(0);
+    }
+    let mut status = 0;
+    assert_eq!(waitpid(child as usize, &mut status), child);
+    assert_eq!(status, 0);
+    let fd = open_at(CWD, name, O_RDWR);
+    assert!(fd >= 0);
+    assert_eq!(syscall(32, [fd as usize, 2 | 4, 0, 0]), 0);
+    assert_eq!(close(fd as usize), 0);
+    assert_eq!(unlink(CWD, name), 0);
 }
 
 fn open_at(dir: usize, name: &str, flags: usize) -> isize {
@@ -471,6 +636,12 @@ fn main() -> i32 {
     test_mounts_and_tmpfs();
     test_devices_and_lib_links();
     test_shared_futex();
+    test_capability_drop();
+    test_splice_backpressure();
+    test_timerfd_poll();
+    test_signalfd_poll();
+    test_shm_replacement();
+    test_flock_release();
 
     println!("vfs-abi-test-ok");
     0

@@ -89,7 +89,7 @@ pub(super) fn is_directory(path: &str) -> bool {
 pub(super) fn directory_identity(path: &str) -> Option<DirectoryIdentity> {
     if matches!(
         path,
-        "proc" | "proc/sys" | "proc/sys/kernel" | "proc/sys/fs" | "proc/sys/vm"
+        "proc" | "proc/sys" | "proc/sys/kernel" | "proc/sys/fs" | "proc/sys/vm" | "proc/sysvipc"
     ) {
         return Some(DirectoryIdentity::Permanent);
     }
@@ -163,7 +163,9 @@ pub(super) fn symlink_target(path: &str) -> Option<Vec<u8>> {
 }
 
 pub(super) fn process_file_exists(path: &str) -> bool {
-    if sysctl_value(path).is_some() {
+    if sysctl_value(path).is_some()
+        || matches!(path, "proc/sysvipc/shm" | "proc/sysvipc/sem" | "proc/sysvipc/msg")
+    {
         return true;
     }
     pid_path(path).map_or(false, |(pid, raw_entry)| {
@@ -177,6 +179,9 @@ pub(super) fn process_file_exists(path: &str) -> bool {
 pub(super) fn snapshot(path: &str) -> Option<Vec<u8>> {
     if let Some(val) = sysctl_value(path) {
         return Some(Vec::from(val.as_bytes()));
+    }
+    if let Some(ipc_kind) = path.strip_prefix("proc/sysvipc/") {
+        return crate::syscall::sysvipc::proc_snapshot(ipc_kind);
     }
     let (pid, raw_entry) = pid_path(path)?;
     let (tid, entry) = resolve_task_entry(pid, raw_entry)?;
@@ -267,6 +272,7 @@ pub(super) fn entries(path: &str) -> Option<Vec<(String, u32, u8)>> {
                 .map(|(i, name)| (String::from(*name), 100 + i as u32, 1))
                 .collect();
             entries.push((String::from("sys"), 118, 2));
+            entries.push((String::from("sysvipc"), 119, 2));
             entries.push((String::from("self"), 120, 7));
             entries.push((String::from("thread-self"), 121, 7));
             entries.extend(
@@ -313,6 +319,15 @@ pub(super) fn entries(path: &str) -> Option<Vec<(String, u32, u8)>> {
                 (String::from(".."), 200, 2),
                 (String::from("overcommit_memory"), 230, 1),
                 (String::from("max_map_count"), 231, 1),
+            ]);
+        }
+        "proc/sysvipc" => {
+            return Some(alloc::vec![
+                (String::from("."), 119, 2),
+                (String::from(".."), 1, 2),
+                (String::from("shm"), 240, 1),
+                (String::from("sem"), 241, 1),
+                (String::from("msg"), 242, 1),
             ]);
         }
         _ => {}

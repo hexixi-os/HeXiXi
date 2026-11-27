@@ -514,7 +514,7 @@ impl VmaSpace {
             };
             let _ = writeln!(
                 out,
-                "{:012x}-{:012x} {}{}{}{} {:08x} {:02x}:{:02x} {}",
+                "{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {}",
                 start.0 * PAGE_SIZE,
                 area.end.0 * PAGE_SIZE,
                 r, w, x, s,
@@ -550,5 +550,24 @@ impl VmaSpace {
             cursor = area.end;
         }
         Ok(())
+    }
+
+    pub(super) fn has_shared_writable_mapping(&self, identity: (u64, u64)) -> bool {
+        self.areas.values().any(|area| {
+            matches!(
+                &area.backing,
+                VmaBacking::File { file, shared: true, .. }
+                    if (area.permissions.contains(MapPermission::W) || file.writable())
+                        && file.stat_identity() == Some(identity)
+            )
+        })
+    }
+
+    pub(super) fn is_resident(&self, vpn: VirtPageNum) -> bool {
+        self.pages.contains_key(&vpn)
+    }
+
+    pub(super) fn permissions_at(&self, vpn: VirtPageNum) -> Option<MapPermission> {
+        Self::covering(&self.areas, vpn).map(|(_, area)| area.permissions)
     }
 }

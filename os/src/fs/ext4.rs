@@ -13,7 +13,7 @@ use alloc::sync::Arc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 pub const EXT4_MAGIC: u16 = 0xEF53;
 const EXTENT_MAGIC: u16 = 0xF30A;
@@ -456,15 +456,22 @@ pub struct Ext4File {
     inode: Inode,
     offset: UPSafeCell<usize>,
     stream: UPSafeCell<ReadStream>,
+    extra_flags: AtomicU32,
 }
 
 impl Ext4File {
     pub fn new(fs: Arc<Ext4Fs>, inode: Inode) -> Self {
+        Self::new_with_status(fs, inode, 0)
+    }
+
+    pub fn new_with_status(fs: Arc<Ext4Fs>, inode: Inode, status: u32) -> Self {
+        const MUTABLE: u32 = 0o2000 | 0o4000 | 0o20000 | 0o40000 | 0o1000000;
         Self {
             fs,
             inode,
             offset: unsafe { UPSafeCell::new(0) },
             stream: unsafe { UPSafeCell::new(ReadStream::default()) },
+            extra_flags: AtomicU32::new(status & MUTABLE),
         }
     }
 
@@ -508,6 +515,27 @@ impl File for Ext4File {
     }
     fn writable(&self) -> bool {
         false
+    }
+    fn status_flags(&self) -> u32 {
+        self.extra_flags.load(Ordering::Relaxed)
+    }
+    fn set_status_flags(&self, flags: u32) {
+        const MUTABLE: u32 = 0o2000 | 0o4000 | 0o20000 | 0o40000 | 0o1000000;
+        self.extra_flags.store(flags & MUTABLE, Ordering::Relaxed);
+    }
+    fn xattr_op(
+        &self,
+        name: &str,
+        set_val: Option<(&[u8], usize)>,
+        remove: bool,
+    ) -> Result<Vec<u8>, isize> {
+        if set_val.is_some() || remove {
+            Err(-95)
+        } else if name.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(-61)
+        }
     }
     fn read(&self, buf: UserBuffer) -> usize {
         let mut off = self.offset.exclusive_access();

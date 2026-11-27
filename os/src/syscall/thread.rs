@@ -91,6 +91,7 @@ pub fn sys_clone_thread(flags: usize, stack: usize, ptid: usize, tls: usize, cti
     const CLONE_CHILD_CLEARTID: usize = 0x200000;
     const CLONE_DETACHED: usize = 0x400000;
     const CLONE_CHILD_SETTID: usize = 0x1000000;
+    const CLONE_VFORK: usize = 0x4000;
     const GROUP: usize = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
     const THREAD_FLAGS: usize = GROUP
         | CLONE_SYSVSEM
@@ -99,18 +100,39 @@ pub fn sys_clone_thread(flags: usize, stack: usize, ptid: usize, tls: usize, cti
         | CLONE_CHILD_CLEARTID
         | CLONE_DETACHED
         | CLONE_CHILD_SETTID;
-    if flags & CLONE_VM == 0 {
-        return if matches!(flags & 0xff, 0 | 17)
-            && flags & !(0xff | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) == 0
-        {
-            super::process::fork_with_child_tid(
-                stack,
-                (flags & CLONE_CHILD_SETTID != 0).then_some(ctid),
-                (flags & CLONE_CHILD_CLEARTID != 0).then_some(ctid),
-            )
+    if flags & CLONE_THREAD == 0 && (flags & CLONE_VM == 0 || flags & CLONE_VFORK != 0) {
+        const FORK_ALLOWED: usize = 0xff
+            | CLONE_VM
+            | CLONE_VFORK
+            | CLONE_PARENT_SETTID
+            | CLONE_CHILD_SETTID
+            | CLONE_CHILD_CLEARTID;
+        if (flags & 0xff) > 64 || flags & !FORK_ALLOWED != 0 {
+            return -22;
+        }
+        let parent_tid = if flags & CLONE_PARENT_SETTID != 0 {
+            let token = current_task().unwrap().get_user_token();
+            match crate::mm::prepare_user_write(token, ptid as *mut i32) {
+                Some(word) => Some(word),
+                None => return -14,
+            }
         } else {
-            -22
+            None
         };
+        let child_pid = super::process::fork_with_child_tid(
+            stack,
+            (flags & CLONE_CHILD_SETTID != 0).then_some(ctid),
+            (flags & CLONE_CHILD_CLEARTID != 0).then_some(ctid),
+        );
+        if child_pid > 0 {
+            if let Some(word) = parent_tid {
+                word.write(child_pid as i32);
+            }
+            if flags & CLONE_VFORK != 0 {
+                crate::task::suspend_current_and_run_next();
+            }
+        }
+        return child_pid;
     }
     if flags & GROUP != GROUP
         || flags & !THREAD_FLAGS != 0

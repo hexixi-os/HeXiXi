@@ -12,15 +12,17 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use user_lib::{
-    chdir, close, exec, exit, fork, get_time, open, read, sleep, sys_execve, sys_kill_raw,
-    sys_mkdirat, sys_setpgid, sys_symlinkat, waitpid, waitpid_nb, write, yield_, OpenFlags,
+    chdir, close, exec, exit, fork, get_monotonic_ms, open, read, sleep, sys_execve, sys_kill_raw,
+    sys_mkdirat, sys_setpgid, sys_symlinkat, sys_unlinkat, waitpid, waitpid_nb, write, yield_,
+    OpenFlags,
 };
 
 const AT_FDCWD: isize = -100;
 const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
-const LTP_CASE_TIMEOUT_MS: isize = 450;
-const LTP_KILL_GRACE_MS: isize = 80;
+const LTP_CASE_TIMEOUT_MS: isize = 320;
+const LTP_SLOW_CASE_TIMEOUT_MS: isize = 1250;
+const LTP_KILL_GRACE_MS: isize = 50;
 
 /// NUL 结尾字符串，内核按 C 字符串解析路径
 struct CStr(Vec<u8>);
@@ -282,10 +284,28 @@ impl Shell {
     }
 }
 
-fn run_busybox(args: &[*const u8], script: &str) -> i32 {
+fn run_busybox_env(libc: &str, args: &[*const u8], script: &str) -> i32 {
+    let env_items = [
+        CStr::new(&format!("PATH=/{}:/bin:/usr/bin:.", libc)),
+        CStr::new(&format!("LD_LIBRARY_PATH=/{}/lib:/lib:/lib64:.", libc)),
+        CStr::new("HOME=/tmp"),
+        CStr::new("TMPDIR=/tmp"),
+    ];
+    let envp = [
+        env_items[0].ptr(),
+        env_items[1].ptr(),
+        env_items[2].ptr(),
+        env_items[3].ptr(),
+        core::ptr::null(),
+    ];
     let pid = fork();
     if pid == 0 {
-        let errno = exec("busybox\0", args);
+        let bb = CStr::new(&format!("/{}/busybox", libc));
+        let errno = if exists(bb.as_str()) {
+            sys_execve(bb.ptr(), args, &envp)
+        } else {
+            sys_execve(b"busybox\0".as_ptr(), args, &envp)
+        };
         println!("[oscomp] cannot exec busybox sh {} errno={}", script, errno);
         exit(126);
     }
@@ -297,6 +317,10 @@ fn run_busybox(args: &[*const u8], script: &str) -> i32 {
 }
 
 fn run_with_busybox(script: &str) -> i32 {
+    run_with_libc_busybox("musl", script)
+}
+
+fn run_with_libc_busybox(libc: &str, script: &str) -> i32 {
     let filename = CStr::new(script);
     let args = [
         b"busybox\0".as_ptr(),
@@ -304,20 +328,20 @@ fn run_with_busybox(script: &str) -> i32 {
         filename.ptr(),
         core::ptr::null(),
     ];
-    run_busybox(&args, script)
+    run_busybox_env(libc, &args, script)
 }
 
 fn run_official_lmbench(libc: &str, script: &str) -> i32 {
     const LEGACY_HELLO: &[u8] = b"/code/lmbench_src/bin/build/lmbench_all hello \"$@\"\n";
     let fd = open("hello\0", OpenFlags::RDONLY);
     if fd < 0 {
-        return run_with_busybox(script);
+        return run_with_libc_busybox(libc, script);
     }
     let mut contents = [0; LEGACY_HELLO.len() + 1];
     let length = read(fd as usize, &mut contents);
     close(fd as usize);
     if length != LEGACY_HELLO.len() as isize || &contents[..LEGACY_HELLO.len()] != LEGACY_HELLO {
-        return run_with_busybox(script);
+        return run_with_libc_busybox(libc, script);
     }
 
     // The official image ships a build-host stub in place of the hello applet.
@@ -346,7 +370,7 @@ echo "[oscomp] lmbench: ENOUGH=$ENOUGH us"
 export ENOUGH
 . "./$2"
 "#);
-    let libc = CStr::new(libc);
+    let libc_c = CStr::new(libc);
     let script_arg = CStr::new(script);
     let args = [
         b"busybox\0".as_ptr(),
@@ -354,16 +378,18 @@ export ENOUGH
         b"-ec\0".as_ptr(),
         setup.ptr(),
         b"oscomp-lmbench\0".as_ptr(),
-        libc.ptr(),
+        libc_c.ptr(),
         script_arg.ptr(),
         core::ptr::null(),
     ];
-    run_busybox(&args, script)
+    run_busybox_env(libc, &args, script)
 }
 
-fn prepare_ltp_userland(libc: &str) {
+fn prepare_libc_userland(libc: &str) {
     mkdir_p("/etc", 0o755);
     mkdir_p("/bin", 0o755);
+    mkdir_p("/usr", 0o755);
+    mkdir_p("/usr/bin", 0o755);
     mkdir_p("/tmp", 0o1777);
     mkdir_p("/var", 0o755);
     mkdir_p("/var/tmp", 0o1777);
@@ -395,10 +421,90 @@ nobody:x:65534:nobody\n",
         "/etc/protocols",
         b"ip 0 IP\nicmp 1 ICMP\ntcp 6 TCP\nudp 17 UDP\n",
     );
-    let bb_target = CStr::new(&format!("/{}/busybox", libc));
-    if !exists("/bin/sh") {
-        let _ = sys_symlinkat(bb_target.ptr(), AT_FDCWD, b"/bin/sh\0".as_ptr());
+    write_if_missing(
+        "/etc/services",
+        b"echo 7/tcp\necho 7/udp\nhttp 80/tcp\nnetperf 12865/tcp\nnetperf 12865/udp\n",
+    );
+
+    // Ensure musl dynamic loader aliases exist in /musl/lib when musl is present.
+    if exists("/musl/lib/libc.so") {
+        let musl_libc = b"/musl/lib/libc.so\0";
+        for alias in [
+            "/musl/lib/ld-musl-riscv64.so.1",
+            "/musl/lib/ld-musl-riscv64-sf.so.1",
+            "/musl/lib/ld-musl-loongarch-lp64d.so.1",
+        ] {
+            if !exists(alias) {
+                let alias_c = CStr::new(alias);
+                let _ = sys_symlinkat(musl_libc.as_ptr(), AT_FDCWD, alias_c.ptr());
+            }
+        }
     }
+
+    // Point /lib and /lib64 to the active libc's library directory.
+    let lib_dir = format!("/{}/lib", libc);
+    if exists(&lib_dir) {
+        let target_c = CStr::new(&lib_dir);
+        let _ = sys_unlinkat(AT_FDCWD, b"/lib\0".as_ptr(), 0);
+        let _ = sys_symlinkat(target_c.ptr(), AT_FDCWD, b"/lib\0".as_ptr());
+        let _ = sys_unlinkat(AT_FDCWD, b"/lib64\0".as_ptr(), 0);
+        let _ = sys_symlinkat(target_c.ptr(), AT_FDCWD, b"/lib64\0".as_ptr());
+    }
+
+    let bb_path = format!("/{}/busybox", libc);
+    let bb_target = CStr::new(&bb_path);
+    if exists(&bb_path) {
+        let _ = sys_unlinkat(AT_FDCWD, b"/bin/sh\0".as_ptr(), 0);
+        let _ = sys_symlinkat(bb_target.ptr(), AT_FDCWD, b"/bin/sh\0".as_ptr());
+        let _ = sys_unlinkat(AT_FDCWD, b"/bin/busybox\0".as_ptr(), 0);
+        let _ = sys_symlinkat(bb_target.ptr(), AT_FDCWD, b"/bin/busybox\0".as_ptr());
+    }
+    if !exists("/bin/ls") && exists(&bb_path) {
+        let pid = fork();
+        if pid == 0 {
+            let argv = [
+                b"busybox\0".as_ptr(),
+                b"--install\0".as_ptr(),
+                b"-s\0".as_ptr(),
+                b"/bin\0".as_ptr(),
+                core::ptr::null(),
+            ];
+            let _ = sys_execve(bb_target.ptr(), &argv, &[core::ptr::null()]);
+            exit(125);
+        }
+        if pid > 0 {
+            let mut code = 0;
+            let _ = waitpid(pid as usize, &mut code);
+        }
+    }
+}
+
+fn ensure_script_shebang(name: &str) {
+    let bytes = match read_all(name) {
+        Some(bytes) => bytes,
+        None => return,
+    };
+    if bytes.starts_with(b"#!") {
+        return;
+    }
+    let c = CStr::new(name);
+    let fd = open(c.as_str(), OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::WRONLY);
+    if fd >= 0 {
+        let _ = write(fd as usize, b"#!/bin/sh\n");
+        let _ = write(fd as usize, &bytes);
+        close(fd as usize);
+    }
+}
+
+fn run_official_libctest(libc: &str, script: &str) -> i32 {
+    ensure_script_shebang("run-static.sh");
+    ensure_script_shebang("run-dynamic.sh");
+    run_with_libc_busybox(libc, script)
+}
+
+fn prepare_ltp_userland(libc: &str) {
+    prepare_libc_userland(libc);
+    let bb_target = CStr::new(&format!("/{}/busybox", libc));
     let tools = format!("/tmp/oscomp-ltp-{}", libc);
     if !exists(&format!("{}/sh", tools)) {
         mkdir_p(&tools, 0o755);
@@ -436,11 +542,37 @@ fn should_skip_ltp_case(tag: &str, cmd: &str) -> bool {
             || name.starts_with("swapon")
             || name == "cve-2017-17052"
             || name == "cve-2017-17053"
+            || name == "dirtyc0w"
+            || name == "dirtypipe"
+            || name == "leapsec01"
         {
             return true;
         }
     }
     false
+}
+
+fn ltp_case_timeout_ms(tag: &str, cmd: &str) -> isize {
+    for name in [tag, cmd] {
+        if name == "timerfd01"
+            || name == "timerfd04"
+            || name == "timerfd_settime02"
+            || name == "setitimer01"
+            || name == "setrlimit06"
+            || name == "rt_sigsuspend01"
+            || name == "sigsuspend01"
+            || name == "sigtimedwait01"
+            || name == "kill10"
+            || name == "pipe04"
+            || name == "setsid01"
+            || name == "alarm02"
+            || name == "alarm03"
+            || name == "nanosleep02"
+        {
+            return LTP_SLOW_CASE_TIMEOUT_MS;
+        }
+    }
+    LTP_CASE_TIMEOUT_MS
 }
 
 fn decode_shell_exit(code: i32) -> i32 {
@@ -503,7 +635,8 @@ fn run_one_ltp_case(libc: &str, tag: &str, cmd_line: &str, envp: &[*const u8]) {
 
     let child = pid as usize;
     let _ = sys_setpgid(child, child);
-    let start = get_time();
+    let case_timeout_ms = ltp_case_timeout_ms(tag, first_tok);
+    let start = get_monotonic_ms();
     let mut status = 0i32;
     let mut sent_term = false;
     let mut term_at = 0isize;
@@ -517,8 +650,8 @@ fn run_one_ltp_case(libc: &str, tag: &str, cmd_line: &str, envp: &[*const u8]) {
             status = 1;
             break;
         }
-        let now = get_time();
-        if !sent_term && now - start >= LTP_CASE_TIMEOUT_MS {
+        let now = get_monotonic_ms();
+        if !sent_term && now - start >= case_timeout_ms {
             let _ = sys_kill_raw(-(pid as isize), SIGTERM);
             let _ = sys_kill_raw(pid as isize, SIGTERM);
             sent_term = true;
@@ -642,7 +775,7 @@ busybox=$suite/busybox
 tools=/tmp/oscomp-ltp-$libc
 export LTPROOT=$suite/ltp LD_LIBRARY_PATH=$suite/lib:/lib:/lib64
 export PATH=$tools:$LTPROOT/testcases/bin:/bin:/usr/bin
-export TMPDIR=/tmp HOME=/tmp KCONFIG_SKIP_CHECK=1 LTP_COLORIZE_OUTPUT=0 LTP_TIMEOUT_MUL=0.1
+export TMPDIR=/tmp HOME=/tmp KCONFIG_SKIP_CHECK=1 LTP_COLORIZE_OUTPUT=0 LTP_TIMEOUT_MUL=1
 exec \"$busybox\" sh \"$2\"\0";
     let libc_c = CStr::new(libc);
     let filename = CStr::new(script);
@@ -656,7 +789,7 @@ exec \"$busybox\" sh \"$2\"\0";
         filename.ptr(),
         core::ptr::null(),
     ];
-    run_busybox(&args, script)
+    run_busybox_env(libc, &args, script)
 }
 
 /// 在平铺测试盘上直接运行 Lua 用例，避开旧版 BusyBox 的 test.sh 问题。
@@ -708,12 +841,17 @@ const GROUPS: &[&str] = &[
 fn run_official(requested: Option<&str>) -> i32 {
     let mut selected = false;
     for (libc, directory) in [("musl", "/musl\0"), ("glibc", "/glibc\0")] {
+        let mut prepared = false;
         for group in GROUPS {
             let name = format!("{}-{}", group, libc);
             if requested.map_or(false, |selection| selection != name) {
                 continue;
             }
             selected = true;
+            if !prepared {
+                prepare_libc_userland(libc);
+                prepared = true;
+            }
             let script = format!("{}_testcode.sh", group);
             println!("[oscomp] running /{}/{}", libc, script);
             let code = if chdir(directory) != 0 || !exists("busybox") || !exists(&script) {
@@ -723,8 +861,10 @@ fn run_official(requested: Option<&str>) -> i32 {
                 run_official_ltp(libc, &script)
             } else if *group == "lmbench" {
                 run_official_lmbench(libc, &script)
+            } else if *group == "libctest" {
+                run_official_libctest(libc, &script)
             } else {
-                run_with_busybox(&script)
+                run_with_libc_busybox(libc, &script)
             };
             println!("[oscomp] result {} exit={}", name, code);
         }

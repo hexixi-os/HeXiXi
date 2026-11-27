@@ -359,6 +359,31 @@ impl SignalInfo {
         Self { signo: 17, code, source: SignalSource::Child { pid: pid as u32, status } }
     }
 
+    pub(crate) fn code(self) -> i32 {
+        self.code
+    }
+
+    pub(crate) fn sender_pid(self) -> u32 {
+        match self.source {
+            SignalSource::Sender { pid, .. } | SignalSource::Child { pid, .. } => pid,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn sender_uid(self) -> u32 {
+        match self.source {
+            SignalSource::Sender { uid, .. } => uid,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn child_status(self) -> i32 {
+        match self.source {
+            SignalSource::Child { status, .. } => status,
+            _ => 0,
+        }
+    }
+
     fn encode(self, bytes: &mut [u8]) {
         bytes[..4].copy_from_slice(&(self.signo as i32).to_ne_bytes());
         bytes[8..12].copy_from_slice(&self.code.to_ne_bytes());
@@ -418,12 +443,22 @@ fn interrupt_sleep(task: &Arc<TaskControlBlock>) {
     super::futex::interrupt_waiter(task);
 }
 
+fn wake_signal_fd_readers(inner: &ProcessControlBlockInner, signo: usize) {
+    let bit = signal_bit(signo);
+    if inner.fd_table.iter().flatten().any(|file| {
+        file.signalfd().map_or(false, |signalfd| signalfd.watches(bit))
+    }) {
+        crate::task::wake_poll_waiters();
+    }
+}
+
 pub(crate) fn queue_process_signal(inner: &mut ProcessControlBlockInner, info: SignalInfo) {
     let action = inner.signal_actions[info.signo - 1];
     if action.handler == 1 {
         return;
     }
     enqueue(&mut inner.signal_pending, &mut inner.signal_info, info);
+    wake_signal_fd_readers(inner, info.signo);
     if interrupts_for_action(action, info.signo) {
         let bit = signal_bit(info.signo);
         for task in inner.tasks.iter().flatten() {
@@ -506,6 +541,7 @@ fn generate(process: &ProcessControlBlock, target: Option<&Arc<TaskControlBlock>
         if interrupt {
             interrupt_sleep(task);
         }
+        wake_signal_fd_readers(&inner, signo);
     } else {
         queue_process_signal(&mut inner, info);
     }

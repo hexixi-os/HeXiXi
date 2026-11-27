@@ -15,7 +15,7 @@ extern crate bitflags;
 use alloc::vec::Vec;
 use buddy_system_allocator::LockedHeap;
 use syscall::*;
-pub use syscall::{sys_execve, sys_kill_raw, sys_mkdirat, sys_setpgid, sys_symlinkat};
+pub use syscall::{sys_execve, sys_kill_raw, sys_mkdirat, sys_setpgid, sys_symlinkat, sys_unlinkat};
 
 const USER_HEAP_SIZE: usize = 32768;
 
@@ -120,6 +120,13 @@ pub fn get_time() -> isize {
         return -1;
     }
     (tv[0] * 1000 + tv[1] / 1000) as isize
+}
+pub fn get_monotonic_ms() -> isize {
+    let mut ts = [0usize; 2];
+    if sys_clock_monotonic(ts.as_mut_ptr()) != 0 {
+        return get_time();
+    }
+    (ts[0].saturating_mul(1000) + ts[1] / 1_000_000) as isize
 }
 pub fn getpid() -> isize {
     sys_getpid()

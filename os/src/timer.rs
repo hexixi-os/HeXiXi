@@ -1,5 +1,5 @@
 use core::cmp::Ordering;
-use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::arch::{read_ticks, set_timer, timer_frequency};
 use crate::sync::UPSafeCell;
@@ -53,11 +53,26 @@ pub fn get_time_us() -> usize {
     (ticks / freq) * 1_000_000 + (ticks % freq) * 1_000_000 / freq
 }
 
-/// 纳秒级时间（按实际时基换算，避免固定假设 12.5MHz 或乘法溢出）
+static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
+
+/// 纳秒级单调时间（按实际时基换算，避免固定假设 12.5MHz 或乘法溢出）
 pub fn get_time_ns() -> usize {
     let ticks = read_ticks();
     let freq = timer_frequency();
     (ticks / freq) * 1_000_000_000 + (ticks % freq) * 1_000_000_000 / freq
+}
+
+pub fn get_realtime_ns() -> u64 {
+    let mono = get_time_ns() as i128;
+    let off = REALTIME_OFFSET_NS.load(AtomicOrdering::Relaxed) as i128;
+    (mono + off).max(0) as u64
+}
+
+pub fn set_realtime_ns(target_ns: u64) {
+    let mono = get_time_ns() as i128;
+    let diff = (target_ns as i128 - mono).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    REALTIME_OFFSET_NS.store(diff, AtomicOrdering::Relaxed);
+    arm_within_ms(1);
 }
 
 fn next_timer_interval_ticks() -> usize {
@@ -72,6 +87,7 @@ fn next_timer_interval_ticks() -> usize {
     for candidate in [
         crate::syscall::signal::next_alarm_ms(),
         crate::syscall::futex::next_waiter_ms(),
+        crate::syscall::eventfd::next_timerfd_ms(),
     ] {
         if let Some(ms) = candidate {
             earliest_ms = Some(earliest_ms.map_or(ms, |cur| cur.min(ms)));
@@ -177,6 +193,7 @@ pub fn check_timer() {
     crate::net::poll();
     crate::syscall::signal::check_alarm();
     crate::syscall::futex::check_waiters();
+    crate::syscall::eventfd::check_timerfds();
     let current_ms = get_time_ms();
     let mut expired = Vec::new();
     {

@@ -2,6 +2,7 @@ use super::{overlay::SymlinkCharge, File};
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -11,6 +12,9 @@ pub(super) struct Symlink {
     target: Vec<u8>,
     identity: Option<(u64, u64)>,
     links: AtomicU32,
+    uid: AtomicU32,
+    gid: AtomicU32,
+    xattrs: UPSafeCell<BTreeMap<String, Vec<u8>>>,
     charge: UPSafeCell<Option<SymlinkCharge>>,
 }
 
@@ -25,11 +29,29 @@ impl Symlink {
         identity: Option<(u64, u64)>,
         charge: Option<SymlinkCharge>,
     ) -> Self {
+        let (fsuid, fsgid) = crate::task::current_task()
+            .and_then(|t| t.process.upgrade())
+            .map_or((0, 0), |p| {
+                let inner = p.inner_exclusive_access();
+                (inner.fsuid, inner.fsgid)
+            });
         Self {
             target,
             identity,
             links: AtomicU32::new(1),
+            uid: AtomicU32::new(fsuid),
+            gid: AtomicU32::new(fsgid),
+            xattrs: unsafe { UPSafeCell::new(BTreeMap::new()) },
             charge: unsafe { UPSafeCell::new(charge) },
+        }
+    }
+
+    pub fn set_owner_ids(&self, uid: Option<u32>, gid: Option<u32>) {
+        if let Some(u) = uid {
+            self.uid.store(u, Ordering::Relaxed);
+        }
+        if let Some(g) = gid {
+            self.gid.store(g, Ordering::Relaxed);
         }
     }
 
@@ -57,6 +79,10 @@ impl Symlink {
 
     pub fn commit_copy_up(&self, charge: SymlinkCharge) {
         *self.charge.exclusive_access() = Some(charge);
+    }
+
+    pub fn add_link(&self) {
+        self.links.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn detach(&self) {
@@ -87,6 +113,9 @@ impl File for Symlink {
     fn mode(&self) -> u16 {
         0o120777
     }
+    fn owner(&self) -> (u32, u32) {
+        (self.uid.load(Ordering::Relaxed), self.gid.load(Ordering::Relaxed))
+    }
     fn size(&self) -> usize {
         self.target.len()
     }
@@ -95,5 +124,13 @@ impl File for Symlink {
     }
     fn link_count(&self) -> u32 {
         self.links.load(Ordering::Relaxed)
+    }
+    fn xattr_op(
+        &self,
+        name: &str,
+        set_val: Option<(&[u8], usize)>,
+        remove: bool,
+    ) -> Result<Vec<u8>, isize> {
+        super::overlay::apply_xattr_map(&mut self.xattrs.exclusive_access(), name, set_val, remove)
     }
 }

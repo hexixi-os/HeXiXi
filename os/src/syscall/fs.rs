@@ -1,4 +1,4 @@
-use crate::fs::{self, make_pipe, OpenFlags};
+use crate::fs::{self, make_pipe_with_flags, OpenFlags};
 use crate::mm::{
     translated_byte_buffer, translated_path, MapPermission, UserBuffer,
 };
@@ -76,19 +76,24 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
 
 pub fn sys_close(fd: usize) -> isize {
     let process = current_process();
+    let pid = process.getpid();
     let mut inner = process.inner_exclusive_access();
     if fd >= inner.fd_table.len() || inner.fd_table[fd].is_none() {
         return -9;
     }
-    inner.fd_table[fd].take();
+    let closed = inner.fd_table[fd].take().unwrap();
     inner.set_close_on_exec(fd, false);
+    drop(inner);
+    super::lock::on_file_closed(pid, &closed);
+    drop(closed);
     0
 }
 
 const O_CLOEXEC: u32 = 0o2000000;
 
 pub fn sys_pipe(pipe: *mut usize, flags: u32) -> isize {
-    if flags & !O_CLOEXEC != 0 {
+    const PIPE2_VALID: u32 = O_CLOEXEC | 0o4000 | 0o40000; // O_CLOEXEC | O_NONBLOCK | O_DIRECT
+    if flags & !PIPE2_VALID != 0 {
         return -22;
     }
     let process = current_process();
@@ -99,7 +104,7 @@ pub fn sys_pipe(pipe: *mut usize, flags: u32) -> isize {
         None => return -14, // EFAULT
     };
     let mut inner = process.inner_exclusive_access();
-    let (pipe_read, pipe_write) = make_pipe();
+    let (pipe_read, pipe_write) = make_pipe_with_flags(flags);
     let read_fd = match inner.alloc_fd() {
         Some(fd) => fd,
         None => return -24, // EMFILE
@@ -220,16 +225,107 @@ fn ioctl_input<const N: usize>(arg: usize) -> Result<[u8; N], isize> {
     Ok(value)
 }
 
+fn rtc_time_from_unix(mut secs: u64) -> [u8; 36] {
+    if secs < 946_684_800 {
+        secs += 1_704_067_200; // Anchor boot epoch to 2024-01-01T00:00:00Z if unset
+    }
+    let days = (secs / 86_400) as i64;
+    let rem = (secs % 86_400) as i32;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+    let wday = ((days + 4).rem_euclid(7)) as i32;
+    // Howard Hinnant's civil-from-days algorithm
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let mut y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    let is_leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    let month_days = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let mut yday = month_days[(m - 1) as usize] + d as i32 - 1;
+    if is_leap && m > 2 {
+        yday += 1;
+    }
+    let fields: [i32; 9] = [sec, min, hour, d as i32, m as i32 - 1, (y - 1900) as i32, wday, yday, 0];
+    let mut out = [0u8; 36];
+    for (slot, val) in out.chunks_exact_mut(4).zip(fields) {
+        slot.copy_from_slice(&val.to_ne_bytes());
+    }
+    out
+}
+
 pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
+    // musl's ioctl(int fd, int req, ...) sign-extends 32-bit _IOR/_IOWR codes on LP64.
+    let request = (request as u32) as usize;
+    const FIONREAD: usize = 0x541b;
+    const FIONBIO: usize = 0x5421;
+    const FIONCLEX: usize = 0x5450;
+    const FIOCLEX: usize = 0x5451;
+    const RTC_UIE_ON: usize = 0x7003;
+    const RTC_UIE_OFF: usize = 0x7004;
+    const RTC_RD_TIME: usize = 0x8024_7009;
+    const RTC_SET_TIME: usize = 0x4024_700a;
+
     let result = (|| {
         let file = file_by_fd(fd)?;
         if file.path_only() { return Err(-9); }
-        if !file.is_tty() { return Err(-25); }
 
         let output = |bytes: &[u8]| match write_stat_bytes(arg as *mut u8, bytes) {
             0 => Ok(()),
             errno => Err(errno),
         };
+        match request {
+            FIOCLEX | FIONCLEX => {
+                let proc = current_process();
+                proc.inner_exclusive_access().set_close_on_exec(fd, request == FIOCLEX);
+                return Ok(());
+            }
+            FIONBIO => {
+                let val = i32::from_ne_bytes(ioctl_input::<4>(arg)?);
+                let cur = file.status_flags();
+                let next = if val != 0 { cur | 0o4000 } else { cur & !0o4000 };
+                file.set_status_flags(next);
+                return Ok(());
+            }
+            FIONREAD => {
+                let avail = if let Some(p) = file.pipe() {
+                    p.available_read_bytes() as i32
+                } else if file.supports_positioned_io() {
+                    let pos = file.seek(0).max(0) as usize;
+                    file.size().saturating_sub(pos).min(i32::MAX as usize) as i32
+                } else if file.is_tty() {
+                    0
+                } else {
+                    return Err(-25);
+                };
+                return output(&avail.to_ne_bytes());
+            }
+            _ if file.is_rtc() => {
+                return match request {
+                    RTC_RD_TIME => {
+                        let tm = rtc_time_from_unix(crate::timer::get_realtime_ns() / 1_000_000_000);
+                        output(&tm)
+                    }
+                    RTC_SET_TIME => {
+                        let _ = ioctl_input::<36>(arg)?;
+                        Ok(())
+                    }
+                    RTC_UIE_ON | RTC_UIE_OFF => Ok(()),
+                    _ => Err(-25),
+                };
+            }
+            _ => {}
+        }
+        if !file.is_tty() { return Err(-25); }
+
         match request {
             TCGETS => {
                 let value = CONSOLE_SETTINGS.exclusive_access().termios;
@@ -289,6 +385,7 @@ fn resolve_at_with(dirfd: isize, path: &str, follow_final: bool) -> Result<Strin
 
     let process = current_process();
     let inner = process.inner_exclusive_access();
+    let root = inner.root.clone();
     let file = inner
         .fd_table
         .get(dirfd as usize)
@@ -300,7 +397,7 @@ fn resolve_at_with(dirfd: isize, path: &str, follow_final: bool) -> Result<Strin
     if !fs::directory_is_live(directory) {
         return Err(-2);
     }
-    fs::resolve_from(path, &directory.path(), follow_final)
+    fs::resolve_from_in_root(path, &directory.path(), &root, follow_final)
 }
 
 fn check_mode_bits(
@@ -458,6 +555,9 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
                 match fs::path_mode_owner(&path) {
                     Ok((fmode, fuid, fgid)) => {
                         if !exclusive && !path_only {
+                            if flags & 0o1000000 != 0 && fsuid != fuid {
+                                return Err(-1); // O_NOATIME requires owner or root
+                            }
                             let is_dir = fmode & 0o170000 == 0o040000;
                             let mut want = if open_flags.contains(OpenFlags::RDWR) {
                                 6
@@ -482,7 +582,8 @@ pub fn sys_openat(dirfd: isize, path: *const u8, flags: u32, mode: u32) -> isize
             }
         }
         let permissions = creation_permissions(mode);
-        let file = fs::open_dyn_with_mode(&path, open_flags, permissions)?;
+        let init_status = flags & (0o2000 | 0o4000 | 0o20000 | 0o40000 | 0o1000000);
+        let file = fs::open_dyn_with_status(&path, open_flags, permissions, init_status)?;
         if path_only { Ok(Arc::new(fs::PathFile(file, flags & !O_CLOEXEC))) } else { Ok(file) }
     })();
     let file = match result {
@@ -541,6 +642,7 @@ pub fn sys_symlinkat(target: *const u8, dirfd: isize, link: *const u8) -> isize 
 /// dup3(24)：把 oldfd 复制到指定的 newfd
 pub fn sys_dup3(oldfd: usize, newfd: usize, flags: u32) -> isize {
     let process = current_process();
+    let pid = process.getpid();
     let mut inner = process.inner_exclusive_access();
     if flags & !O_CLOEXEC != 0 || oldfd == newfd {
         return -22;
@@ -555,8 +657,12 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, flags: u32) -> isize {
     if let Err(error) = inner.ensure_fd_slot(newfd) {
         return error;
     }
-    inner.fd_table[newfd] = Some(file);
+    let replaced = inner.fd_table[newfd].replace(file);
     inner.set_close_on_exec(newfd, flags & O_CLOEXEC != 0);
+    drop(inner);
+    if let Some(old_file) = replaced {
+        super::lock::on_file_closed(pid, &old_file);
+    }
     newfd as isize
 }
 
@@ -582,14 +688,79 @@ pub fn sys_chdir(path: *const u8) -> isize {
     0
 }
 
+/// fchdir(50)：切换到目录 fd 指向的目录。
+pub fn sys_fchdir(fd: usize) -> isize {
+    let file = match file_by_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let Some(dir) = file.directory() else {
+        return -20; // ENOTDIR
+    };
+    let loc = dir.location().clone();
+    if !fs::directory_is_live(&loc) {
+        return -2;
+    }
+    let (fsuid, fsgid, groups) = current_fs_cred();
+    if fsuid != 0 {
+        let (fuid, fgid) = file.owner();
+        if let Err(e) = check_mode_bits(fsuid, fsgid, &groups, file.mode(), fuid, fgid, 1) {
+            return e;
+        }
+    }
+    current_process().inner_exclusive_access().cwd = loc;
+    0
+}
+
+/// chroot(51)：设置当前进程的根目录。
+pub fn sys_chroot(path: *const u8) -> isize {
+    let resolved = match translated_path(current_user_token(), path)
+        .and_then(|raw| resolve_at(AT_FDCWD, &raw))
+        .and_then(|path| {
+            check_path_search(&path)?;
+            fs::require_directory(&path)?;
+            let (fsuid, fsgid, groups) = current_fs_cred();
+            if fsuid != 0 {
+                let (dmode, duid, dgid) = fs::path_mode_owner(&path)?;
+                check_mode_bits(fsuid, fsgid, &groups, dmode, duid, dgid, 1)?;
+            }
+            Ok(path)
+        })
+    {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let proc = current_process();
+    let mut inner = proc.inner_exclusive_access();
+    // Require root or CAP_SYS_CHROOT (bit 18 in word 0)
+    if inner.euid != 0 && (inner.caps[0][0] & (1 << 18)) == 0 {
+        return -1; // EPERM
+    }
+    inner.root = resolved;
+    0
+}
+
 /// getcwd(17) returns the path length including the trailing NUL.
 pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
-    let cwd = current_process().inner_exclusive_access().cwd.clone();
+    let (cwd, root) = {
+        let proc = current_process();
+        let inner = proc.inner_exclusive_access();
+        (inner.cwd.clone(), inner.root.clone())
+    };
     if !fs::directory_is_live(&cwd) {
         return -2;
     }
-    let path = cwd.path();
-    let count = 1 + path.len() + 1;
+    let full = cwd.path();
+    let rel: &str = if root.is_empty() {
+        &full
+    } else if full.as_ref() == root.as_str() {
+        ""
+    } else if let Some(rest) = full.strip_prefix(root.as_str()).and_then(|s| s.strip_prefix('/')) {
+        rest
+    } else {
+        return -2; // ENOENT when cwd is unreachable from chroot
+    };
+    let count = if rel.is_empty() { 2 } else { 1 + rel.len() + 1 };
     if size < count {
         return -34;
     }
@@ -597,7 +768,7 @@ pub fn sys_getcwd(buf: *mut u8, size: usize) -> isize {
         Some(buffers) => UserBuffer::new(buffers),
         None => return -14,
     };
-    let bytes = core::iter::once(b'/').chain(path.bytes()).chain(core::iter::once(0));
+    let bytes = core::iter::once(b'/').chain(rel.bytes()).chain(core::iter::once(0));
     for (dst, byte) in target.into_iter().zip(bytes) {
         dst.write(byte);
     }
@@ -800,6 +971,13 @@ fn write_stat(st: *mut u8, file: &dyn fs::File, fallback_inode: u64) -> isize {
     buf[48..56].copy_from_slice(&size.to_le_bytes());
     buf[56..60].copy_from_slice(&4096u32.to_le_bytes());
     buf[64..72].copy_from_slice(&blocks.to_le_bytes());
+    let ((asec, ansec), (msec, mnsec), (csec, cnsec)) = file.timestamps();
+    buf[72..80].copy_from_slice(&asec.to_le_bytes());
+    buf[80..88].copy_from_slice(&ansec.to_le_bytes());
+    buf[88..96].copy_from_slice(&msec.to_le_bytes());
+    buf[96..104].copy_from_slice(&mnsec.to_le_bytes());
+    buf[104..112].copy_from_slice(&csec.to_le_bytes());
+    buf[112..120].copy_from_slice(&cnsec.to_le_bytes());
     write_stat_bytes(st, &buf)
 }
 
@@ -826,7 +1004,7 @@ fn stat_file_at(
     if raw.ends_with('/') {
         fs::require_directory(&path)?;
     }
-    fs::open_dyn(&path, OpenFlags::RDONLY).map(|file| (file, 0))
+    fs::open_for_stat(&path).map(|file| (file, 0))
 }
 
 pub fn sys_faccessat(dirfd: isize, path: *const u8, mode: usize, flags: usize) -> isize {
@@ -911,7 +1089,7 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: usize, mask: u32, st: *mu
     const AT_NO_AUTOMOUNT: usize = 0x800;
     const AT_STATX_SYNC_TYPE: usize = 0x6000;
     const STATX_RESERVED: u32 = 0x8000_0000;
-    const STATX_AVAILABLE: u32 = 0x61f; // type, mode, nlink, uid, gid, size, blocks
+    const STATX_AVAILABLE: u32 = 0x6ff; // type, mode, nlink, uid, gid, atime, mtime, ctime, size, blocks
     const STATX_INO: u32 = 0x100;
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE) != 0
         || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE
@@ -936,6 +1114,7 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: usize, mask: u32, st: *mu
     let available = STATX_AVAILABLE | if identity.is_some() { STATX_INO } else { 0 };
     let major = ((device >> 8) as u32 & 0xfff) | ((device >> 32) as u32 & !0xfff);
     let minor = (device as u32 & 0xff) | ((device >> 12) as u32 & !0xff);
+    let ((asec, ansec), (msec, mnsec), (csec, cnsec)) = file.timestamps();
     let mut buf = [0u8; 256]; // Linux uapi struct statx
     buf[0..4].copy_from_slice(&available.to_le_bytes());
     buf[4..8].copy_from_slice(&4096u32.to_le_bytes());
@@ -946,6 +1125,12 @@ pub fn sys_statx(dirfd: isize, path: *const u8, flags: usize, mask: u32, st: *mu
     buf[32..40].copy_from_slice(&inode.to_le_bytes());
     buf[40..48].copy_from_slice(&size.to_le_bytes());
     buf[48..56].copy_from_slice(&blocks.to_le_bytes());
+    buf[64..72].copy_from_slice(&asec.to_le_bytes());
+    buf[72..76].copy_from_slice(&(ansec as u32).to_le_bytes());
+    buf[96..104].copy_from_slice(&csec.to_le_bytes());
+    buf[104..108].copy_from_slice(&(cnsec as u32).to_le_bytes());
+    buf[112..120].copy_from_slice(&msec.to_le_bytes());
+    buf[120..124].copy_from_slice(&(mnsec as u32).to_le_bytes());
     if let Some((rdev_major, rdev_minor)) = file.device_numbers() {
         buf[128..132].copy_from_slice(&rdev_major.to_le_bytes());
         buf[132..136].copy_from_slice(&rdev_minor.to_le_bytes());
@@ -994,11 +1179,22 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     const F_SETFD: usize = 2;
     const F_GETFL: usize = 3;
     const F_SETFL: usize = 4;
+    const F_GETLK: usize = 5;
+    const F_SETLK: usize = 6;
+    const F_SETLKW: usize = 7;
+    const F_OFD_GETLK: usize = 36;
+    const F_OFD_SETLK: usize = 37;
+    const F_OFD_SETLKW: usize = 38;
     const F_DUPFD_CLOEXEC: usize = 1030;
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
+    const F_SETPIPE_SZ: usize = 1031;
+    const F_GETPIPE_SZ: usize = 1032;
+    const F_ADD_SEALS: usize = 1033;
+    const F_GET_SEALS: usize = 1034;
+
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
+            let process = current_process();
+            let mut inner = process.inner_exclusive_access();
             let file = match inner.fd_table.get(fd).and_then(Option::as_ref) {
                 Some(file) => file.clone(),
                 None => return -9,
@@ -1012,6 +1208,8 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             new_fd as isize
         }
         F_GETFD | F_SETFD => {
+            let process = current_process();
+            let mut inner = process.inner_exclusive_access();
             if inner.fd_table.get(fd).and_then(Option::as_ref).is_none() {
                 return -9;
             }
@@ -1022,13 +1220,71 @@ pub fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 0
             }
         }
-        F_GETFL => inner.fd_table.get(fd).and_then(Option::as_ref)
-            .map_or(-9, |file| file.status_flags() as isize),
-        F_SETFL => inner.fd_table.get(fd).and_then(Option::as_ref).map_or(-9, |file| {
-            file.set_status_flags(arg as u32);
-            0
-        }),
-        _ => 0,
+        F_GETFL => match file_by_fd(fd) {
+            Ok(file) => file.status_flags() as isize,
+            Err(e) => e,
+        },
+        F_SETFL => match file_by_fd(fd) {
+            Ok(file) if file.path_only() => -9,
+            Ok(file) => {
+                // O_NOATIME(0o1000000) change requires owner or root
+                if (arg as u32 ^ file.status_flags()) & 0o1000000 != 0 && (arg as u32 & 0o1000000) != 0 {
+                    let euid = current_process().inner_exclusive_access().euid;
+                    let (fuid, _) = file.owner();
+                    if euid != 0 && euid != fuid {
+                        return -1;
+                    }
+                }
+                file.set_status_flags(arg as u32);
+                0
+            }
+            Err(e) => e,
+        },
+        F_GETLK | F_OFD_GETLK => match file_by_fd(fd) {
+            Ok(file) => super::lock::fcntl_getlk(fd, &file, arg, cmd == F_OFD_GETLK),
+            Err(e) => e,
+        },
+        F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => match file_by_fd(fd) {
+            Ok(file) => super::lock::fcntl_setlk(
+                fd,
+                &file,
+                arg,
+                matches!(cmd, F_SETLKW | F_OFD_SETLKW),
+                matches!(cmd, F_OFD_SETLK | F_OFD_SETLKW),
+            ),
+            Err(e) => e,
+        },
+        8..=11 | 15 | 16 | 1024 | 1025 => match file_by_fd(fd) {
+            Ok(file) => super::lock::fcntl_owner_sig(&file, cmd, arg),
+            Err(e) => e,
+        },
+        F_SETPIPE_SZ => match file_by_fd(fd) {
+            Ok(file) if file.path_only() => -9,
+            Ok(file) => {
+                let privileged = current_process().inner_exclusive_access().euid == 0;
+                file.pipe().map_or(-22, |p| p.set_pipe_size(arg, privileged))
+            }
+            Err(e) => e,
+        },
+        F_GETPIPE_SZ => match file_by_fd(fd) {
+            Ok(file) if file.path_only() => -9,
+            Ok(file) => file.pipe().map_or(-22, |p| p.pipe_size() as isize),
+            Err(e) => e,
+        },
+        F_ADD_SEALS => match file_by_fd(fd) {
+            Ok(file) if file.path_only() => -9,
+            Ok(file) => file.add_seals(arg as u32),
+            Err(e) => e,
+        },
+        F_GET_SEALS => match file_by_fd(fd) {
+            Ok(file) if file.path_only() => -9,
+            Ok(file) => file.seals().map_or(-22, |s| s as isize),
+            Err(e) => e,
+        },
+        _ => match file_by_fd(fd) {
+            Ok(_) => -22,
+            Err(e) => e,
+        },
     }
 }
 
@@ -1191,7 +1447,7 @@ pub fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: *mut i64, count: us
     result.unwrap_or_else(|e| e)
 }
 
-/// utimensat(88)：校验 fd/路径/timespec，并保留 "touch" 的文件创建语义。
+/// utimensat(88)：校验 fd/路径/timespec 并实际更新文件/目录时间戳。
 pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, flags: usize) -> isize {
     const UTIME_NOW: i64 = (1 << 30) - 1;
     const UTIME_OMIT: i64 = (1 << 30) - 2;
@@ -1199,22 +1455,50 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, flags: usi
         return -22;
     }
     let token = current_user_token();
+    let now_ns = crate::timer::get_realtime_ns();
+    let now = ((now_ns / 1_000_000_000) as i64, (now_ns % 1_000_000_000) as i64);
+    let mut parsed = [Some(now); 2];
+    let mut both_now = times.is_null();
+    let mut both_omit = false;
     if !times.is_null() {
+        let mut raw_nsecs = [0i64; 2];
         for idx in 0..2usize {
             let Some(base) = (times as usize).checked_add(idx * 16) else {
                 return -14;
             };
-            let Some(_sec) = crate::mm::try_read_user(token, base as *const i64) else {
+            let Some(sec) = crate::mm::try_read_user(token, base as *const i64) else {
                 return -14;
             };
             let Some(nsec) = crate::mm::try_read_user(token, (base + 8) as *const i64) else {
                 return -14;
             };
-            if nsec != UTIME_NOW && nsec != UTIME_OMIT && !(0..1_000_000_000).contains(&nsec) {
+            raw_nsecs[idx] = nsec;
+            parsed[idx] = if nsec == UTIME_OMIT {
+                None
+            } else if nsec == UTIME_NOW {
+                Some(now)
+            } else if (0..1_000_000_000).contains(&nsec) {
+                Some((sec, nsec))
+            } else {
                 return -22;
-            }
+            };
         }
+        both_now = raw_nsecs == [UTIME_NOW, UTIME_NOW];
+        both_omit = raw_nsecs == [UTIME_OMIT, UTIME_OMIT];
     }
+    let check_perm = |fmode: u16, fuid: u32, fgid: u32| -> Result<(), isize> {
+        if both_omit {
+            return Ok(());
+        }
+        let (fsuid, fsgid, groups) = current_fs_cred();
+        if fsuid == 0 || fsuid == fuid {
+            return Ok(());
+        }
+        if both_now {
+            return check_mode_bits(fsuid, fsgid, &groups, fmode, fuid, fgid, 2);
+        }
+        Err(-1) // EPERM for explicit timestamp when not owner
+    };
     if path.is_null() {
         if flags & AT_SYMLINK_NOFOLLOW != 0 {
             return -22;
@@ -1222,7 +1506,13 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, flags: usi
         return match file_by_fd(dirfd as usize) {
             Ok(file) if file.path_only() => -9,
             Ok(file) if file.space_usage().map_or(false, |(_, ro)| ro) => -30,
-            Ok(_) => 0,
+            Ok(file) => {
+                let (fuid, fgid) = file.owner();
+                if let Err(e) = check_perm(file.mode(), fuid, fgid) {
+                    return e;
+                }
+                if both_omit { 0 } else { file.set_timestamps(parsed[0], parsed[1]) }
+            }
             Err(e) => e,
         };
     }
@@ -1232,15 +1522,26 @@ pub fn sys_utimensat(dirfd: isize, path: *const u8, times: *const u8, flags: usi
             let resolved = resolve_at_with(dirfd, &raw, follow || raw.ends_with('/'))?;
             check_path_search(&resolved)?;
             if raw.ends_with('/') {
-                fs::require_directory(&resolved)
-            } else if fs::exists(&resolved) {
+                fs::require_directory(&resolved)?;
+            } else if !follow && fs::find_symlink(&resolved)?.is_some() {
                 if fs::space_usage(&resolved).map_or(false, |(_, ro)| ro) {
                     return Err(-30);
                 }
-                Ok(())
-            } else {
-                Err(-2)
+                let (fmode, fuid, fgid) = fs::path_mode_owner(&resolved)?;
+                check_perm(fmode, fuid, fgid)?;
+                return Ok(());
+            } else if !fs::exists(&resolved) {
+                return Err(-2);
             }
+            if fs::space_usage(&resolved).map_or(false, |(_, ro)| ro) {
+                return Err(-30);
+            }
+            let (fmode, fuid, fgid) = fs::path_mode_owner(&resolved)?;
+            check_perm(fmode, fuid, fgid)?;
+            if !both_omit {
+                fs::set_path_timestamps(&resolved, follow, parsed[0], parsed[1])?;
+            }
+            Ok(())
         })
         .err()
         .unwrap_or(0)
@@ -1662,4 +1963,603 @@ pub fn sys_fchownat(dirfd: isize, path: *const u8, uid: u32, gid: u32, flags: us
         })
     })();
     result.err().unwrap_or(0)
+}
+
+pub fn sys_linkat(
+    olddirfd: isize,
+    oldpath: *const u8,
+    newdirfd: isize,
+    newpath: *const u8,
+    flags: usize,
+) -> isize {
+    const AT_SYMLINK_FOLLOW: usize = 0x400;
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return -22;
+    }
+    let token = current_user_token();
+    let result = (|| {
+        let old_raw = translated_path(token, oldpath)?;
+        let new_raw = translated_path(token, newpath)?;
+        if new_raw.is_empty() {
+            return Err(-2);
+        }
+        let follow_old = flags & AT_SYMLINK_FOLLOW != 0;
+        let old_resolved = if old_raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+            return Err(-1); // Linking anonymous/open fd without procfs path
+        } else {
+            let p = resolve_at_with(olddirfd, &old_raw, follow_old || old_raw.ends_with('/'))?;
+            check_path_search(&p)?;
+            if old_raw.ends_with('/') {
+                fs::require_directory(&p)?;
+                return Err(-1); // Hard link to directory -> EPERM
+            }
+            p
+        };
+        let new_resolved = resolve_at_with(newdirfd, &new_raw, false)?;
+        check_parent_write(&new_resolved)?;
+        if new_raw.ends_with('/') {
+            return Err(if fs::exists(&new_resolved) { -17 } else { -2 });
+        }
+        fs::link_path(&old_resolved, &new_resolved)
+    })();
+    result.err().unwrap_or(0)
+}
+
+pub fn sys_mknodat(dirfd: isize, path: *const u8, mode: u32, dev: usize) -> isize {
+    let ftype = (mode as u16) & 0o170000;
+    let ftype = if ftype == 0 { 0o100000 } else { ftype };
+    if !matches!(ftype, 0o100000 | 0o010000 | 0o020000 | 0o060000 | 0o140000) {
+        return -22;
+    }
+    if matches!(ftype, 0o020000 | 0o060000) {
+        let proc = current_process();
+        let inner = proc.inner_exclusive_access();
+        // Require root or CAP_MKNOD (bit 27 in word 0)
+        if inner.euid != 0 && (inner.caps[0][0] & (1 << 27)) == 0 {
+            return -1; // EPERM
+        }
+    }
+    let result = (|| {
+        let raw = translated_path(current_user_token(), path)?;
+        let resolved = resolve_at_with(dirfd, &raw, false)?;
+        check_parent_write(&resolved)?;
+        if raw.ends_with('/') {
+            return Err(if fs::exists(&resolved) { -17 } else { -2 });
+        }
+        let d = dev as u64;
+        let major = (((d >> 8) & 0xfff) | ((d >> 32) & !0xfff)) as u32;
+        let minor = ((d & 0xff) | ((d >> 12) & !0xff)) as u32;
+        let perms = creation_permissions(mode);
+        fs::mknod_path(&resolved, ftype | perms, (major, minor))
+    })();
+    result.err().unwrap_or(0)
+}
+
+pub fn sys_fadvise64(fd: usize, _offset: i64, len: i64, advice: usize) -> isize {
+    let file = match file_by_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    if file.path_only() {
+        return -9;
+    }
+    if file.pipe().is_some() {
+        return -29; // ESPIPE
+    }
+    if len < 0 || advice > 5 {
+        return -22; // EINVAL
+    }
+    0
+}
+
+pub fn sys_sync_file_range(fd: usize, offset: i64, nbytes: i64, flags: u32) -> isize {
+    let file = match file_by_fd(fd) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    if file.path_only() {
+        return -9;
+    }
+    if file.pipe().is_some() {
+        return -29; // ESPIPE
+    }
+    if offset < 0 || nbytes < 0 || flags & !7 != 0 || offset.checked_add(nbytes).is_none() {
+        return -22;
+    }
+    let len = if nbytes == 0 { usize::MAX } else { nbytes as usize };
+    file.sync_range(offset as usize, len).err().unwrap_or(0)
+}
+
+pub fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
+    const CLOSE_RANGE_UNSHARE: u32 = 2;
+    const CLOSE_RANGE_CLOEXEC: u32 = 4;
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
+        return -22;
+    }
+    let proc = current_process();
+    let pid = proc.getpid();
+    let mut inner = proc.inner_exclusive_access();
+    let len = inner.fd_table.len();
+    let start = (first as usize).min(len);
+    let end = (last as usize).saturating_add(1).min(len);
+    if flags & CLOSE_RANGE_CLOEXEC != 0 {
+        for fd in start..end {
+            if inner.fd_table[fd].is_some() {
+                inner.set_close_on_exec(fd, true);
+            }
+        }
+        return 0;
+    }
+    let mut closed = Vec::new();
+    for fd in start..end {
+        if let Some(f) = inner.fd_table[fd].take() {
+            inner.set_close_on_exec(fd, false);
+            closed.push(f);
+        }
+    }
+    drop(inner);
+    for file in closed {
+        super::lock::on_file_closed(pid, &file);
+    }
+    0
+}
+
+pub fn sys_splice(
+    fd_in: usize,
+    off_in: *mut i64,
+    fd_out: usize,
+    off_out: *mut i64,
+    len: usize,
+    flags: u32,
+) -> isize {
+    if flags & !0xf != 0 {
+        return -22;
+    }
+    let result = (|| -> Result<isize, isize> {
+        let in_file = file_by_fd(fd_in)?;
+        let out_file = file_by_fd(fd_out)?;
+        if in_file.path_only() || !in_file.readable() || out_file.path_only() || !out_file.writable() {
+            return Err(-9);
+        }
+        if out_file.status_flags() & 0o2000 != 0 {
+            return Err(-22); // O_APPEND on out_fd -> EINVAL in splice
+        }
+        let in_pipe = in_file.pipe();
+        let out_pipe = out_file.pipe();
+        if in_pipe.is_none() && out_pipe.is_none() {
+            return Err(-22);
+        }
+        if (in_pipe.is_some() && !off_in.is_null()) || (out_pipe.is_some() && !off_out.is_null()) {
+            return Err(-29); // ESPIPE
+        }
+        if let (Some(pi), Some(po)) = (in_pipe, out_pipe) {
+            if pi.same_buffer(po) {
+                return Err(-22);
+            }
+        }
+        if in_pipe.is_none() && (!in_file.supports_positioned_io() || in_file.directory().is_some()) {
+            return Err(-22);
+        }
+        if out_pipe.is_none() && (!out_file.supports_positioned_io() || out_file.directory().is_some()) {
+            return Err(-22);
+        }
+        let token = current_user_token();
+        let mut in_off = if !off_in.is_null() {
+            let off = crate::mm::try_read_user(token, off_in as *const i64).ok_or(-14isize)?;
+            if crate::mm::prepare_user_write(token, off_in).is_none() {
+                return Err(-14);
+            }
+            if off < 0 {
+                return Err(-22);
+            }
+            Some(off)
+        } else {
+            None
+        };
+        let mut out_off = if !off_out.is_null() {
+            let off = crate::mm::try_read_user(token, off_out as *const i64).ok_or(-14isize)?;
+            if crate::mm::prepare_user_write(token, off_out).is_none() {
+                return Err(-14);
+            }
+            if off < 0 {
+                return Err(-22);
+            }
+            Some(off)
+        } else {
+            None
+        };
+        let mut remaining = len.min(MAX_RW_COUNT);
+        if remaining == 0 {
+            return Ok(0);
+        }
+        let nonblock = flags & 2 != 0; // SPLICE_F_NONBLOCK
+        let mut buf = alloc::vec![0u8; remaining.min(4096)];
+        if let (Some(input), Some(output)) = (in_pipe, out_pipe) {
+            return Ok(input.splice_to(output, &mut buf, nonblock));
+        }
+        let mut total = 0usize;
+        while remaining > 0 {
+            let chunk = remaining.min(buf.len());
+            let transferred = if let Some(input) = in_pipe {
+                let copied = input.peek_kernel(&mut buf[..chunk], nonblock);
+                if copied <= 0 {
+                    copied
+                } else {
+                    let data = unsafe {
+                        UserBuffer::from_kernel_slice(buf.as_mut_ptr(), copied as usize)
+                    };
+                    let written = if let Some(off) = out_off {
+                        out_file.write_positioned(off as usize, data)
+                    } else {
+                        out_file.write(data)
+                    };
+                    if written > 0 {
+                        input.consume_kernel(written as usize);
+                    }
+                    written
+                }
+            } else {
+                out_pipe.unwrap().splice_from_file(&mut buf[..chunk], nonblock || total > 0, |dst| {
+                    let data = unsafe { UserBuffer::from_kernel_slice(dst.as_mut_ptr(), dst.len()) };
+                    if let Some(off) = in_off {
+                        in_file.read_positioned(off as usize, data)
+                    } else {
+                        in_file.read_result(data)
+                    }
+                })
+            };
+            if transferred <= 0 {
+                if total == 0 && transferred < 0 {
+                    return Err(transferred);
+                }
+                break;
+            }
+            if let Some(off) = in_off.as_mut() {
+                *off = off.saturating_add(transferred as i64);
+            }
+            if let Some(off) = out_off.as_mut() {
+                *off = off.saturating_add(transferred as i64);
+            }
+            let transferred = transferred as usize;
+            total += transferred;
+            remaining -= transferred;
+            if transferred < chunk || in_pipe.is_some() {
+                break;
+            }
+        }
+        if let Some(off) = in_off {
+            crate::mm::try_write_user(token, off_in, off).ok_or(-14isize)?;
+        }
+        if let Some(off) = out_off {
+            crate::mm::try_write_user(token, off_out, off).ok_or(-14isize)?;
+        }
+        Ok(total as isize)
+    })();
+    result.unwrap_or_else(|e| e)
+}
+
+pub fn sys_vmsplice(fd: usize, iov: *const u8, nr_segs: usize, flags: u32) -> isize {
+    if flags & !0xf != 0 {
+        return -22;
+    }
+    let result = (|| -> Result<isize, isize> {
+        let file = file_by_fd(fd)?;
+        if file.path_only() || file.pipe().is_none() || !file.writable() {
+            return Err(-9); // EBADF
+        }
+        let token = current_user_token();
+        let segments = read_iovecs(token, iov as usize, nr_segs)?;
+        for &(base, len) in &segments {
+            if len != 0 && base.checked_add(len).map_or(true, |end| end > crate::mm::USER_END) {
+                return Err(-14);
+            }
+        }
+        let mut buffers = Vec::new();
+        for &(base, len) in &segments {
+            let (mut chunk, copied) =
+                crate::mm::translated_byte_prefix(token, base as *const u8, len, MapPermission::R);
+            buffers.append(&mut chunk);
+            if copied < len {
+                if buffers.is_empty() {
+                    return Err(-14);
+                }
+                break;
+            }
+        }
+        if buffers.is_empty() {
+            return Ok(0);
+        }
+        Ok(with_io_file(file, |f| f.write(UserBuffer::new(buffers))))
+    })();
+    result.unwrap_or_else(|e| e)
+}
+
+pub fn sys_tee(fd_in: usize, fd_out: usize, len: usize, flags: u32) -> isize {
+    if flags & !0xf != 0 {
+        return -22;
+    }
+    let result = (|| -> Result<isize, isize> {
+        let in_file = file_by_fd(fd_in)?;
+        let out_file = file_by_fd(fd_out)?;
+        if in_file.path_only() || !in_file.readable() || out_file.path_only() || !out_file.writable() {
+            return Err(-9);
+        }
+        let (Some(pi), Some(po)) = (in_file.pipe(), out_file.pipe()) else {
+            return Err(-22); // EINVAL on non-pipe
+        };
+        if pi.same_buffer(po) {
+            return Err(-22);
+        }
+        if len == 0 {
+            return Ok(0);
+        }
+        let cap = len.min(16384);
+        let mut scratch = alloc::vec![0u8; cap];
+        let n = pi.peek_kernel(&mut scratch, flags & 2 != 0);
+        if n <= 0 {
+            return Ok(n);
+        }
+        Ok(po.write_kernel(&scratch[..n as usize], flags & 2 != 0))
+    })();
+    result.unwrap_or_else(|e| e)
+}
+
+pub fn sys_copy_file_range(
+    fd_in: usize,
+    off_in: *mut i64,
+    fd_out: usize,
+    off_out: *mut i64,
+    len: usize,
+    flags: u32,
+) -> isize {
+    if flags != 0 {
+        return -22;
+    }
+    let result = (|| -> Result<isize, isize> {
+        let in_file = file_by_fd(fd_in)?;
+        let out_file = file_by_fd(fd_out)?;
+        if in_file.path_only()
+            || !in_file.readable()
+            || out_file.path_only()
+            || !out_file.writable()
+            || (out_file.status_flags() & 0o2000 != 0)
+        {
+            return Err(-9); // EBADF (including O_APPEND on out_fd)
+        }
+        if in_file.directory().is_some() || out_file.directory().is_some() {
+            return Err(-21); // EISDIR
+        }
+        if !in_file.supports_positioned_io() || !out_file.supports_positioned_io() {
+            return Err(-22); // EINVAL on pipes/devices/sockets
+        }
+        let token = current_user_token();
+        let mut explicit_in = if !off_in.is_null() {
+            let off = crate::mm::try_read_user(token, off_in as *const i64).ok_or(-14isize)?;
+            if crate::mm::prepare_user_write(token, off_in).is_none() {
+                return Err(-14);
+            }
+            if off < 0 {
+                return Err(-22);
+            }
+            Some(off)
+        } else {
+            None
+        };
+        let mut explicit_out = if !off_out.is_null() {
+            let off = crate::mm::try_read_user(token, off_out as *const i64).ok_or(-14isize)?;
+            if crate::mm::prepare_user_write(token, off_out).is_none() {
+                return Err(-14);
+            }
+            if off < 0 {
+                return Err(-22);
+            }
+            Some(off)
+        } else {
+            None
+        };
+        let mut remaining = len.min(MAX_RW_COUNT);
+        let cur_in = explicit_in.unwrap_or_else(|| in_file.seek(0).max(0) as i64);
+        let cur_out = explicit_out.unwrap_or_else(|| out_file.seek(0).max(0) as i64);
+        if cur_in.checked_add(remaining as i64).is_none() || cur_out.checked_add(remaining as i64).is_none() {
+            return Err(-75); // EOVERFLOW
+        }
+        if remaining == 0 {
+            return Ok(0);
+        }
+        if let (Some(id_a), Some(id_b)) = (in_file.stat_identity(), out_file.stat_identity()) {
+            if id_a == id_b {
+                let a_end = cur_in + remaining as i64;
+                let b_end = cur_out + remaining as i64;
+                if cur_in < b_end && cur_out < a_end {
+                    return Err(-22); // Overlapping ranges on same file -> EINVAL
+                }
+            }
+        }
+        let mut buf = alloc::vec![0u8; remaining.min(4096)];
+        let mut total = 0usize;
+        while remaining > 0 {
+            let chunk = remaining.min(buf.len());
+            let nr = if let Some(off) = explicit_in {
+                if (off as usize) >= in_file.size() {
+                    0
+                } else {
+                    let kb = unsafe { UserBuffer::from_kernel_slice(buf.as_mut_ptr(), chunk) };
+                    in_file.read_positioned(off as usize, kb)
+                }
+            } else {
+                let kb = unsafe { UserBuffer::from_kernel_slice(buf.as_mut_ptr(), chunk) };
+                in_file.read_result(kb)
+            };
+            if nr < 0 {
+                return if total > 0 { Ok(total as isize) } else { Err(nr) };
+            }
+            if nr == 0 {
+                break;
+            }
+            let nr = nr as usize;
+            let nw = if let Some(off) = explicit_out {
+                let kb = unsafe { UserBuffer::from_kernel_slice(buf.as_mut_ptr(), nr) };
+                out_file.write_positioned(off as usize, kb)
+            } else {
+                let kb = unsafe { UserBuffer::from_kernel_slice(buf.as_mut_ptr(), nr) };
+                out_file.write(kb)
+            };
+            if nw < 0 {
+                return if total > 0 { Ok(total as isize) } else { Err(nw) };
+            }
+            let nw = nw as usize;
+            if let Some(ref mut off) = explicit_in {
+                *off += nw as i64;
+            } else if nw < nr {
+                let _ = in_file.seek(-((nr - nw) as isize));
+            }
+            if let Some(ref mut off) = explicit_out {
+                *off += nw as i64;
+            }
+            total += nw;
+            remaining -= nw;
+            if nw < chunk {
+                break;
+            }
+        }
+        if let Some(off) = explicit_in {
+            crate::mm::try_write_user(token, off_in, off).ok_or(-14isize)?;
+        }
+        if let Some(off) = explicit_out {
+            crate::mm::try_write_user(token, off_out, off).ok_or(-14isize)?;
+        }
+        Ok(total as isize)
+    })();
+    result.unwrap_or_else(|e| e)
+}
+
+fn check_xattr_name(name: &str, write: bool) -> Result<(), isize> {
+    if name.is_empty() || name.len() > 255 {
+        return Err(-34); // ERANGE
+    }
+    if let Some(rest) = name.strip_prefix("user.") {
+        if rest.is_empty() {
+            return Err(-22);
+        }
+        Ok(())
+    } else if let Some(rest) = name
+        .strip_prefix("trusted.")
+        .or_else(|| name.strip_prefix("security."))
+    {
+        if rest.is_empty() {
+            return Err(-22);
+        }
+        if write && current_process().inner_exclusive_access().euid != 0 {
+            return Err(-1); // EPERM
+        }
+        Ok(())
+    } else if name.starts_with("system.") {
+        Err(-95)
+    } else {
+        Err(-95) // EOPNOTSUPP
+    }
+}
+
+pub fn sys_xattr(syscall_id: usize, args: [usize; 6]) -> isize {
+    // 5..=7: setxattr/lsetxattr/fsetxattr
+    // 8..=10: getxattr/lgetxattr/fgetxattr
+    // 11..=13: listxattr/llistxattr/flistxattr
+    // 14..=16: removexattr/lremovexattr/fremovexattr
+    let is_fd = matches!(syscall_id, 7 | 10 | 13 | 16);
+    let follow = !matches!(syscall_id, 6 | 9 | 12 | 15);
+    let is_set = (5..=7).contains(&syscall_id);
+    let is_get = (8..=10).contains(&syscall_id);
+    let is_list = (11..=13).contains(&syscall_id);
+    let is_remove = (14..=16).contains(&syscall_id);
+    let token = current_user_token();
+
+    let result = (|| -> Result<isize, isize> {
+        let attr_name = if is_list {
+            String::new()
+        } else {
+            let raw_name = crate::mm::translated_c_bytes(token, args[1] as *const u8)?;
+            let s = core::str::from_utf8(&raw_name).map_err(|_| -22isize)?;
+            check_xattr_name(s, is_set || is_remove)?;
+            String::from(s)
+        };
+        let payload = if is_set {
+            let size = args[3];
+            if size > 65536 {
+                return Err(-7); // E2BIG
+            }
+            let mut v = alloc::vec![0u8; size];
+            if size > 0 {
+                let bufs = translated_byte_buffer(token, args[2] as *const u8, size, MapPermission::R)
+                    .ok_or(-14isize)?;
+                for (d, b) in v.iter_mut().zip(UserBuffer::new(bufs)) {
+                    *d = b.read();
+                }
+            }
+            Some((v, args[4]))
+        } else {
+            None
+        };
+
+        let out = if is_fd {
+            let file = file_by_fd(args[0])?;
+            if file.path_only() {
+                return Err(-9);
+            }
+            // user.* xattrs are not permitted on symlinks or device/FIFO special files in Linux
+            let ftype = file.mode() & 0o170000;
+            if attr_name.starts_with("user.") && !matches!(ftype, 0o100000 | 0o040000) {
+                return if is_set || is_remove { Err(-1) } else { Err(-61) };
+            }
+            let (fsuid, fsgid, groups) = current_fs_cred();
+            if fsuid != 0 && !is_list {
+                let (fuid, fgid) = file.owner();
+                let want = if is_set || is_remove { 2 } else { 4 };
+                check_mode_bits(fsuid, fsgid, &groups, file.mode(), fuid, fgid, want)?;
+            }
+            let set_ref = payload.as_ref().map(|(v, fl)| (v.as_slice(), *fl));
+            file.xattr_op(&attr_name, set_ref, is_remove)?
+        } else {
+            let raw_path = translated_path(token, args[0] as *const u8)?;
+            let resolved = resolve_at_with(AT_FDCWD, &raw_path, follow || raw_path.ends_with('/'))?;
+            check_path_search(&resolved)?;
+            if raw_path.ends_with('/') {
+                fs::require_directory(&resolved)?;
+            }
+            let (fmode, fuid, fgid) = fs::path_mode_owner(&resolved)?;
+            let ftype = fmode & 0o170000;
+            if attr_name.starts_with("user.") && !matches!(ftype, 0o100000 | 0o040000) {
+                return if is_set || is_remove { Err(-1) } else { Err(-61) };
+            }
+            let (fsuid, fsgid, groups) = current_fs_cred();
+            if fsuid != 0 && !is_list {
+                let want = if is_set || is_remove { 2 } else { 4 };
+                check_mode_bits(fsuid, fsgid, &groups, fmode, fuid, fgid, want)?;
+            }
+            let set_ref = payload.as_ref().map(|(v, fl)| (v.as_slice(), *fl));
+            fs::xattr_path_op(&resolved, follow, &attr_name, set_ref, is_remove)?
+        };
+
+        if is_get || is_list {
+            let (buf_ptr, size) = if is_get {
+                (args[2] as *mut u8, args[3])
+            } else {
+                (args[1] as *mut u8, args[2])
+            };
+            if size == 0 {
+                return Ok(out.len() as isize);
+            }
+            if size < out.len() {
+                return Err(-34); // ERANGE
+            }
+            if !out.is_empty() {
+                let bufs = translated_byte_buffer(token, buf_ptr, out.len(), MapPermission::W)
+                    .ok_or(-14isize)?;
+                UserBuffer::new(bufs).copy_from(&out);
+            }
+            Ok(out.len() as isize)
+        } else {
+            Ok(0)
+        }
+    })();
+    result.unwrap_or_else(|e| e)
 }

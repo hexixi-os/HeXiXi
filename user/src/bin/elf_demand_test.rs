@@ -68,6 +68,7 @@ fn main() -> i32 {
     reject("elf-short-segment\0");
     reject("elf-long-interpreter\0");
     reject_with("elf-missing-pt-interp\0", -2);
+    reject_with("elf-missing-musl-loader\0", -2);
     reject("elf-invalid-pt-interp\0");
     reject_with("elf-non-elf-pt-interp\0", -80);
     reject_with("elf-overlap-pt-interp\0", -80);

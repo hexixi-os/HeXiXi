@@ -67,7 +67,7 @@ pub fn open_executable(name: &str) -> Result<Executable, isize> {
                     Some(OverlayEntry::File(data)) => {
                         data.exclusive_access().snapshot().map(Executable::Overlay)
                     }
-                    Some(OverlayEntry::Directory(_)) => Err(-13),
+                    Some(OverlayEntry::Directory(_) | OverlayEntry::Fifo(_) | OverlayEntry::Special(_)) => Err(-13),
                     Some(OverlayEntry::Symlink(_)) => Err(-40),
                     Some(OverlayEntry::Whiteout) | None => Err(-2),
                 };
@@ -81,7 +81,7 @@ pub fn open_executable(name: &str) -> Result<Executable, isize> {
         Some(OverlayEntry::File(data)) => {
             return data.exclusive_access().snapshot().map(Executable::Overlay);
         }
-        Some(OverlayEntry::Directory(_)) => return Err(-13),
+        Some(OverlayEntry::Directory(_) | OverlayEntry::Fifo(_) | OverlayEntry::Special(_)) => return Err(-13),
         Some(OverlayEntry::Symlink(_)) => return Err(-40),
         Some(OverlayEntry::Whiteout) => return Err(-2),
         None => {}

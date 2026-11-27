@@ -19,7 +19,9 @@ use crate::timer::remove_timer;
 
 pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
-pub(crate) use manager::{invalidate_file_pages, mount_is_busy, process_ids};
+pub(crate) use manager::{
+    has_shared_writable_mapping, invalidate_file_pages, mount_is_busy, process_ids,
+};
 pub use manager::{add_task, remove_task, pid2process, remove_from_pid2process, tid2task};
 #[allow(unused_imports)]
 pub use processor::{
@@ -146,15 +148,28 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
         }
 
         let mut init_waiters = None;
+        let mut pdeath_targets: Vec<(Arc<ProcessControlBlock>, usize)> = Vec::new();
         if !process_inner.children.is_empty() {
             // move all child processes under init process
             let mut initproc_inner = INITPROC.inner_exclusive_access();
             for child in process_inner.children.iter() {
-                child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
+                let sig = {
+                    let mut ci = child.inner_exclusive_access();
+                    ci.parent = Some(Arc::downgrade(&INITPROC));
+                    if !ci.is_zombie && ci.pdeathsig != 0 {
+                        Some(ci.pdeathsig as usize)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(sig) = sig {
+                    pdeath_targets.push((Arc::clone(child), sig));
+                }
                 initproc_inner.children.push(child.clone());
             }
             init_waiters = Some(initproc_inner.child_waiters.clone());
         }
+        let exit_uid = process_inner.uid;
         if let Some(waiters) = parent_waiters {
             waiters.wake_all();
         }
@@ -193,11 +208,19 @@ fn exit_current_with_status(exit_code: i32, wait_status: i32, group: bool) {
         let exiting_task = process_inner.tasks.get_mut(tid).and_then(|t| t.take());
         // deallocate other data in user space i.e. program code/data section
         process_inner.memory_set.recycle_data_pages();
-        // drop file descriptors
-        process_inner.fd_table.clear();
+        let old_fds = core::mem::take(&mut process_inner.fd_table);
+        let old_shm = core::mem::take(&mut process_inner.shm_attachments);
         // remove all tasks
         process_inner.tasks.clear();
         drop(process_inner);
+        for (child, sig) in pdeath_targets {
+            crate::syscall::signal::send_process_signal(&child, sig, pid, exit_uid);
+        }
+        crate::syscall::lock::release_process_locks(pid);
+        crate::syscall::sysvipc::on_process_exit(pid, &old_shm);
+        for file in old_fds.into_iter().flatten() {
+            crate::syscall::lock::on_file_closed(pid, &file);
+        }
         // 交给延迟回收队列，下次在别的内核栈上再真正析构
         if let Some(t) = exiting_task {
             recycle_task(t);

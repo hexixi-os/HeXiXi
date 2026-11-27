@@ -151,6 +151,230 @@ fn script_interpreter(
     Ok((source, new_args, interpreter_path))
 }
 
+pub fn sys_execveat(
+    dirfd: isize,
+    path: *const u8,
+    args: *const usize,
+    envp: *const usize,
+    flags: usize,
+) -> isize {
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    const AT_EMPTY_PATH: usize = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return -22;
+    }
+    let token = current_user_token();
+    let raw_path = match translated_path(token, path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let args = match exec_arguments(token, args) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    let envs = match exec_arguments(token, envp) {
+        Ok(e) => e,
+        Err(e) => return e,
+    };
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let resolved = if raw_path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        return -13;
+    } else if raw_path.starts_with('/') || dirfd == -100 {
+        match crate::fs::resolve_path_with(&raw_path, follow) {
+            Ok(p) => p,
+            Err(e) => return e,
+        }
+    } else {
+        let proc = current_process();
+        let inner = proc.inner_exclusive_access();
+        let root = inner.root.clone();
+        let Some(file) = inner.fd_table.get(dirfd as usize).and_then(Option::as_ref).cloned() else {
+            return -9;
+        };
+        drop(inner);
+        let Some(dir) = file.directory() else {
+            return -20;
+        };
+        if !crate::fs::directory_is_live(dir.location()) {
+            return -2;
+        }
+        match crate::fs::resolve_from_in_root(&raw_path, &dir.location().path(), &root, follow) {
+            Ok(p) => p,
+            Err(e) => return e,
+        }
+    };
+    if !follow {
+        if let Ok(Some(_)) = crate::fs::find_symlink(&resolved) {
+            return -40; // ELOOP when AT_SYMLINK_NOFOLLOW targets a symlink
+        }
+    }
+    let source = match open_executable(&resolved) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let mut prefix = [0; 256];
+    let prefix_len = source.read_at(0, &mut prefix);
+    let prefix = &prefix[..prefix_len];
+    let (source, args, final_path) = if prefix.starts_with(b"#!") {
+        match script_interpreter(prefix, prefix_len < source.len(), &raw_path, args) {
+            Ok(interp) => interp,
+            Err(e) => return e,
+        }
+    } else {
+        (source, args, resolved)
+    };
+    match current_process().exec(source, &final_path, &raw_path, args, envs) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+pub fn sys_waitid(
+    idtype: usize,
+    id: usize,
+    infop: usize,
+    options: usize,
+    rusage: usize,
+) -> isize {
+    const P_ALL: usize = 0;
+    const P_PID: usize = 1;
+    const P_PGID: usize = 2;
+    const WNOHANG: usize = 1;
+    const WSTOPPED: usize = 2;
+    const WEXITED: usize = 4;
+    const WCONTINUED: usize = 8;
+    const WNOWAIT: usize = 0x0100_0000;
+    const WNOTHREAD: usize = 0x2000_0000;
+    const WALL: usize = 0x4000_0000;
+    const WCLONE: usize = 0x8000_0000;
+
+    if !matches!(idtype, P_ALL | P_PID | P_PGID) {
+        return -22;
+    }
+    if options & (WEXITED | WSTOPPED | WCONTINUED) == 0
+        || options & !(WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | WNOTHREAD | WALL | WCLONE) != 0
+    {
+        return -22;
+    }
+    if matches!(idtype, P_PID | P_PGID) && (id as isize) <= 0 && !(idtype == P_PGID && id == 0) {
+        return -22;
+    }
+    loop {
+        let process = current_process();
+        let inner = process.inner_exclusive_access();
+        let caller_pgid = inner.pgid.0;
+        let mut has_child = false;
+        let event = inner.children.iter().enumerate().find_map(|(idx, child)| {
+            let state = child.inner_exclusive_access();
+            match idtype {
+                P_ALL => {}
+                P_PID => {
+                    if child.getpid() != id {
+                        return None;
+                    }
+                }
+                P_PGID => {
+                    let want = if id == 0 { caller_pgid } else { id };
+                    if state.pgid.0 != want {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+            has_child = true;
+            if state.is_zombie {
+                if options & WEXITED == 0 {
+                    return None;
+                }
+                let ws = state.wait_status;
+                let (code, sig_or_exit) = if ws & 0x7f == 0 {
+                    (1i32, (ws >> 8) & 0xff) // CLD_EXITED
+                } else {
+                    (2i32, ws & 0x7f) // CLD_KILLED
+                };
+                return Some((idx, child.getpid(), state.uid, code, sig_or_exit, true));
+            }
+            let ws = state.job_wait_status?;
+            if ws == 0xffff {
+                (options & WCONTINUED != 0).then_some((idx, child.getpid(), state.uid, 6i32, 18i32, false))
+            } else {
+                (options & WSTOPPED != 0).then_some((
+                    idx,
+                    child.getpid(),
+                    state.uid,
+                    5i32,
+                    (ws >> 8) & 0xff,
+                    false,
+                ))
+            }
+        });
+        let waiters = inner.child_waiters.clone();
+        let token = inner.get_user_token();
+        drop(inner);
+        if let Some((idx, found_pid, cuid, code, status, exited)) = event {
+            if infop != 0 {
+                let mut si = [0u8; 128];
+                si[0..4].copy_from_slice(&17i32.to_ne_bytes()); // SIGCHLD
+                si[8..12].copy_from_slice(&code.to_ne_bytes());
+                si[16..20].copy_from_slice(&(found_pid as i32).to_ne_bytes());
+                si[20..24].copy_from_slice(&cuid.to_ne_bytes());
+                si[24..28].copy_from_slice(&status.to_ne_bytes());
+                let Some(b) = translated_byte_buffer(token, infop as *const u8, 128, MapPermission::W) else {
+                    return -14;
+                };
+                UserBuffer::new(b).copy_from(&si);
+            }
+            if rusage != 0 {
+                let Some(b) = translated_byte_buffer(token, rusage as *const u8, 144, MapPermission::W) else {
+                    return -14;
+                };
+                UserBuffer::new(b).fill_zero();
+            }
+            if options & WNOWAIT == 0 {
+                let mut inner = process.inner_exclusive_access();
+                if exited {
+                    remove_from_pid2process(found_pid);
+                    inner.children.remove(idx);
+                } else if let Some(ch) = inner.children.get(idx) {
+                    ch.inner_exclusive_access().job_wait_status = None;
+                }
+            }
+            return 0;
+        }
+        drop(process);
+        if !has_child {
+            return -10; // ECHILD
+        }
+        if options & WNOHANG != 0 {
+            if infop != 0 {
+                let Some(b) = translated_byte_buffer(token, infop as *const u8, 128, MapPermission::W) else {
+                    return -14;
+                };
+                UserBuffer::new(b).fill_zero();
+            }
+            if rusage != 0 {
+                let Some(b) = translated_byte_buffer(token, rusage as *const u8, 144, MapPermission::W) else {
+                    return -14;
+                };
+                UserBuffer::new(b).fill_zero();
+            }
+            return 0;
+        }
+        crate::task::check_kill_current();
+        if !waiters.register_current_interruptible() {
+            return -4;
+        }
+        crate::task::block_current_and_run_next();
+        if let Some(current) = crate::task::current_task() {
+            crate::task::WaitQueue::cancel(&current);
+        }
+        crate::task::check_kill_current();
+        if super::signal::current_wait_interrupted() {
+            return -4;
+        }
+    }
+}
+
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32, options: usize) -> isize {
     const WNOHANG: usize = 1;
     const WUNTRACED: usize = 2;
@@ -309,33 +533,123 @@ pub fn sys_umask(mask: u32) -> isize {
     core::mem::replace(&mut inner.umask, mask & 0o777) as isize
 }
 
-/// uname(2)：填 6 个 65 字节字段
-pub fn sys_uname(buf: *mut u8) -> isize {
-    let token = current_user_token();
-    let fields: [&str; 6] = [
-        "Linux",
-        "rcore",
-        "6.0.0-rcore",
-        "#1 rCore-Tutorial",
-        crate::arch::NAME,
-        "localdomain",
-    ];
-    for (i, f) in fields.iter().enumerate() {
-        for j in 0..65usize {
-            let c = if j < f.len() { f.as_bytes()[j] } else { 0 };
-            write_user(token, (buf as usize + i * 65 + j) as *mut u8, c);
+struct UtsNames {
+    nodename: [u8; 65],
+    nodename_len: usize,
+    domainname: [u8; 65],
+    domainname_len: usize,
+}
+
+lazy_static::lazy_static! {
+    static ref UTS_NAMES: crate::sync::UPSafeCell<UtsNames> = {
+        let mut nodename = [0u8; 65];
+        nodename[..5].copy_from_slice(b"rcore");
+        let mut domainname = [0u8; 65];
+        domainname[..11].copy_from_slice(b"localdomain");
+        unsafe {
+            crate::sync::UPSafeCell::new(UtsNames {
+                nodename,
+                nodename_len: 5,
+                domainname,
+                domainname_len: 11,
+            })
         }
+    };
+}
+
+/// uname(160)：填 6 个 65 字节字段，非法指针返回 EFAULT
+pub fn sys_uname(buf: *mut u8) -> isize {
+    if buf.is_null() {
+        return -14;
     }
+    let token = current_user_token();
+    let Some(buffers) = translated_byte_buffer(token, buf, 390, MapPermission::W) else {
+        return -14;
+    };
+    let mut raw = [0u8; 390];
+    let uts = UTS_NAMES.exclusive_access();
+    let fixed: [&[u8]; 6] = [
+        b"Linux",
+        &uts.nodename[..uts.nodename_len],
+        b"6.0.0-rcore",
+        b"#1 rCore-Tutorial",
+        crate::arch::NAME.as_bytes(),
+        &uts.domainname[..uts.domainname_len],
+    ];
+    for (i, f) in fixed.iter().enumerate() {
+        let n = f.len().min(64);
+        raw[i * 65..i * 65 + n].copy_from_slice(&f[..n]);
+    }
+    drop(uts);
+    UserBuffer::new(buffers).copy_from(&raw);
     0
 }
 
-/// times(2)：返回 100Hz 的时钟滴答数
-pub fn sys_times(buf: *mut u8) -> isize {
-    let token = current_user_token();
-    for i in 0..32usize {
-        write_user(token, (buf as usize + i) as *mut u8, 0);
+pub fn sys_sethostname(name: *const u8, len: usize) -> isize {
+    let proc = current_process();
+    let inner = proc.inner_exclusive_access();
+    if inner.euid != 0 && (inner.caps[0][0] & (1 << 21)) == 0 {
+        return -1; // EPERM (CAP_SYS_ADMIN)
     }
-    (crate::timer::get_time_ms() / 10) as isize
+    drop(inner);
+    if (len as isize) < 0 || len > 64 {
+        return -22; // EINVAL
+    }
+    let mut tmp = [0u8; 65];
+    if len > 0 {
+        if name.is_null() {
+            return -14;
+        }
+        let Some(bufs) = translated_byte_buffer(current_user_token(), name, len, MapPermission::R) else {
+            return -14;
+        };
+        for (d, s) in tmp[..len].iter_mut().zip(UserBuffer::new(bufs)) {
+            *d = s.read();
+        }
+    }
+    let mut uts = UTS_NAMES.exclusive_access();
+    uts.nodename = tmp;
+    uts.nodename_len = len;
+    0
+}
+
+pub fn sys_setdomainname(name: *const u8, len: usize) -> isize {
+    let proc = current_process();
+    let inner = proc.inner_exclusive_access();
+    if inner.euid != 0 && (inner.caps[0][0] & (1 << 21)) == 0 {
+        return -1; // EPERM (CAP_SYS_ADMIN)
+    }
+    drop(inner);
+    if (len as isize) < 0 || len > 64 {
+        return -22; // EINVAL
+    }
+    let mut tmp = [0u8; 65];
+    if len > 0 {
+        if name.is_null() {
+            return -14;
+        }
+        let Some(bufs) = translated_byte_buffer(current_user_token(), name, len, MapPermission::R) else {
+            return -14;
+        };
+        for (d, s) in tmp[..len].iter_mut().zip(UserBuffer::new(bufs)) {
+            *d = s.read();
+        }
+    }
+    let mut uts = UTS_NAMES.exclusive_access();
+    uts.domainname = tmp;
+    uts.domainname_len = len;
+    0
+}
+
+/// times(153)：返回 100Hz 的时钟滴答数；buf == NULL 合法，非法非空指针返回 EFAULT
+pub fn sys_times(buf: *mut u8) -> isize {
+    if !buf.is_null() {
+        let Some(buffers) = translated_byte_buffer(current_user_token(), buf, 32, MapPermission::W) else {
+            return -14;
+        };
+        UserBuffer::new(buffers).fill_zero();
+    }
+    (crate::timer::get_time_ms() / 10).max(1) as isize
 }
 
 pub fn sys_sysinfo(buf: *mut u8) -> isize {
@@ -432,14 +746,23 @@ pub fn sys_set_tid_address(tidptr: usize) -> isize {
 }
 
 /// gettimeofday(169)：填 struct timeval { long sec; long usec; }，返回 0
-pub fn sys_gettimeofday(tv: *mut u8) -> isize {
+pub fn sys_gettimeofday(tv: *mut u8, tz: *mut u8) -> isize {
     let token = current_user_token();
-    // 微秒分辨率（基准测试靠它做时间校准）
-    let us = crate::timer::get_time_us();
-    let pair = [us / 1_000_000, us % 1_000_000];
-    if try_write_user(token, tv as *mut [usize; 2], pair).is_none() {
-        write_user(token, tv as *mut usize, pair[0]);
-        write_user(token, (tv as usize + 8) as *mut usize, pair[1]);
+    if !tv.is_null() {
+        let Some(buffers) = translated_byte_buffer(token, tv, 16, MapPermission::W) else {
+            return -14;
+        };
+        let ns = crate::timer::get_realtime_ns();
+        let mut raw = [0u8; 16];
+        raw[0..8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_ne_bytes());
+        raw[8..16].copy_from_slice(&(((ns / 1_000) % 1_000_000) as i64).to_ne_bytes());
+        UserBuffer::new(buffers).copy_from(&raw);
+    }
+    if !tz.is_null() {
+        let Some(buffers) = translated_byte_buffer(token, tz, 8, MapPermission::W) else {
+            return -14;
+        };
+        UserBuffer::new(buffers).fill_zero();
     }
     0
 }
@@ -552,7 +875,7 @@ pub fn sys_mmap(
             if !inner.memory_set.vacant(&range) {
                 return -17;
             }
-        } else if let Err(error) = inner.memory_set.munmap(range.clone()) {
+        } else if let Err(error) = inner.unmap(range.clone(), process.getpid()) {
             return error;
         }
         range
@@ -592,7 +915,7 @@ pub fn sys_munmap(addr: usize, len: usize) -> isize {
     };
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
-    match inner.memory_set.munmap(range.clone()) {
+    match inner.unmap(range.clone(), process.getpid()) {
         Ok(()) => {
             if inner.mmap_top == range.end.0 * PAGE_SIZE {
                 inner.mmap_top = (range.start.0 * PAGE_SIZE).max(MMAP_BASE);
@@ -662,6 +985,10 @@ pub fn sys_mremap(
 
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
+    let source = old_range.start..old_range.end.max(VirtPageNum(old_range.start.0 + 1));
+    if inner.shm_attachments.iter().any(|attachment| attachment.overlaps(&source)) {
+        return -22; // SysV attachments retain their shmat address for shmdt.
+    }
     let mmap_base = VirtPageNum(MMAP_BASE / PAGE_SIZE);
     match inner.memory_set.mremap(
         old_range,
@@ -671,6 +998,9 @@ pub fn sys_mremap(
         mmap_base,
     ) {
         Ok(start) => {
+            if let Some(dest) = fixed_dest {
+                inner.forget_shm_range(&(dest..VirtPageNum(dest.0 + new_pages)), process.getpid());
+            }
             let end_va = (start.0 + new_pages) * PAGE_SIZE;
             if end_va > inner.mmap_top {
                 inner.mmap_top = end_va;
@@ -707,30 +1037,188 @@ pub fn sys_msync(addr: usize, len: usize, flags: usize) -> isize {
     result.err().unwrap_or(0)
 }
 
-/// sched_getparam(123)：写一个 4 字节的 sched_priority
-pub fn sys_sched_getparam(param: *mut u8) -> isize {
-    if param.is_null() {
+fn sched_target_process(pid: i32) -> Result<Arc<ProcessControlBlock>, isize> {
+    if pid < 0 {
+        return Err(-22);
+    }
+    if pid == 0 {
+        return Ok(current_process());
+    }
+    if let Some(p) = pid2process(pid as usize) {
+        if !p.inner_exclusive_access().is_zombie {
+            return Ok(p);
+        }
+    }
+    if let Some(t) = crate::task::tid2task(pid as usize) {
+        if let Some(p) = t.process.upgrade() {
+            if !p.inner_exclusive_access().is_zombie {
+                return Ok(p);
+            }
+        }
+    }
+    Err(-3) // ESRCH
+}
+
+pub fn sys_sched_get_priority_max(policy: i32) -> isize {
+    match policy {
+        1 | 2 => 99,
+        0 | 3 | 5 | 6 => 0,
+        _ => -22,
+    }
+}
+
+pub fn sys_sched_get_priority_min(policy: i32) -> isize {
+    match policy {
+        1 | 2 => 1,
+        0 | 3 | 5 | 6 => 0,
+        _ => -22,
+    }
+}
+
+pub fn sys_sched_getscheduler(pid: i32) -> isize {
+    match sched_target_process(pid) {
+        Ok(p) => p.inner_exclusive_access().sched_policy as isize,
+        Err(e) => e,
+    }
+}
+
+pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: *const u8) -> isize {
+    const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
+    if pid < 0 || param.is_null() {
         return -22;
     }
-    let token = crate::task::current_user_token();
-    for i in 0..4 {
-        write_user(token, (param as usize + i) as *mut u8, 0);
+    let base_policy = policy & !SCHED_RESET_ON_FORK;
+    if policy != base_policy && (policy & !SCHED_RESET_ON_FORK) != base_policy {
+        return -22;
+    }
+    if !matches!(base_policy, 0 | 1 | 2 | 3 | 5) {
+        return -22;
+    }
+    let target = match sched_target_process(pid) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let Some(prio) = try_read_user(current_user_token(), param as *const i32) else {
+        return -14;
+    };
+    if matches!(base_policy, 1 | 2) {
+        if !(1..=99).contains(&prio) {
+            return -22;
+        }
+        let caller = current_process();
+        let ci = caller.inner_exclusive_access();
+        if ci.euid != 0 && (ci.caps[0][0] & (1 << 23)) == 0 {
+            return -1; // EPERM (CAP_SYS_NICE)
+        }
+    } else if prio != 0 {
+        return -22;
+    }
+    let mut ti = target.inner_exclusive_access();
+    ti.sched_policy = base_policy as u32;
+    ti.sched_priority = prio;
+    0
+}
+
+pub fn sys_sched_setparam(pid: i32, param: *const u8) -> isize {
+    if pid < 0 || param.is_null() {
+        return -22;
+    }
+    let target = match sched_target_process(pid) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let Some(prio) = try_read_user(current_user_token(), param as *const i32) else {
+        return -14;
+    };
+    let cur_policy = target.inner_exclusive_access().sched_policy;
+    if matches!(cur_policy, 1 | 2) {
+        if !(1..=99).contains(&prio) {
+            return -22;
+        }
+        let caller = current_process();
+        let ci = caller.inner_exclusive_access();
+        if ci.euid != 0 && (ci.caps[0][0] & (1 << 23)) == 0 {
+            return -1;
+        }
+    } else if prio != 0 {
+        return -22;
+    }
+    target.inner_exclusive_access().sched_priority = prio;
+    0
+}
+
+/// sched_getparam(121)：写一个 4 字节的 sched_priority
+pub fn sys_sched_getparam(pid: i32, param: *mut u8) -> isize {
+    if pid < 0 || param.is_null() {
+        return -22;
+    }
+    let target = match sched_target_process(pid) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let prio = target.inner_exclusive_access().sched_priority;
+    if try_write_user(current_user_token(), param as *mut i32, prio).is_none() {
+        return -14;
+    }
+    0
+}
+
+pub fn sys_sched_rr_get_interval(pid: i32, tp: *mut u8) -> isize {
+    if pid < 0 {
+        return -22;
+    }
+    let _target = match sched_target_process(pid) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if !tp.is_null() {
+        let Some(bufs) = translated_byte_buffer(current_user_token(), tp, 16, MapPermission::W) else {
+            return -14;
+        };
+        let mut raw = [0u8; 16];
+        raw[8..16].copy_from_slice(&10_000_000i64.to_ne_bytes());
+        UserBuffer::new(bufs).copy_from(&raw);
+    }
+    0
+}
+
+pub fn sys_sched_setaffinity(tid: i32, size: usize, mask: *const u8) -> isize {
+    if tid < 0 || size == 0 {
+        return -22;
+    }
+    let _target = match sched_target_process(tid) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if mask.is_null() {
+        return -14;
+    }
+    let check_len = size.min(128);
+    let Some(bufs) = translated_byte_buffer(current_user_token(), mask, check_len, MapPermission::R) else {
+        return -14;
+    };
+    let mut raw = [0u8; 128];
+    for (d, s) in raw[..check_len].iter_mut().zip(UserBuffer::new(bufs)) {
+        *d = s.read();
+    }
+    #[cfg(feature = "smp")]
+    let online_mask: u8 = crate::arch::online_hart_mask() as u8;
+    #[cfg(not(feature = "smp"))]
+    let online_mask: u8 = 1;
+    if (raw[0] & online_mask) == 0 {
+        return -22; // EINVAL: no online CPUs in mask
     }
     0
 }
 
 pub fn sys_sched_getaffinity(tid: i32, size: usize, mask: *mut u8) -> isize {
     let word = core::mem::size_of::<usize>();
-    if size < word || size % word != 0 {
+    if tid < 0 || size < word || size % word != 0 {
         return -22;
     }
-    let process = if tid == 0 {
-        current_process()
-    } else {
-        match crate::task::tid2task(tid as usize).and_then(|task| task.process.upgrade()) {
-            Some(process) => process,
-            None => return -3, // ESRCH
-        }
+    let process = match sched_target_process(tid) {
+        Ok(process) => process,
+        Err(e) => return e,
     };
     let cpuset = (1usize << process.affinity_hart()).to_le_bytes();
     let buffers = match translated_byte_buffer(current_user_token(), mask, word, MapPermission::W) {
@@ -893,15 +1381,17 @@ pub fn sys_pselect6(
 }
 
 /// getrusage(165)：返回全 0 的 struct rusage（144 字节）。
-/// lmbench 用它做时间校准，全 0 只影响校准精度，不会让测试崩溃。
-pub fn sys_getrusage(buf: *mut u8) -> isize {
+pub fn sys_getrusage(who: i32, buf: *mut u8) -> isize {
+    if !matches!(who, 0 | -1 | 1) {
+        return -22; // EINVAL
+    }
     if buf.is_null() {
         return -14;
     }
-    let token = current_user_token();
-    for i in 0..144usize {
-        write_user(token, (buf as usize + i) as *mut u8, 0);
-    }
+    let Some(buffers) = translated_byte_buffer(current_user_token(), buf, 144, MapPermission::W) else {
+        return -14;
+    };
+    UserBuffer::new(buffers).fill_zero();
     0
 }
 
@@ -1050,8 +1540,8 @@ pub fn sys_capget(hdrp: *mut u32, datap: *mut u32) -> isize {
     if pid < 0 {
         return -22;
     }
-    let euid = if pid == 0 {
-        current_process().inner_exclusive_access().euid
+    let caps = if pid == 0 {
+        current_process().inner_exclusive_access().caps
     } else {
         let Some(target) = pid2process(pid as usize).or_else(|| {
             crate::task::tid2task(pid as usize).and_then(|t| t.process.upgrade())
@@ -1062,14 +1552,13 @@ pub fn sys_capget(hdrp: *mut u32, datap: *mut u32) -> isize {
         if inner.is_zombie {
             return -3;
         }
-        inner.euid
+        inner.caps
     };
     if datap.is_null() {
         return 0;
     }
-    let mask = if euid == 0 { u32::MAX } else { 0 };
     for w in 0..words {
-        for (slot, val) in [(0usize, mask), (1, mask), (2, 0u32)] {
+        for (slot, val) in caps[w].into_iter().enumerate() {
             let Some(off) = (datap as usize).checked_add((w * 3 + slot) * 4) else {
                 return -14;
             };
@@ -1077,6 +1566,415 @@ pub fn sys_capget(hdrp: *mut u32, datap: *mut u32) -> isize {
                 return -14;
             }
         }
+    }
+    0
+}
+
+pub fn sys_capset(hdrp: *mut u32, datap: *const u32) -> isize {
+    const CAP_V1: u32 = 0x1998_0330;
+    const CAP_V2: u32 = 0x2007_1026;
+    const CAP_V3: u32 = 0x2008_0522;
+    if hdrp.is_null() {
+        return -14;
+    }
+    let token = current_user_token();
+    let Some(version) = try_read_user(token, hdrp as *const u32) else {
+        return -14;
+    };
+    let Some(pid_ptr) = (hdrp as usize).checked_add(4) else {
+        return -14;
+    };
+    let Some(pid) = try_read_user(token, pid_ptr as *const i32) else {
+        return -14;
+    };
+    let words = match version {
+        CAP_V1 => 1usize,
+        CAP_V2 | CAP_V3 => 2usize,
+        _ => {
+            if try_write_user(token, hdrp, CAP_V3).is_none() {
+                return -14;
+            }
+            return -22;
+        }
+    };
+    if datap.is_null() {
+        return -14;
+    }
+    let self_pid = current_process().getpid() as i32;
+    let self_tid = current_task().unwrap().linux_tid() as i32;
+    if pid != 0 && pid != self_pid && pid != self_tid {
+        return -1; // EPERM (cannot modify another process's capabilities)
+    }
+    let mut next = [[0u32; 3]; 2];
+    for w in 0..words {
+        for slot in 0..3 {
+            let Some(off) = (datap as usize).checked_add((w * 3 + slot) * 4) else {
+                return -14;
+            };
+            let Some(val) = try_read_user(token, off as *const u32) else {
+                return -14;
+            };
+            next[w][slot] = val;
+        }
+    }
+    let proc = current_process();
+    let mut inner = proc.inner_exclusive_access();
+    let has_setpcap = (inner.caps[0][0] & (1 << 8)) != 0;
+    for w in 0..words {
+        let [ne, np, ni] = next[w];
+        let [_oe, op, oi] = inner.caps[w];
+        if (ne & !np) != 0 || (np & !op) != 0 {
+            return -1; // EPERM: eff must be subset of perm, perm cannot exceed old perm
+        }
+        if !has_setpcap && (ni & !(oi | op)) != 0 {
+            return -1; // EPERM: inh cannot exceed old inh | old perm without CAP_SETPCAP
+        }
+    }
+    for w in 0..words {
+        inner.caps[w] = next[w];
+    }
+    if words == 1 {
+        inner.caps[1] = [0; 3];
+    }
+    0
+}
+
+pub fn sys_prctl(option: usize, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> isize {
+    let token = current_user_token();
+    match option {
+        1 => {
+            // PR_SET_PDEATHSIG
+            if arg2 > 64 {
+                return -22;
+            }
+            current_process().inner_exclusive_access().pdeathsig = arg2 as u8;
+            0
+        }
+        2 => {
+            // PR_GET_PDEATHSIG
+            let sig = current_process().inner_exclusive_access().pdeathsig as i32;
+            if arg2 == 0 || try_write_user(token, arg2 as *mut i32, sig).is_none() {
+                -14
+            } else {
+                0
+            }
+        }
+        3 => current_process().inner_exclusive_access().dumpable as isize, // PR_GET_DUMPABLE
+        4 => {
+            // PR_SET_DUMPABLE
+            if arg2 > 1 {
+                return -22;
+            }
+            current_process().inner_exclusive_access().dumpable = arg2 as u8;
+            0
+        }
+        7 => current_process().inner_exclusive_access().keepcaps as isize, // PR_GET_KEEPCAPS
+        8 => {
+            // PR_SET_KEEPCAPS
+            if arg2 > 1 {
+                return -22;
+            }
+            current_process().inner_exclusive_access().keepcaps = arg2 != 0;
+            0
+        }
+        15 => {
+            // PR_SET_NAME
+            if arg2 == 0 {
+                return -14;
+            }
+            let mut comm = [0u8; 16];
+            for i in 0..15 {
+                let Some(ptr) = arg2.checked_add(i) else {
+                    return -14;
+                };
+                let Some(b) = try_read_user(token, ptr as *const u8) else {
+                    if i == 0 {
+                        return -14;
+                    }
+                    break;
+                };
+                if b == 0 {
+                    break;
+                }
+                comm[i] = b;
+            }
+            current_task().unwrap().inner_exclusive_access().comm = comm;
+            0
+        }
+        16 => {
+            // PR_GET_NAME
+            if arg2 == 0 {
+                return -14;
+            }
+            let comm = current_task().unwrap().inner_exclusive_access().comm;
+            let Some(bufs) = translated_byte_buffer(token, arg2 as *const u8, 16, MapPermission::W) else {
+                return -14;
+            };
+            UserBuffer::new(bufs).copy_from(&comm);
+            0
+        }
+        23 => {
+            // PR_CAPBSET_READ
+            if arg2 > 40 { -22 } else { 1 }
+        }
+        24 => {
+            // PR_CAPBSET_DROP
+            if arg2 > 40 {
+                -22
+            } else {
+                let proc = current_process();
+                let inner = proc.inner_exclusive_access();
+                if inner.euid != 0 && (inner.caps[0][0] & (1 << 8)) == 0 {
+                    -1
+                } else {
+                    0
+                }
+            }
+        }
+        29 => {
+            // PR_SET_TIMERSLACK
+            if (arg2 as isize) < 0 {
+                return -22;
+            }
+            current_process().inner_exclusive_access().timerslack_ns =
+                if arg2 == 0 { 50_000 } else { arg2 as u64 };
+            0
+        }
+        30 => current_process().inner_exclusive_access().timerslack_ns as isize, // PR_GET_TIMERSLACK
+        38 => {
+            // PR_SET_NO_NEW_PRIVS
+            if arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return -22;
+            }
+            current_process().inner_exclusive_access().no_new_privs = true;
+            0
+        }
+        39 => {
+            // PR_GET_NO_NEW_PRIVS
+            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return -22;
+            }
+            current_process().inner_exclusive_access().no_new_privs as isize
+        }
+        41 | 42 => 0, // PR_SET_THP_DISABLE / PR_GET_THP_DISABLE
+        0x5356_4d41 => {
+            // PR_SET_VMA (PR_SET_VMA_ANON_NAME = 0)
+            if arg2 == 0 { 0 } else { -22 }
+        }
+        _ => -22,
+    }
+}
+
+fn collect_priority_targets(which: usize, who: i32) -> Result<Vec<Arc<ProcessControlBlock>>, isize> {
+    let caller = current_process();
+    match which {
+        0 => {
+            // PRIO_PROCESS
+            if who < 0 {
+                return Err(-3);
+            }
+            let target = if who == 0 {
+                Some(caller)
+            } else {
+                pid2process(who as usize).or_else(|| {
+                    crate::task::tid2task(who as usize).and_then(|t| t.process.upgrade())
+                })
+            };
+            match target {
+                Some(p) if !p.inner_exclusive_access().is_zombie => Ok(alloc::vec![p]),
+                _ => Err(-3),
+            }
+        }
+        1 => {
+            // PRIO_PGRP
+            if who < 0 {
+                return Err(-3);
+            }
+            let pgid = if who == 0 {
+                caller.inner_exclusive_access().pgid.0
+            } else {
+                who as usize
+            };
+            let list: Vec<_> = process_ids()
+                .into_iter()
+                .filter_map(pid2process)
+                .filter(|p| {
+                    let i = p.inner_exclusive_access();
+                    !i.is_zombie && i.pgid.0 == pgid
+                })
+                .collect();
+            if list.is_empty() { Err(-3) } else { Ok(list) }
+        }
+        2 => {
+            // PRIO_USER
+            if who < 0 {
+                return Err(-3);
+            }
+            let uid = if who == 0 {
+                caller.inner_exclusive_access().uid
+            } else {
+                who as u32
+            };
+            let list: Vec<_> = process_ids()
+                .into_iter()
+                .filter_map(pid2process)
+                .filter(|p| {
+                    let i = p.inner_exclusive_access();
+                    !i.is_zombie && i.uid == uid
+                })
+                .collect();
+            if list.is_empty() { Err(-3) } else { Ok(list) }
+        }
+        _ => Err(-22),
+    }
+}
+
+pub fn sys_getpriority(which: usize, who: i32) -> isize {
+    let targets = match collect_priority_targets(which, who) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let mut best = 19i8;
+    for p in targets {
+        let n = p.inner_exclusive_access().nice;
+        if n < best {
+            best = n;
+        }
+    }
+    (20 - i32::from(best)) as isize
+}
+
+pub fn sys_setpriority(which: usize, who: i32, prio: i32) -> isize {
+    let targets = match collect_priority_targets(which, who) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let clamped = prio.clamp(-20, 19) as i8;
+    let (caller_uid, caller_euid, has_nice_cap) = {
+        let c = current_process();
+        let ci = c.inner_exclusive_access();
+        (ci.uid, ci.euid, ci.euid == 0 || (ci.caps[0][0] & (1 << 23)) != 0)
+    };
+    for p in &targets {
+        let inner = p.inner_exclusive_access();
+        if !has_nice_cap {
+            if caller_euid != inner.uid && caller_euid != inner.euid && caller_uid != inner.uid {
+                return -1; // EPERM
+            }
+            if clamped < inner.nice {
+                return -13; // EACCES when unprivileged tries to lower nice
+            }
+        }
+    }
+    for p in targets {
+        p.inner_exclusive_access().nice = clamped;
+    }
+    0
+}
+
+pub fn sys_mincore(addr: usize, len: usize, vec: *mut u8) -> isize {
+    if addr % PAGE_SIZE != 0 {
+        return -22;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(aligned) = round_mapping_size(len) else {
+        return -12;
+    };
+    let Some(end) = addr.checked_add(aligned) else {
+        return -12;
+    };
+    if end > USER_END {
+        return -12;
+    }
+    if vec.is_null() {
+        return -14;
+    }
+    let range = VirtPageNum(addr / PAGE_SIZE)..VirtPageNum(end / PAGE_SIZE);
+    let out = {
+        let proc = current_process();
+        let inner = proc.inner_exclusive_access();
+        match inner.memory_set.mincore_vec(range) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
+    };
+    let Some(bufs) = translated_byte_buffer(current_user_token(), vec, out.len(), MapPermission::W) else {
+        return -14;
+    };
+    UserBuffer::new(bufs).copy_from(&out);
+    0
+}
+
+pub fn sys_mlock2(addr: usize, len: usize, flags: u32) -> isize {
+    if flags & !1 != 0 {
+        return -22;
+    }
+    let start = addr & !(PAGE_SIZE - 1);
+    let Some(end_raw) = addr.checked_add(len) else {
+        return -22;
+    };
+    if len == 0 {
+        return 0;
+    }
+    let Some(end) = end_raw.checked_add(PAGE_SIZE - 1).map(|v| v & !(PAGE_SIZE - 1)) else {
+        return -12;
+    };
+    if end > USER_END {
+        return -12;
+    }
+    let proc = current_process();
+    let mut inner = proc.inner_exclusive_access();
+    if inner.euid != 0 && (inner.caps[0][0] & (1 << 14)) == 0 {
+        let limit = inner.resource_limits[8][0]; // RLIMIT_MEMLOCK
+        if limit == 0 {
+            return -1; // EPERM
+        }
+        if end - start > limit {
+            return -12; // ENOMEM
+        }
+    }
+    let range = VirtPageNum(start / PAGE_SIZE)..VirtPageNum(end / PAGE_SIZE);
+    let res = if flags & 1 != 0 {
+        inner.memory_set.check_user_range(&range, MapPermission::empty())
+    } else {
+        inner.memory_set.populate_range(range)
+    };
+    res.err().unwrap_or(0)
+}
+
+pub fn sys_munlock(addr: usize, len: usize) -> isize {
+    let start = addr & !(PAGE_SIZE - 1);
+    let Some(end_raw) = addr.checked_add(len) else {
+        return -22;
+    };
+    if len == 0 {
+        return 0;
+    }
+    let Some(end) = end_raw.checked_add(PAGE_SIZE - 1).map(|v| v & !(PAGE_SIZE - 1)) else {
+        return -12;
+    };
+    if end > USER_END {
+        return -12;
+    }
+    let range = VirtPageNum(start / PAGE_SIZE)..VirtPageNum(end / PAGE_SIZE);
+    current_process()
+        .inner_exclusive_access()
+        .memory_set
+        .check_user_range(&range, MapPermission::empty())
+        .err()
+        .unwrap_or(0)
+}
+
+pub fn sys_mlockall(flags: u32) -> isize {
+    if flags == 0 || flags & !7 != 0 || flags == 4 {
+        return -22;
+    }
+    let proc = current_process();
+    let inner = proc.inner_exclusive_access();
+    if inner.euid != 0 && (inner.caps[0][0] & (1 << 14)) == 0 && inner.resource_limits[8][0] == 0 {
+        return -1;
     }
     0
 }
@@ -1171,14 +2069,11 @@ pub fn sys_setuid(uid: u32) -> isize {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     if inner.euid == 0 {
-        inner.uid = uid;
-        inner.euid = uid;
-        inner.suid = uid;
-        inner.fsuid = uid;
+        inner.update_uids(uid, uid, uid);
         0
     } else if uid == inner.uid || uid == inner.suid {
-        inner.euid = uid;
-        inner.fsuid = uid;
+        let (ruid, suid) = (inner.uid, inner.suid);
+        inner.update_uids(ruid, uid, suid);
         0
     } else {
         -1
@@ -1220,12 +2115,12 @@ pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {
     let old_ruid = inner.uid;
     let new_ruid = if ruid == u32::MAX { inner.uid } else { ruid };
     let new_euid = if euid == u32::MAX { inner.euid } else { euid };
-    if ruid != u32::MAX || (euid != u32::MAX && euid != old_ruid) {
-        inner.suid = new_euid;
-    }
-    inner.uid = new_ruid;
-    inner.euid = new_euid;
-    inner.fsuid = new_euid;
+    let new_suid = if ruid != u32::MAX || (euid != u32::MAX && euid != old_ruid) {
+        new_euid
+    } else {
+        inner.suid
+    };
+    inner.update_uids(new_ruid, new_euid, new_suid);
     0
 }
 
@@ -1263,10 +2158,10 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> isize {
             }
         }
     }
-    if ruid != u32::MAX { inner.uid = ruid; }
-    if euid != u32::MAX { inner.euid = euid; }
-    if suid != u32::MAX { inner.suid = suid; }
-    inner.fsuid = inner.euid;
+    let ruid = if ruid == u32::MAX { inner.uid } else { ruid };
+    let euid = if euid == u32::MAX { inner.euid } else { euid };
+    let suid = if suid == u32::MAX { inner.suid } else { suid };
+    inner.update_uids(ruid, euid, suid);
     0
 }
 

@@ -59,6 +59,7 @@ pub struct TaskControlBlockInner {
     pub(crate) user_io_frames: Vec<Arc<FrameTracker>>,
     pub(crate) user_io_file: Option<Arc<dyn crate::fs::File>>,
     pub(crate) suspended_pipe_io: Option<SuspendedPipeIo>,
+    pub(crate) comm: [u8; 16],
 }
 
 impl TaskControlBlockInner {
@@ -140,6 +141,7 @@ impl TaskControlBlock {
                     user_io_frames: Vec::new(),
                     user_io_file: None,
                     suspended_pipe_io: None,
+                    comm: [0; 16],
                 })
             },
         }

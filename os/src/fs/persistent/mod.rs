@@ -238,6 +238,7 @@ impl PersistentFs {
                 full,
                 flags,
                 DirectoryIdentity::Persistent(self.clone(), self.node(inode, full)),
+                0,
             );
         }
         if flags.contains(OpenFlags::DIRECTORY) {

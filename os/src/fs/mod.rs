@@ -3,7 +3,7 @@ mod executable;
 pub mod ext4;
 mod inode;
 pub mod mount;
-mod overlay;
+pub(crate) mod overlay;
 pub(crate) mod page_cache;
 mod pipe;
 mod persistent;
@@ -15,6 +15,7 @@ mod symlink;
 pub(crate) use pipe::SuspendedPipeIo;
 use crate::mm::{FrameTracker, UserBuffer};
 use crate::sync::UPSafeCell;
+use core::sync::atomic::Ordering;
 use directory::DirectoryIdentity;
 pub use directory::{DirectoryFile, DirectoryLocation};
 pub use executable::{open_executable, Executable};
@@ -23,9 +24,10 @@ use mount::{
     resolve_mount, MountBackend, EXT4_MAGIC,
 };
 use overlay::{
-    new_file as overlay_new_file, overlay_children, overlay_create, overlay_get, overlay_mkdir,
-    overlay_rename, overlay_symlink, overlay_unlink, resize as overlay_resize, MemFs, OverlayData,
-    OverlayEntry, OverlayFile, OVERLAY_DEVICE,
+    new_file as overlay_new_file, overlay_children, overlay_create, overlay_create_with_gid,
+    overlay_get, overlay_link, overlay_mkdir_with_gid, overlay_mknod, overlay_rename,
+    overlay_symlink, overlay_unlink, resize as overlay_resize, FifoNode, FifoStatFile, MemFs,
+    OverlayData, OverlayEntry, OverlayFile, SpecialFile, OVERLAY_DEVICE,
 };
 use random::RandomFile;
 use symlink::Symlink;
@@ -49,13 +51,56 @@ pub trait File: Send + Sync {
     fn epoll(&self) -> Option<&crate::syscall::epoll::Epoll> {
         None
     }
+    fn pipe(&self) -> Option<&Pipe> {
+        None
+    }
+    fn timerfd(&self) -> Option<&crate::syscall::eventfd::TimerFdFile> {
+        None
+    }
+    fn signalfd(&self) -> Option<&crate::syscall::eventfd::SignalFdFile> {
+        None
+    }
+    fn is_rtc(&self) -> bool {
+        false
+    }
     fn epollable(&self) -> bool {
-        self.socket().is_some() || self.unix_socket().is_some()
+        self.socket().is_some()
+            || self.unix_socket().is_some()
+            || self.pipe().is_some()
+            || self.timerfd().is_some()
+            || self.signalfd().is_some()
     }
     fn status_flags(&self) -> u32 {
-        self.path_flags().unwrap_or(0)
+        if let Some(pf) = self.path_flags() {
+            return pf;
+        }
+        match (self.readable(), self.writable()) {
+            (true, true) => 2,
+            (false, true) => 1,
+            _ => 0,
+        }
     }
     fn set_status_flags(&self, _flags: u32) {}
+    fn timestamps(&self) -> ((i64, i64), (i64, i64), (i64, i64)) {
+        ((0, 0), (0, 0), (0, 0))
+    }
+    fn set_timestamps(&self, _atime: Option<(i64, i64)>, _mtime: Option<(i64, i64)>) -> isize {
+        0
+    }
+    fn seals(&self) -> Option<u32> {
+        None
+    }
+    fn add_seals(&self, _add: u32) -> isize {
+        -22
+    }
+    fn xattr_op(
+        &self,
+        _name: &str,
+        _set_val: Option<(&[u8], usize)>,
+        _remove: bool,
+    ) -> Result<Vec<u8>, isize> {
+        Err(-95)
+    }
     fn poll_events(&self) -> u16 {
         ((self.readable() && self.poll_readable()) as u16) |
             (((self.writable() && self.poll_writable()) as u16) << 2)
@@ -208,10 +253,13 @@ impl File for PathFile {
     fn size(&self) -> usize {
         self.0.size()
     }
+    fn timestamps(&self) -> ((i64, i64), (i64, i64), (i64, i64)) {
+        self.0.timestamps()
+    }
 }
 
 pub use inode::{list_apps, mark_unlinked, open_file, root_names, OpenFlags};
-pub use pipe::make_pipe;
+pub use pipe::{make_pipe_with_flags, Pipe};
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -305,6 +353,184 @@ impl File for ZeroFile {
     }
 }
 
+/// /dev/full：读返回全 0，写永远返回 ENOSPC(-28)
+pub struct FullFile;
+
+impl File for FullFile {
+    fn mode(&self) -> u16 {
+        0o20666
+    }
+    fn stat_identity(&self) -> Option<(u64, u64)> {
+        Some((DEV_DEVICE, 305))
+    }
+    fn device_numbers(&self) -> Option<(u32, u32)> {
+        Some((1, 7))
+    }
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn read(&self, buf: UserBuffer) -> usize {
+        buf.fill_zero()
+    }
+    fn write(&self, _buf: UserBuffer) -> isize {
+        -28
+    }
+    fn seek(&self, _offset: isize) -> isize {
+        0
+    }
+    fn seek_to(&self, _pos: isize) -> isize {
+        0
+    }
+}
+
+/// /dev/rtc, /dev/rtc0, /dev/misc/rtc：供 hwclock 等通过 RTC_RD_TIME 读取实时钟
+pub struct RtcFile;
+
+impl File for RtcFile {
+    fn mode(&self) -> u16 {
+        0o20666
+    }
+    fn is_rtc(&self) -> bool {
+        true
+    }
+    fn stat_identity(&self) -> Option<(u64, u64)> {
+        Some((DEV_DEVICE, 308))
+    }
+    fn device_numbers(&self) -> Option<(u32, u32)> {
+        Some((254, 0))
+    }
+    fn readable(&self) -> bool {
+        true
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn read(&self, _buf: UserBuffer) -> usize {
+        0
+    }
+    fn write(&self, _buf: UserBuffer) -> isize {
+        -22
+    }
+}
+
+struct NamedFifoFile {
+    pipe: Arc<Pipe>,
+    node: Arc<FifoNode>,
+}
+
+impl File for NamedFifoFile {
+    fn readable(&self) -> bool {
+        self.pipe.readable()
+    }
+    fn writable(&self) -> bool {
+        self.pipe.writable()
+    }
+    fn read(&self, buf: UserBuffer) -> usize {
+        if self.pipe.status_flags() & 0o1000000 == 0 {
+            self.node.times.exclusive_access().0 = overlay::now_ts();
+        }
+        self.pipe.read(buf)
+    }
+    fn read_result(&self, buf: UserBuffer) -> isize {
+        if self.pipe.status_flags() & 0o1000000 == 0 {
+            self.node.times.exclusive_access().0 = overlay::now_ts();
+        }
+        self.pipe.read_result(buf)
+    }
+    fn write(&self, buf: UserBuffer) -> isize {
+        let n = self.pipe.write(buf);
+        if n > 0 {
+            let ts = overlay::now_ts();
+            let mut t = self.node.times.exclusive_access();
+            t.1 = ts;
+            t.2 = ts;
+        }
+        n
+    }
+    fn pipe(&self) -> Option<&Pipe> {
+        Some(&self.pipe)
+    }
+    fn epollable(&self) -> bool {
+        true
+    }
+    fn status_flags(&self) -> u32 {
+        self.pipe.status_flags()
+    }
+    fn set_status_flags(&self, flags: u32) {
+        self.pipe.set_status_flags(flags);
+    }
+    fn poll_events(&self) -> u16 {
+        self.pipe.poll_events()
+    }
+    fn poll_generations(&self) -> (u64, u64) {
+        self.pipe.poll_generations()
+    }
+    fn poll_readable(&self) -> bool {
+        self.pipe.poll_readable()
+    }
+    fn poll_writable(&self) -> bool {
+        self.pipe.poll_writable()
+    }
+    fn mode(&self) -> u16 {
+        self.node.mode.load(Ordering::Relaxed)
+    }
+    fn owner(&self) -> (u32, u32) {
+        (
+            self.node.uid.load(Ordering::Relaxed),
+            self.node.gid.load(Ordering::Relaxed),
+        )
+    }
+    fn set_mode(&self, perm: u16) -> isize {
+        let cur = self.node.mode.load(Ordering::Relaxed);
+        self.node
+            .mode
+            .store((cur & !0o7777) | (perm & 0o7777), Ordering::Relaxed);
+        self.node.times.exclusive_access().2 = overlay::now_ts();
+        0
+    }
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> isize {
+        if let Some(u) = uid {
+            self.node.uid.store(u, Ordering::Relaxed);
+        }
+        if let Some(g) = gid {
+            self.node.gid.store(g, Ordering::Relaxed);
+        }
+        self.node.times.exclusive_access().2 = overlay::now_ts();
+        0
+    }
+    fn stat_identity(&self) -> Option<(u64, u64)> {
+        Some((self.node.dev, u64::from(self.node.ino)))
+    }
+    fn link_count(&self) -> u32 {
+        self.node.nlink.load(Ordering::Relaxed)
+    }
+    fn timestamps(&self) -> ((i64, i64), (i64, i64), (i64, i64)) {
+        *self.node.times.exclusive_access()
+    }
+    fn set_timestamps(&self, atime: Option<(i64, i64)>, mtime: Option<(i64, i64)>) -> isize {
+        let mut t = self.node.times.exclusive_access();
+        if let Some(a) = atime {
+            t.0 = a;
+        }
+        if let Some(m) = mtime {
+            t.1 = m;
+        }
+        t.2 = overlay::now_ts();
+        0
+    }
+    fn xattr_op(
+        &self,
+        name: &str,
+        set_val: Option<(&[u8], usize)>,
+        remove: bool,
+    ) -> Result<Vec<u8>, isize> {
+        overlay::apply_xattr_map(&mut self.node.xattrs.exclusive_access(), name, set_val, remove)
+    }
+}
+
 fn proc_rel_path(rel: &str) -> String {
     if rel.is_empty() {
         String::from("proc")
@@ -313,20 +539,39 @@ fn proc_rel_path(rel: &str) -> String {
     }
 }
 
+fn dev_dir_exists(rel: &str) -> bool {
+    matches!(rel, "" | "misc")
+}
+
 fn dev_file_exists(rel: &str) -> bool {
-    matches!(rel, "null" | "zero" | "tty" | "console" | "random" | "urandom")
+    matches!(
+        rel,
+        "null"
+            | "zero"
+            | "full"
+            | "tty"
+            | "console"
+            | "random"
+            | "urandom"
+            | "rtc"
+            | "rtc0"
+            | "misc/rtc"
+            | "cpu_dma_latency"
+    )
 }
 
 fn open_dev_file(rel: &str, flags: OpenFlags) -> Option<Arc<dyn File + Send + Sync>> {
     let readable = !flags.contains(OpenFlags::WRONLY);
     let writable = flags.intersects(OpenFlags::WRONLY | OpenFlags::RDWR);
     Some(match rel {
-        "null" => Arc::new(NullFile),
+        "null" | "cpu_dma_latency" => Arc::new(NullFile),
         "zero" => Arc::new(ZeroFile),
+        "full" => Arc::new(FullFile),
         "tty" => Arc::new(stdio::ConsoleFile(readable, writable, 303)),
         "console" => Arc::new(stdio::ConsoleFile(readable, writable, 304)),
         "random" => Arc::new(RandomFile(306)),
         "urandom" => Arc::new(RandomFile(307)),
+        "rtc" | "rtc0" | "misc/rtc" => Arc::new(RtcFile),
         _ => return None,
     })
 }
@@ -382,7 +627,7 @@ pub fn path_is_directory(name: &str) -> Result<bool, isize> {
                 return Err(-2);
             }
             MountBackend::Devfs => {
-                if rel.is_empty() {
+                if dev_dir_exists(rel) {
                     return Ok(true);
                 }
                 if dev_file_exists(rel) {
@@ -395,7 +640,12 @@ pub fn path_is_directory(name: &str) -> Result<bool, isize> {
                     return Ok(true);
                 }
                 return match fs.get(rel) {
-                    Some(OverlayEntry::File(_) | OverlayEntry::Symlink(_)) => Ok(false),
+                    Some(
+                        OverlayEntry::File(_)
+                        | OverlayEntry::Symlink(_)
+                        | OverlayEntry::Fifo(_)
+                        | OverlayEntry::Special(_),
+                    ) => Ok(false),
                     Some(OverlayEntry::Directory(_)) => Ok(true),
                     Some(OverlayEntry::Whiteout) | None => Err(-2),
                 };
@@ -405,7 +655,12 @@ pub fn path_is_directory(name: &str) -> Result<bool, isize> {
         }
     }
     match overlay_get(name) {
-        Some(OverlayEntry::File(_) | OverlayEntry::Symlink(_)) => return Ok(false),
+        Some(
+            OverlayEntry::File(_)
+            | OverlayEntry::Symlink(_)
+            | OverlayEntry::Fifo(_)
+            | OverlayEntry::Special(_),
+        ) => return Ok(false),
         Some(OverlayEntry::Directory(_)) => return Ok(true),
         Some(OverlayEntry::Whiteout) => return Err(-2),
         None => {}
@@ -505,17 +760,92 @@ pub fn working_directory(name: &str) -> Result<DirectoryLocation, isize> {
     Ok(DirectoryLocation::new(name, identity))
 }
 
-fn open_overlay(data: OverlayData, flags: OpenFlags) -> Result<Arc<dyn File + Send + Sync>, isize> {
+fn parent_inherited_gid_and_mode(
+    full_path: &str,
+    mut permissions: u16,
+    is_dir: bool,
+) -> (u16, Option<u32>) {
+    let parent = full_path.rsplit_once('/').map_or("", |(p, _)| p);
+    if let Ok((pmode, _, pgid)) = path_mode_owner(parent) {
+        if pmode & 0o2000 != 0 {
+            if is_dir {
+                permissions |= 0o2000;
+            } else if permissions & 0o2000 != 0 {
+                let keep_sgid = crate::task::current_task()
+                    .and_then(|t| t.process.upgrade())
+                    .map_or(true, |p| {
+                        let inner = p.inner_exclusive_access();
+                        inner.euid == 0 || inner.egid == pgid || inner.groups.contains(&pgid)
+                    });
+                if !keep_sgid {
+                    permissions &= !0o2000;
+                }
+            }
+            return (permissions, Some(pgid));
+        }
+    }
+    (permissions, None)
+}
+
+fn open_overlay(
+    data: OverlayData,
+    flags: OpenFlags,
+    status: u32,
+) -> Result<Arc<dyn File + Send + Sync>, isize> {
     if flags.contains(OpenFlags::TRUNC) {
+        {
+            let d = data.exclusive_access();
+            if let Some(s) = d.seals {
+                if s & 0x8 != 0 || (s & 0x2 != 0 && d.len() > 0) {
+                    return Err(-1);
+                }
+            }
+        }
         overlay_resize(&data, 0);
     }
-    Ok(Arc::new(OverlayFile::new(data, flags)))
+    Ok(Arc::new(OverlayFile::new_with_status(data, flags, status)))
+}
+
+fn open_fifo_entry(
+    fifo: Arc<FifoNode>,
+    flags: OpenFlags,
+    status: u32,
+    exclusive: bool,
+    directory: bool,
+) -> Result<Arc<dyn File + Send + Sync>, isize> {
+    if exclusive || directory {
+        return Err(if exclusive { -17 } else { -20 });
+    }
+    let readable = !flags.contains(OpenFlags::WRONLY);
+    let writable = flags.intersects(OpenFlags::WRONLY | OpenFlags::RDWR);
+    let pipe = Pipe::open_fifo(Arc::clone(&fifo.buffer), readable, writable, status)?;
+    Ok(Arc::new(NamedFifoFile { pipe, node: fifo }))
+}
+
+fn open_special_entry(
+    spec: Arc<overlay::SpecialNode>,
+    flags: OpenFlags,
+    status: u32,
+    exclusive: bool,
+    directory: bool,
+) -> Result<Arc<dyn File + Send + Sync>, isize> {
+    if exclusive || directory {
+        return Err(if exclusive { -17 } else { -20 });
+    }
+    let ftype = spec.mode.load(Ordering::Relaxed) & 0o170000;
+    if ftype == 0o140000 {
+        return Err(-6); // ENXIO on S_IFSOCK
+    }
+    let readable = !flags.contains(OpenFlags::WRONLY);
+    let writable = flags.intersects(OpenFlags::WRONLY | OpenFlags::RDWR);
+    Ok(Arc::new(SpecialFile::new(spec, readable, writable, status)))
 }
 
 fn open_directory(
     name: &str,
     flags: OpenFlags,
     identity: DirectoryIdentity,
+    status: u32,
 ) -> Result<Arc<dyn File + Send + Sync>, isize> {
     if flags.contains(OpenFlags::CREATE | OpenFlags::EXCL) {
         return Err(-17);
@@ -523,7 +853,11 @@ fn open_directory(
     if flags.intersects(OpenFlags::WRONLY | OpenFlags::RDWR | OpenFlags::TRUNC) {
         return Err(-21); // EISDIR
     }
-    Ok(Arc::new(DirectoryFile::new(name, identity)))
+    let dir = DirectoryFile::new(name, identity);
+    if status != 0 {
+        dir.set_status_flags(status);
+    }
+    Ok(Arc::new(dir))
 }
 
 fn open_memfs(
@@ -532,32 +866,61 @@ fn open_memfs(
     rel: &str,
     flags: OpenFlags,
     permissions: u16,
+    status: u32,
 ) -> Result<Arc<dyn File + Send + Sync>, isize> {
     let create = flags.contains(OpenFlags::CREATE);
     let exclusive = flags.contains(OpenFlags::CREATE | OpenFlags::EXCL);
     let directory = flags.contains(OpenFlags::DIRECTORY);
     if rel.is_empty() {
-        return open_directory(full_name, flags, DirectoryIdentity::Upper(fs.root_dir()));
+        return open_directory(full_name, flags, DirectoryIdentity::Upper(fs.root_dir()), status);
     }
     match fs.get(rel) {
         Some(OverlayEntry::Directory(identity)) => {
-            open_directory(full_name, flags, DirectoryIdentity::Upper(identity))
+            open_directory(full_name, flags, DirectoryIdentity::Upper(identity), status)
         }
         Some(OverlayEntry::File(data)) => {
             if exclusive || directory {
                 return Err(if exclusive { -17 } else { -20 });
             }
-            open_overlay(data, flags)
+            open_overlay(data, flags, status)
         }
+        Some(OverlayEntry::Fifo(fifo)) => open_fifo_entry(fifo, flags, status, exclusive, directory),
+        Some(OverlayEntry::Special(spec)) => open_special_entry(spec, flags, status, exclusive, directory),
         Some(OverlayEntry::Symlink(_)) => Err(if exclusive { -17 } else { -40 }),
         Some(OverlayEntry::Whiteout) | None => {
             require_parent_directories(full_name)?;
             if !create || directory {
                 return Err(-2);
             }
-            open_overlay(fs.create(rel, None, permissions)?, flags)
+            let (perms, gid_ovr) = parent_inherited_gid_and_mode(full_name, permissions, false);
+            open_overlay(fs.create_with_gid(rel, None, perms, gid_ovr)?, flags, status)
         }
     }
+}
+
+/// 打开文件供 stat/faccessat/xattr 元数据查询使用（对 FIFO / S_IFSOCK 不阻塞且不返回 ENXIO）
+pub fn open_for_stat(name: &str) -> Result<Arc<dyn File + Send + Sync>, isize> {
+    if let Some((mount, rel)) = resolve_mount(name) {
+        if let MountBackend::Memfs(fs) = mount.backend {
+            if !rel.is_empty() {
+                match fs.get(rel) {
+                    Some(OverlayEntry::Fifo(fifo)) => return Ok(Arc::new(FifoStatFile(fifo))),
+                    Some(OverlayEntry::Special(spec)) => {
+                        return Ok(Arc::new(SpecialFile::new(spec, false, false, 0)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    match overlay_get(name) {
+        Some(OverlayEntry::Fifo(fifo)) => return Ok(Arc::new(FifoStatFile(fifo))),
+        Some(OverlayEntry::Special(spec)) => {
+            return Ok(Arc::new(SpecialFile::new(spec, false, false, 0)));
+        }
+        _ => {}
+    }
+    open_dyn_with_status(name, OpenFlags::RDONLY, 0o644, 0)
 }
 
 /// 打开文件并返回统一的 File 对象（供系统调用使用）
@@ -569,6 +932,15 @@ pub fn open_dyn_with_mode(
     name: &str,
     flags: OpenFlags,
     permissions: u16,
+) -> Result<Arc<dyn File + Send + Sync>, isize> {
+    open_dyn_with_status(name, flags, permissions, 0)
+}
+
+pub fn open_dyn_with_status(
+    name: &str,
+    flags: OpenFlags,
+    permissions: u16,
+    status: u32,
 ) -> Result<Arc<dyn File + Send + Sync>, isize> {
     let create = flags.contains(OpenFlags::CREATE);
     let exclusive = flags.contains(OpenFlags::CREATE | OpenFlags::EXCL);
@@ -585,11 +957,11 @@ pub fn open_dyn_with_mode(
         if let Some((mount, _)) = resolve_mount(name) {
             return match mount.backend {
                 MountBackend::Procfs | MountBackend::Devfs | MountBackend::Persistent(_) => Err(-95),
-                MountBackend::Memfs(fs) => open_overlay(fs.new_file(None, false, permissions)?, flags),
-                MountBackend::RootOverlay => open_overlay(overlay_new_file(None, false, permissions)?, flags),
+                MountBackend::Memfs(fs) => open_overlay(fs.new_file(None, false, permissions)?, flags, status),
+                MountBackend::RootOverlay => open_overlay(overlay_new_file(None, false, permissions)?, flags, status),
             };
         }
-        return open_overlay(overlay_new_file(None, false, permissions)?, flags);
+        return open_overlay(overlay_new_file(None, false, permissions)?, flags, status);
     }
 
     if let Some((mount, rel)) = resolve_mount(name) {
@@ -597,7 +969,7 @@ pub fn open_dyn_with_mode(
             MountBackend::Procfs => {
                 let proc_path = proc_rel_path(rel);
                 if let Some(identity) = procfs::directory_identity(&proc_path) {
-                    return open_directory(name, flags, identity);
+                    return open_directory(name, flags, identity, status);
                 }
                 if let Some(v) = virtual_file(&proc_path) {
                     if exclusive || directory {
@@ -615,8 +987,8 @@ pub fn open_dyn_with_mode(
                 return Err(if create { -30 } else { -2 });
             }
             MountBackend::Devfs => {
-                if rel.is_empty() {
-                    return open_directory(name, flags, DirectoryIdentity::Permanent);
+                if dev_dir_exists(rel) {
+                    return open_directory(name, flags, DirectoryIdentity::Permanent, status);
                 }
                 if let Some(device) = open_dev_file(rel, flags) {
                     if exclusive || directory {
@@ -628,7 +1000,7 @@ pub fn open_dyn_with_mode(
                 return Err(if create { -30 } else { -2 });
             }
             MountBackend::Memfs(fs) => {
-                return open_memfs(&fs, name, rel, flags, permissions);
+                return open_memfs(&fs, name, rel, flags, permissions, status);
             }
             MountBackend::Persistent(fs) => return fs.open(rel, name, flags),
             MountBackend::RootOverlay => {}
@@ -636,19 +1008,25 @@ pub fn open_dyn_with_mode(
     }
 
     if is_root_path(name) {
-        return open_directory(name, flags, DirectoryIdentity::Permanent);
+        return open_directory(name, flags, DirectoryIdentity::Permanent, status);
     }
 
     let upper = overlay_get(name);
     match upper {
         Some(OverlayEntry::Directory(identity)) => {
-            return open_directory(name, flags, DirectoryIdentity::Upper(identity));
+            return open_directory(name, flags, DirectoryIdentity::Upper(identity), status);
         }
         Some(OverlayEntry::File(data)) => {
             if exclusive || directory {
                 return Err(if exclusive { -17 } else { -20 });
             }
-            return open_overlay(data, flags);
+            return open_overlay(data, flags, status);
+        }
+        Some(OverlayEntry::Fifo(fifo)) => {
+            return open_fifo_entry(fifo, flags, status, exclusive, directory);
+        }
+        Some(OverlayEntry::Special(spec)) => {
+            return open_special_entry(spec, flags, status, exclusive, directory);
         }
         Some(OverlayEntry::Symlink(_)) => return Err(if exclusive { -17 } else { -40 }),
         _ => {}
@@ -668,18 +1046,18 @@ pub fn open_dyn_with_mode(
                 return Err(-40);
             }
             if inode.is_dir() {
-                return open_directory(name, flags, DirectoryIdentity::Lower);
+                return open_directory(name, flags, DirectoryIdentity::Lower, status);
             }
             if directory {
                 // 旧版评测盘曾把 basic 的 mnt 打包成普通文件，test_openat 仍用它打开同级文件。
                 if crate::config::legacy_oscomp_image() && is_legacy_basic_mnt(name) {
                     let parent = name.rsplit_once('/').map_or("", |(parent, _)| parent);
-                    return open_directory(parent, flags, working_directory(parent)?.identity);
+                    return open_directory(parent, flags, working_directory(parent)?.identity, status);
                 }
                 return Err(-20);
             }
             if !flags.intersects(OpenFlags::WRONLY | OpenFlags::RDWR | OpenFlags::TRUNC) {
-                return Ok(Arc::new(ext4::Ext4File::new(Arc::clone(fs), inode)));
+                return Ok(Arc::new(ext4::Ext4File::new_with_status(Arc::clone(fs), inode, status)));
             }
             if !inode.is_file() {
                 return Err(-30);
@@ -687,13 +1065,14 @@ pub fn open_dyn_with_mode(
             let permissions = inode.mode & 0o7777;
             let lower = (!flags.contains(OpenFlags::TRUNC))
                 .then(|| ext4::Ext4File::new(Arc::clone(fs), inode));
-            return open_overlay(overlay_create(name, lower, permissions)?, flags);
+            return open_overlay(overlay_create(name, lower, permissions)?, flags, status);
         }
         require_parent_directories(name)?;
         if !create || directory {
             return Err(-2);
         }
-        open_overlay(overlay_create(name, None, permissions)?, flags)
+        let (perms, gid_ovr) = parent_inherited_gid_and_mode(name, permissions, false);
+        open_overlay(overlay_create_with_gid(name, None, perms, gid_ovr)?, flags, status)
     } else {
         let exists = || open_file(name, OpenFlags::RDONLY).is_some();
         if directory {
@@ -710,8 +1089,19 @@ pub fn open_dyn_with_mode(
 
 /// Walk components in order so a link target changes the meaning of a later `..`.
 pub fn resolve_from(name: &str, base: &str, follow_final: bool) -> Result<String, isize> {
+    resolve_from_in_root(name, base, "", follow_final)
+}
+
+pub(crate) fn resolve_from_in_root(
+    name: &str,
+    base: &str,
+    root: &str,
+    follow_final: bool,
+) -> Result<String, isize> {
     let mut resolved = String::new();
-    if !name.starts_with('/') {
+    if name.starts_with('/') {
+        resolved.push_str(root);
+    } else {
         resolved.push_str(base);
     }
     let mut remaining: VecDeque<_> = name
@@ -725,6 +1115,9 @@ pub fn resolve_from(name: &str, base: &str, follow_final: bool) -> Result<String
             continue;
         }
         if part == ".." {
+            if !root.is_empty() && resolved == root {
+                continue;
+            }
             resolved.truncate(resolved.rfind('/').unwrap_or(0));
             continue;
         }
@@ -745,11 +1138,12 @@ pub fn resolve_from(name: &str, base: &str, follow_final: bool) -> Result<String
                 }
                 let target =
                     core::str::from_utf8(link.link_target().unwrap()).map_err(|_| -84isize)?;
-                resolved.truncate(if target.starts_with('/') {
-                    0
+                if target.starts_with('/') {
+                    resolved.clear();
+                    resolved.push_str(root);
                 } else {
-                    parent_end
-                });
+                    resolved.truncate(parent_end);
+                }
                 if target.ends_with('/') {
                     remaining.push_front(String::from("."));
                 }
@@ -774,17 +1168,23 @@ pub fn resolve_path_with(name: &str, follow_final: bool) -> Result<String, isize
     if name.is_empty() {
         return Err(-2);
     }
+    let (cwd, root) = match crate::task::current_task().and_then(|t| t.process.upgrade()) {
+        Some(proc) => {
+            let inner = proc.inner_exclusive_access();
+            (Some(inner.cwd.clone()), inner.root.clone())
+        }
+        None => (None, String::new()),
+    };
     if name.starts_with('/') {
-        return resolve_from(name, "", follow_final);
+        return resolve_from_in_root(name, "", &root, follow_final);
     }
-    let cwd = crate::task::current_process()
-        .inner_exclusive_access()
-        .cwd
-        .clone();
+    let Some(cwd) = cwd else {
+        return resolve_from(name, "", follow_final);
+    };
     if !directory_is_live(&cwd) {
         return Err(-2);
     }
-    resolve_from(name, &cwd.path(), follow_final)
+    resolve_from_in_root(name, &cwd.path(), &root, follow_final)
 }
 
 pub fn exists(name: &str) -> bool {
@@ -920,7 +1320,8 @@ pub fn mkdir(name: &str, permissions: u16) -> Result<(), isize> {
                 if exists(name) {
                     return Err(-17);
                 }
-                return fs.mkdir(rel, permissions);
+                let (perms, gid_ovr) = parent_inherited_gid_and_mode(name, permissions, true);
+                return fs.mkdir_with_gid(rel, perms, gid_ovr);
             }
             MountBackend::Persistent(fs) => return fs.mkdir(rel),
             MountBackend::RootOverlay => {}
@@ -936,7 +1337,164 @@ pub fn mkdir(name: &str, permissions: u16) -> Result<(), isize> {
     if exists(name) {
         return Err(-17); // EEXIST
     }
-    overlay_mkdir(name, permissions)
+    let (perms, gid_ovr) = parent_inherited_gid_and_mode(name, permissions, true);
+    overlay_mkdir_with_gid(name, perms, gid_ovr)
+}
+
+pub fn mknod_path(name: &str, mode: u16, rdev: (u32, u32)) -> Result<(), isize> {
+    if !has_ext4() {
+        return Err(-95);
+    }
+    let ftype = mode & 0o170000;
+    if !matches!(ftype, 0 | 0o100000 | 0o010000 | 0o020000 | 0o060000 | 0o140000) {
+        return Err(-22);
+    }
+    if let Some((mount, rel)) = resolve_mount(name) {
+        match mount.backend {
+            MountBackend::Procfs | MountBackend::Devfs => {
+                return Err(if rel.is_empty() { -17 } else { -30 });
+            }
+            MountBackend::Memfs(fs) => {
+                if rel.is_empty() {
+                    return Err(-17);
+                }
+                require_parent_directories(name)?;
+                if exists(name) {
+                    return Err(-17);
+                }
+                let (perms, gid_ovr) = parent_inherited_gid_and_mode(name, mode & 0o7777, false);
+                return fs.mknod(rel, ftype | perms, rdev, gid_ovr);
+            }
+            MountBackend::Persistent(_) => return Err(-95),
+            MountBackend::RootOverlay => {}
+        }
+    }
+    require_parent_directories(name)?;
+    if exists(name) {
+        return Err(-17);
+    }
+    let (perms, gid_ovr) = parent_inherited_gid_and_mode(name, mode & 0o7777, false);
+    overlay_mknod(name, ftype | perms, rdev, gid_ovr)
+}
+
+pub fn link_path(old: &str, new: &str) -> Result<(), isize> {
+    if !has_ext4() {
+        return Err(-95);
+    }
+    if is_root_path(old) || is_root_path(new) {
+        return Err(-1);
+    }
+    require_parent_directories(old)?;
+    require_parent_directories(new)?;
+    let (old_mount, old_rel) = resolve_mount(old).ok_or(-18isize)?;
+    let (new_mount, new_rel) = resolve_mount(new).ok_or(-18isize)?;
+    if old_mount.id != new_mount.id {
+        return Err(-18); // EXDEV
+    }
+    if exists(new) || find_symlink(new)?.is_some() {
+        return Err(-17); // EEXIST
+    }
+    match old_mount.backend {
+        MountBackend::Procfs | MountBackend::Devfs => return Err(-1),
+        MountBackend::Persistent(_) => return Err(-95),
+        MountBackend::Memfs(fs) => {
+            let entry = fs.get(old_rel).ok_or(-2isize)?;
+            if matches!(entry, OverlayEntry::Directory(_)) {
+                return Err(-1); // EPERM
+            }
+            return fs.link_entry(new_rel, entry);
+        }
+        MountBackend::RootOverlay => {}
+    }
+    let entry = match overlay_get(old) {
+        Some(OverlayEntry::Directory(_)) => return Err(-1),
+        Some(OverlayEntry::Whiteout) => return Err(-2),
+        Some(entry) => entry,
+        None => {
+            let fs = EXT4.as_ref().ok_or(-2isize)?;
+            let inode = lower_inode(old).ok_or(-2isize)?;
+            if inode.is_dir() {
+                return Err(-1);
+            }
+            if inode.is_symlink() {
+                let link = Symlink::lower(fs, &inode)?;
+                if let Some(charge) = link.reserve_copy_up()? {
+                    link.commit_copy_up(charge);
+                }
+                OverlayEntry::Symlink(link)
+            } else if inode.is_file() {
+                let data = overlay_create(
+                    old,
+                    Some(ext4::Ext4File::new(Arc::clone(fs), inode.clone())),
+                    inode.mode & 0o7777,
+                )?;
+                OverlayEntry::File(data)
+            } else {
+                return Err(-1);
+            }
+        }
+    };
+    overlay_link(new, entry)
+}
+
+pub fn xattr_path_op(
+    name: &str,
+    follow: bool,
+    attr: &str,
+    set_val: Option<(&[u8], usize)>,
+    remove: bool,
+) -> Result<Vec<u8>, isize> {
+    if !follow {
+        if let Some(link) = find_symlink(name)? {
+            return link.xattr_op(attr, set_val, remove);
+        }
+    }
+    if (set_val.is_some() || remove) && overlay_get(name).is_none() {
+        if let Some((mount, _)) = resolve_mount(name) {
+            if matches!(mount.backend, MountBackend::RootOverlay) {
+                if let Some(fs) = EXT4.as_ref() {
+                    if let Some(inode) = lower_inode(name).filter(ext4::Inode::is_file) {
+                        let _ = overlay_create(
+                            name,
+                            Some(ext4::Ext4File::new(Arc::clone(fs), inode.clone())),
+                            inode.mode & 0o7777,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    open_for_stat(name)?.xattr_op(attr, set_val, remove)
+}
+
+pub fn set_path_timestamps(
+    name: &str,
+    follow: bool,
+    atime: Option<(i64, i64)>,
+    mtime: Option<(i64, i64)>,
+) -> Result<(), isize> {
+    if !follow {
+        if find_symlink(name)?.is_some() {
+            return Ok(());
+        }
+    }
+    if overlay_get(name).is_none() {
+        if let Some((mount, _)) = resolve_mount(name) {
+            if matches!(mount.backend, MountBackend::RootOverlay) {
+                if let Some(fs) = EXT4.as_ref() {
+                    if let Some(inode) = lower_inode(name).filter(ext4::Inode::is_file) {
+                        let _ = overlay_create(
+                            name,
+                            Some(ext4::Ext4File::new(Arc::clone(fs), inode.clone())),
+                            inode.mode & 0o7777,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    let rc = open_for_stat(name)?.set_timestamps(atime, mtime);
+    if rc < 0 { Err(rc) } else { Ok(()) }
 }
 
 pub fn unlink(name: &str, remove_directory: bool) -> Result<(), isize> {
@@ -1285,6 +1843,13 @@ pub fn list_dir_path(name: &str) -> Vec<(String, u32, u8)> {
                 return entries;
             }
             MountBackend::Devfs => {
+                if rel == "misc" {
+                    return alloc::vec![
+                        (String::from("."), 309, 2),
+                        (String::from(".."), 1, 2),
+                        (String::from("rtc"), 308, 3),
+                    ];
+                }
                 if !rel.is_empty() {
                     return Vec::new();
                 }
@@ -1293,8 +1858,13 @@ pub fn list_dir_path(name: &str) -> Vec<(String, u32, u8)> {
                     (String::from("zero"), 302, 3),
                     (String::from("tty"), 303, 3),
                     (String::from("console"), 304, 3),
+                    (String::from("full"), 305, 3),
                     (String::from("random"), 306, 3),
                     (String::from("urandom"), 307, 3),
+                    (String::from("rtc"), 308, 3),
+                    (String::from("rtc0"), 308, 3),
+                    (String::from("misc"), 309, 2),
+                    (String::from("cpu_dma_latency"), 310, 3),
                 ];
                 merge_child_mounts(name, &mut entries);
                 return entries;
@@ -1392,7 +1962,7 @@ pub fn path_mode_owner(name: &str) -> Result<(u16, u32, u32), isize> {
                 return Err(-2);
             }
             MountBackend::Devfs => {
-                if rel.is_empty() {
+                if dev_dir_exists(rel) {
                     return Ok((0o40755, 0, 0));
                 }
                 if dev_file_exists(rel) {
@@ -1415,7 +1985,20 @@ pub fn path_mode_owner(name: &str) -> Result<(u16, u32, u32), isize> {
                         let (u, g) = dir.owner();
                         Ok((dir.mode(), u, g))
                     }
-                    Some(OverlayEntry::Symlink(_)) => Ok((0o120777, 0, 0)),
+                    Some(OverlayEntry::Fifo(f)) => Ok((
+                        f.mode.load(Ordering::Relaxed),
+                        f.uid.load(Ordering::Relaxed),
+                        f.gid.load(Ordering::Relaxed),
+                    )),
+                    Some(OverlayEntry::Special(s)) => Ok((
+                        s.mode.load(Ordering::Relaxed),
+                        s.uid.load(Ordering::Relaxed),
+                        s.gid.load(Ordering::Relaxed),
+                    )),
+                    Some(OverlayEntry::Symlink(link)) => {
+                        let (u, g) = link.owner();
+                        Ok((0o120777, u, g))
+                    }
                     Some(OverlayEntry::Whiteout) | None => Err(-2),
                 };
             }
@@ -1436,7 +2019,24 @@ pub fn path_mode_owner(name: &str) -> Result<(u16, u32, u32), isize> {
             let (u, g) = dir.owner();
             return Ok((dir.mode(), u, g));
         }
-        Some(OverlayEntry::Symlink(_)) => return Ok((0o120777, 0, 0)),
+        Some(OverlayEntry::Fifo(f)) => {
+            return Ok((
+                f.mode.load(Ordering::Relaxed),
+                f.uid.load(Ordering::Relaxed),
+                f.gid.load(Ordering::Relaxed),
+            ));
+        }
+        Some(OverlayEntry::Special(s)) => {
+            return Ok((
+                s.mode.load(Ordering::Relaxed),
+                s.uid.load(Ordering::Relaxed),
+                s.gid.load(Ordering::Relaxed),
+            ));
+        }
+        Some(OverlayEntry::Symlink(link)) => {
+            let (u, g) = link.owner();
+            return Ok((0o120777, u, g));
+        }
         Some(OverlayEntry::Whiteout) => return Err(-2),
         None => {}
     }
@@ -1504,9 +2104,49 @@ pub fn mutate_path_meta(
                         dir.set_owner(nu, ng);
                         Ok(())
                     }
-                    Some(OverlayEntry::Symlink(_)) => {
-                        let (m, _, _) = update(0o120777, 0, 0)?;
-                        if m.is_some() { Err(-95) } else { Ok(()) }
+                    Some(OverlayEntry::Fifo(f)) => {
+                        let fm = f.mode.load(Ordering::Relaxed);
+                        let fu = f.uid.load(Ordering::Relaxed);
+                        let fg = f.gid.load(Ordering::Relaxed);
+                        let (m, nu, ng) = update(fm, fu, fg)?;
+                        if let Some(perm) = m {
+                            f.mode.store((fm & !0o7777) | (perm & 0o7777), Ordering::Relaxed);
+                        }
+                        if let Some(u) = nu {
+                            f.uid.store(u, Ordering::Relaxed);
+                        }
+                        if let Some(g) = ng {
+                            f.gid.store(g, Ordering::Relaxed);
+                        }
+                        f.times.exclusive_access().2 = overlay::now_ts();
+                        Ok(())
+                    }
+                    Some(OverlayEntry::Special(s)) => {
+                        let sm = s.mode.load(Ordering::Relaxed);
+                        let su = s.uid.load(Ordering::Relaxed);
+                        let sg = s.gid.load(Ordering::Relaxed);
+                        let (m, nu, ng) = update(sm, su, sg)?;
+                        if let Some(perm) = m {
+                            s.mode.store((sm & !0o7777) | (perm & 0o7777), Ordering::Relaxed);
+                        }
+                        if let Some(u) = nu {
+                            s.uid.store(u, Ordering::Relaxed);
+                        }
+                        if let Some(g) = ng {
+                            s.gid.store(g, Ordering::Relaxed);
+                        }
+                        s.times.exclusive_access().2 = overlay::now_ts();
+                        Ok(())
+                    }
+                    Some(OverlayEntry::Symlink(link)) => {
+                        let (lu, lg) = link.owner();
+                        let (m, nu, ng) = update(0o120777, lu, lg)?;
+                        if m.is_some() {
+                            Err(-95)
+                        } else {
+                            link.set_owner_ids(nu, ng);
+                            Ok(())
+                        }
                     }
                     Some(OverlayEntry::Whiteout) | None => Err(-2),
                 };
@@ -1549,9 +2189,48 @@ pub fn mutate_path_meta(
             dir.set_owner(nu, ng);
             return Ok(());
         }
-        Some(OverlayEntry::Symlink(_)) => {
-            let (m, _, _) = update(0o120777, 0, 0)?;
-            return if m.is_some() { Err(-95) } else { Ok(()) };
+        Some(OverlayEntry::Fifo(f)) => {
+            let fm = f.mode.load(Ordering::Relaxed);
+            let fu = f.uid.load(Ordering::Relaxed);
+            let fg = f.gid.load(Ordering::Relaxed);
+            let (m, nu, ng) = update(fm, fu, fg)?;
+            if let Some(perm) = m {
+                f.mode.store((fm & !0o7777) | (perm & 0o7777), Ordering::Relaxed);
+            }
+            if let Some(u) = nu {
+                f.uid.store(u, Ordering::Relaxed);
+            }
+            if let Some(g) = ng {
+                f.gid.store(g, Ordering::Relaxed);
+            }
+            f.times.exclusive_access().2 = overlay::now_ts();
+            return Ok(());
+        }
+        Some(OverlayEntry::Special(s)) => {
+            let sm = s.mode.load(Ordering::Relaxed);
+            let su = s.uid.load(Ordering::Relaxed);
+            let sg = s.gid.load(Ordering::Relaxed);
+            let (m, nu, ng) = update(sm, su, sg)?;
+            if let Some(perm) = m {
+                s.mode.store((sm & !0o7777) | (perm & 0o7777), Ordering::Relaxed);
+            }
+            if let Some(u) = nu {
+                s.uid.store(u, Ordering::Relaxed);
+            }
+            if let Some(g) = ng {
+                s.gid.store(g, Ordering::Relaxed);
+            }
+            s.times.exclusive_access().2 = overlay::now_ts();
+            return Ok(());
+        }
+        Some(OverlayEntry::Symlink(link)) => {
+            let (lu, lg) = link.owner();
+            let (m, nu, ng) = update(0o120777, lu, lg)?;
+            if m.is_some() {
+                return Err(-95);
+            }
+            link.set_owner_ids(nu, ng);
+            return Ok(());
         }
         Some(OverlayEntry::Whiteout) => return Err(-2),
         None => {}

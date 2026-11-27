@@ -73,6 +73,64 @@ RISC-V64 和 LoongArch64 均以单核、1 GiB 和每组 120 s 运行原盘。两
 
 `make all`、`make all SMP=1` 和 `make kernel-la` 均零告警通过。单核官方 `basic` 双架构双库均为 **102/102**，RV64 双核双库为 98/102（与基线一致），`busybox` 双架构双库保持 **52/55**。`test_fork_cow.sh`、`test_mmap_vma.sh`、`test_page_cache_policy.sh`、`test_smp.sh`、`test_overlay_fs.sh`、`ext4_probe`、`easy-fs` 宿主测试及双架构 VFS、网络、Pipe 等待、ELF 动态/按需加载和 EasyFS 持久化等全套专项回归全部通过。
 
+### PR-26 全量原盘判分复测
+
+以 `bca16c8f`（PR-25）为基线，使用 2025 初赛原盘、QEMU 11.1.3、单核、QEMU 内存参数 1 GiB、`--legacy-image` 和每组 120 s 宿主机上限。每个架构各启动 24 组，每组独立启动 QEMU。基线 RV64 glibc LTP 在并发采样时触发过超时，表中采用同一基线内核随后完成的 76.11 s 复测。测试套件、判分器版本及启动命令见 [对接官方评测](oscomp-evaluation.md#3-完整-24-项评测矩阵)。
+
+#### 24 组矩阵对照
+
+基线双架构各完成 24/24 组。PR-26 双架构各完成 22/24 组，超时均为 UnixBench，双架构全矩阵内核 panic 为 0。下表为基线 → PR-26。带公开判分器的组列得分，`iozone` 为 20 项判分之和并保留两位小数。其余组列用例成功数、有效测项数或耗时。`ltp` 两个数字依次为退出码 0 的用例数和 `Summary.passed` 总和。cyclictest 的压力源状态指 `hackbench` 的启动与退出结果。
+
+| 测试组 | RV64 musl | RV64 glibc | LA64 musl | LA64 glibc |
+|---|---:|---:|---:|---:|
+| `basic` | 102/102 → 102/102 | 102/102 → 102/102 | 102/102 → 102/102 | 102/102 → 102/102 |
+| `busybox` | 52/55 → 54/55 | 52/55 → 54/55 | 52/55 → 54/55 | 52/55 → 54/55 |
+| `lua` | 9/9 → 9/9 | 9/9 → 9/9 | 9/9 → 9/9 | 9/9 → 9/9 |
+| `libctest` | 106/220 → 217/220 | 85/220 → 179/220 | 0/220 → 217/220 | 85/220 → 179/220 |
+| `libcbench` | 27 项 → 27 项 | 27 项 → 27 项 | 27 项 → 27 项 | 27 项 → 27 项 |
+| `lmbench` | 65.62 s → 67.49 s | 50.31 s → 50.07 s | 56.98 s → 62.72 s | 57.81 s → 55.65 s |
+| `unixbench` | 0/27 项 → 8/27 项（超时） | 0/27 项 → 8/27 项（超时） | 0/27 项 → 8/27 项（超时） | 0/27 项 → 8/27 项（超时） |
+| `iozone` | 0.00 → 23.81 | 0.00 → 29.63 | 0.00 → 39.26 | 0.00 → 39.57 |
+| `cyclictest` | 4/4，压力源失败 → 4/4，压力源退出 | 4/4，压力源失败 → 4/4，压力源退出 | 0/4，压力源失败 → 0/4，压力源退出 | 0/4，压力源失败 → 4/4，压力源退出 |
+| `ltp` | 485 / 2,530 → 699 / 3,605 | 495 / 2,579 → 704 / 3,599 | 487 / 2,527 → 704 / 3,616 | 494 / 2,579 → 707 / 3,731 |
+| `iperf` | 6/6 → 5/6 | 6/6 → 6/6 | 5/6 → 5/6 | 6/6 → 6/6 |
+| `netperf` | 0/5 → 5/5 | 0/5 → 5/5 | 0/5 → 5/5 | 0/5 → 5/5 |
+
+#### LTP 二轮实测
+
+四组最终内核均在 120 s 内执行到原盘系统调用清单末尾，0 次内核 panic。基线每组执行 1,397 项。PR-26 额外过滤 `dirtyc0w`、`dirtypipe`、`leapsec01`，每组实际执行 1,394 项。执行器改用单调时钟限制单项耗时，默认从 450 ms 调整为 320 ms，定时器、信号等需要等待的指定用例使用 1,250 ms。发送 `SIGTERM` 后的宽限从 80 ms 调整为 50 ms。
+
+| 平台 / libc | 退出码 0，基线 → PR-26 | `Summary.passed`，基线 → PR-26 | PR-26 `TCONF`（退出码 32） | PR-26 耗时 |
+|---|---:|---:|---:|---:|
+| RV64 musl | 485 → **699** | 2,530 → **3,605** | 307 | 93.25 s |
+| RV64 glibc | 495 → **704** | 2,579 → **3,599** | 302 | 112.82 s |
+| LA64 musl | 487 → **704** | 2,527 → **3,616** | 307 | 62.95 s |
+| LA64 glibc | 494 → **707** | 2,579 → **3,731** | 303 | 67.11 s |
+
+下表合计双架构双库的退出码 0 用例。统计范围为前后两次均执行且均未返回 `TCONF` 的案例，可直接比较同一批用例。
+
+| 用例聚类 | 基线 → PR-26 | 可比较用例数 |
+|---|---:|---:|
+| `eventfd`、`timerfd`、`signalfd`、`memfd_create` | 0 → 40 | 52 |
+| `fcntl`、`flock` | 80 → 220 | 284 |
+| 硬链接、`copy_file_range`、`splice`、`vmsplice`、`tee` | 0 → 46 | 88 |
+| SysV 共享内存、信号量、消息队列 | 0 → 133 | 184 |
+| `getpriority`、`setpriority`、`prctl` | 0 → 8 | 40 |
+
+#### 失败项与环境限制
+
+- BusyBox 原盘引导环境提供可执行的 `ls` 和 `/dev/rtc`，`which ls`、`hwclock` 恢复。脚本的 54 个不同命令均输出成功，包括启动子进程后执行的 `kill $!`。固定版本判分器还要求原盘命令表中缺失的 `kill 10`，因此四组官方分均为 54/55。
+- musl `libctest` 剩余静态 `crypt`、静态 `pleval` 和动态 `crypt`。glibc 剩余失分主要涉及 locale、宽字符、正则、线程取消和 DNS 解析。逐项结果可从各组的 `score.json` 查询。
+- LA64 原盘 musl 的 `sched_getparam`、`sched_getscheduler` 和 `sched_setscheduler` 均直接返回 `ENOSYS`，串口插桩确认 `sched_getparam` 未到达内核。该组的四个 `cyclictest` 子项仍失败，`hackbench` 可正常启动并退出。调度 API 保存进程级策略和优先级，内核仍使用 FIFO 就绪队列。
+- 基线的 UnixBench 脚本可退出，但待测程序因解释器路径缺失而无法启动。原盘 UnixBench 的 27 项依次运行，脚本传入的采样时长合计 390 s。四份原盘用户态目录均缺少 `sort.src`，影响三个 SHELL 子项。用 PR-26 首轮内核在补入官方 `sort.src` 的镜像副本上诊断，四组都在 480 s 内输出前 26 项。最终内核按原脚本参数单独运行 `./syscall 10 exec`，双架构双库均取得最后一项数据。
+- 双架构 musl 的 `iperf BASIC_UDP` 在矩阵中出现客户端连接拒绝。原脚本在后台启动服务端后立即连接，使用同一最终内核单独复测时，两组均为 6/6。
+
+#### 构建与专项回归
+
+`make all`、`make all SMP=1`、`make kernel-la` 均通过，三个日志各 0 条告警。RV64 双核原盘 `basic` 双库均为 98/102，失分集中在 `test_pipe` 输出，单核双架构双库均为 102/102。
+
+`test_vfs_abi.sh`、`test_pipe_wait.sh` 在 RV64 单核、双核和 LA64 单核通过。`test_net_abi.sh` 在双架构单核通过。`test_elf_demand.sh`、`test_elf_dynamic.sh`、`test_overlay_fs.sh`、`test_pthread_abi.sh`、`test_smp.sh` 及宿主机矩阵解析单测（9/9）通过。新增检查覆盖普通模式解释器缺失、放弃 UID 0 时清除 capability、`splice` 背压、timerfd/signalfd 唤醒、SysV 映射替换及文件锁释放。
+
 ### 网络测例（`iperf` / `netperf`）
 
 - **Netperf 2.7.0**：使用独立 EXT4 盘（含按架构静态构建的 `netperf` / `netserver`），RISC-V64 与 LoongArch64 单核均 **5/5**（UDP/TCP stream、RR、CRR）。

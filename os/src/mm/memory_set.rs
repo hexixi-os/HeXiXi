@@ -147,6 +147,45 @@ impl MemorySet {
         self.vmas.has_device_mapping(dev)
     }
 
+    pub(crate) fn has_shared_writable_mapping(&self, identity: (u64, u64)) -> bool {
+        self.vmas.has_shared_writable_mapping(identity)
+    }
+
+    pub(crate) fn mincore_vec(&self, range: Range<VirtPageNum>) -> Result<Vec<u8>, isize> {
+        self.check_user_range(&range, MapPermission::empty())?;
+        let mut out = Vec::with_capacity(range.end.0 - range.start.0);
+        for raw in range.start.0..range.end.0 {
+            let vpn = VirtPageNum(raw);
+            let resident = self.vmas.is_resident(vpn)
+                || self.areas.iter().any(|area| area.data_frames.contains_key(&vpn));
+            out.push(u8::from(resident));
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn populate_range(&mut self, range: Range<VirtPageNum>) -> Result<(), isize> {
+        self.check_user_range(&range, MapPermission::empty())?;
+        for raw in range.start.0..range.end.0 {
+            let vpn = VirtPageNum(raw);
+            if self.translate(vpn).is_some() {
+                continue;
+            }
+            if let Some(perms) = self.vmas.permissions_at(vpn) {
+                let access = if perms.contains(MapPermission::R) {
+                    MapPermission::R
+                } else if perms.contains(MapPermission::X) {
+                    MapPermission::X
+                } else {
+                    continue;
+                };
+                if !matches!(self.vmas.fault(&mut self.page_table, vpn, access), PageFault::Resolved) {
+                    return Err(-12);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn is_shared_at(&self, vpn: VirtPageNum) -> bool {
         self.vmas.is_shared_at(vpn)
     }
@@ -449,24 +488,26 @@ impl MemorySet {
             (_, None) => None,
             (None, Some(_)) => return Err(ENOEXEC), // Kernel-started init is static.
             (Some(path), Some(interpreter)) => {
-                match resolve_path(interpreter).and_then(|path| open_executable(&path)) {
-                    Ok(source) => Some(source),
-                    Err(-2) if crate::config::legacy_oscomp_image()
-                        && image.is_official_basic(path, &headers) => None,
-                    Err(-2) if crate::config::legacy_oscomp_image() => {
-                        let source = match interpreter {
-                            crate::arch::OFFICIAL_MUSL_INTERPRETER if path.starts_with("musl/ltp/") => {
-                                open_executable("musl/lib/libc.so")
-                            }
-                            crate::arch::OFFICIAL_BASIC_INTERPRETER if path.starts_with("glibc/ltp/") => {
-                                let name = interpreter.rsplit('/').next().ok_or(ENOEXEC)?;
-                                open_executable(&alloc::format!("glibc/lib/{}", name))
-                            }
-                            _ => return Err(-2),
-                        }?;
-                        Some(source)
+                if crate::config::legacy_oscomp_image()
+                    && image.is_official_basic(path, &headers)
+                {
+                    None
+                } else {
+                    match resolve_path(interpreter).and_then(|p| open_executable(&p)) {
+                        Ok(source) => Some(source),
+                        Err(-2) if crate::config::legacy_oscomp_image() => {
+                            let name = interpreter.rsplit('/').next().ok_or(ENOEXEC)?;
+                            let source = if path.starts_with("musl/") && name.starts_with("ld-musl-") {
+                                open_executable("musl/lib/libc.so")?
+                            } else if path.starts_with("glibc/") && name.starts_with("ld-linux-") {
+                                open_executable(&alloc::format!("glibc/lib/{}", name))?
+                            } else {
+                                return Err(-2);
+                            };
+                            Some(source)
+                        }
+                        Err(errno) => return Err(errno),
                     }
-                    Err(errno) => return Err(errno),
                 }
             }
         };

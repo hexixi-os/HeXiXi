@@ -2,6 +2,7 @@ use core::arch::asm;
 
 const SYSCALL_DUP: usize = 23;
 const SYSCALL_MKDIRAT: usize = 34;
+const SYSCALL_UNLINKAT: usize = 35;
 const SYSCALL_SYMLINKAT: usize = 36;
 const SYSCALL_CHDIR: usize = 49;
 const SYSCALL_OPEN: usize = 56;
@@ -11,6 +12,7 @@ const SYSCALL_READ: usize = 63;
 const SYSCALL_WRITE: usize = 64;
 const SYSCALL_EXIT: usize = 93;
 const SYSCALL_SLEEP: usize = 101;
+const SYSCALL_CLOCK_GETTIME: usize = 113;
 const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
 const SYSCALL_SETPGID: usize = 154;
@@ -63,6 +65,10 @@ fn syscall(id: usize, args: [usize; 3]) -> isize {
 
 pub fn sys_dup(fd: usize) -> isize {
     syscall(SYSCALL_DUP, [fd, 0, 0])
+}
+
+pub fn sys_clock_monotonic(ts: *mut usize) -> isize {
+    syscall(SYSCALL_CLOCK_GETTIME, [1, ts as usize, 0])
 }
 
 pub fn sys_chdir(path: &str) -> isize {
@@ -132,6 +138,10 @@ pub fn sys_setpgid(pid: usize, pgid: usize) -> isize {
 
 pub fn sys_mkdirat(dirfd: isize, path: *const u8, mode: u32) -> isize {
     syscall(SYSCALL_MKDIRAT, [dirfd as usize, path as usize, mode as usize])
+}
+
+pub fn sys_unlinkat(dirfd: isize, path: *const u8, flags: usize) -> isize {
+    syscall(SYSCALL_UNLINKAT, [dirfd as usize, path as usize, flags])
 }
 
 pub fn sys_symlinkat(target: *const u8, dirfd: isize, link: *const u8) -> isize {

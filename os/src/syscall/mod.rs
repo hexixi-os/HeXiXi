@@ -1,16 +1,24 @@
+const SYSCALL_SETXATTR: usize = 5;
+const SYSCALL_FREMOVEXATTR: usize = 16;
+const SYSCALL_EVENTFD2: usize = 19;
 const SYSCALL_EPOLL_CREATE1: usize = 20;
 const SYSCALL_EPOLL_CTL: usize = 21;
 const SYSCALL_EPOLL_PWAIT: usize = 22;
 const SYSCALL_EPOLL_PWAIT2: usize = 441;
 const SYSCALL_GETCWD: usize = 17;
+const SYSCALL_FLOCK: usize = 32;
+const SYSCALL_MKNODAT: usize = 33;
 const SYSCALL_UMOUNT2: usize = 39;
 const SYSCALL_MOUNT: usize = 40;
 const SYSCALL_GETDENTS64: usize = 61;
 const SYSCALL_MKDIRAT: usize = 34;
 const SYSCALL_UNLINKAT: usize = 35;
 const SYSCALL_SYMLINKAT: usize = 36;
+const SYSCALL_LINKAT: usize = 37;
 const SYSCALL_READLINKAT: usize = 78;
 const SYSCALL_CHDIR: usize = 49;
+const SYSCALL_FCHDIR: usize = 50;
+const SYSCALL_CHROOT: usize = 51;
 const SYSCALL_FSTAT: usize = 80;
 const SYSCALL_TRUNCATE: usize = 45;
 const SYSCALL_FTRUNCATE: usize = 46;
@@ -49,14 +57,48 @@ const SYSCALL_PWRITEV2: usize = 287;
 const SYSCALL_RENAMEAT2: usize = 276;
 const SYSCALL_PSELECT6: usize = 72;
 const SYSCALL_PPOLL: usize = 73;
+const SYSCALL_SIGNALFD4: usize = 74;
+const SYSCALL_VMSPLICE: usize = 75;
+const SYSCALL_SPLICE: usize = 76;
+const SYSCALL_TEE: usize = 77;
+const SYSCALL_SYNC_FILE_RANGE: usize = 84;
+const SYSCALL_TIMERFD_CREATE: usize = 85;
+const SYSCALL_TIMERFD_SETTIME: usize = 86;
+const SYSCALL_TIMERFD_GETTIME: usize = 87;
+const SYSCALL_ACCT: usize = 89;
+const SYSCALL_WAITID: usize = 95;
 const SYSCALL_SET_ROBUST_LIST: usize = 99;
 const SYSCALL_GET_ROBUST_LIST: usize = 100;
+const SYSCALL_CLOCK_SETTIME: usize = 112;
 const SYSCALL_SIGALTSTACK: usize = 132;
+const SYSCALL_REBOOT: usize = 142;
+const SYSCALL_SETHOSTNAME: usize = 161;
+const SYSCALL_SETDOMAINNAME: usize = 162;
 const SYSCALL_GETRUSAGE: usize = 165;
+const SYSCALL_MSGGET: usize = 186;
+const SYSCALL_MSGCTL: usize = 187;
+const SYSCALL_MSGRCV: usize = 188;
+const SYSCALL_MSGSND: usize = 189;
+const SYSCALL_SEMGET: usize = 190;
+const SYSCALL_SEMCTL: usize = 191;
+const SYSCALL_SEMTIMEDOP: usize = 192;
+const SYSCALL_SEMOP: usize = 193;
+const SYSCALL_SHMGET: usize = 194;
+const SYSCALL_SHMCTL: usize = 195;
+const SYSCALL_SHMAT: usize = 196;
+const SYSCALL_SHMDT: usize = 197;
+const SYSCALL_FADVISE64: usize = 223;
 const SYSCALL_MPROTECT: usize = 226;
 const SYSCALL_MSYNC: usize = 227;
+const SYSCALL_MINCORE: usize = 232;
 const SYSCALL_MADVISE: usize = 233;
+const SYSCALL_GET_MEMPOLICY: usize = 236;
 const SYSCALL_GETRANDOM: usize = 278;
+const SYSCALL_MEMFD_CREATE: usize = 279;
+const SYSCALL_EXECVEAT: usize = 281;
+const SYSCALL_MLOCK2: usize = 284;
+const SYSCALL_COPY_FILE_RANGE: usize = 285;
+const SYSCALL_CLOSE_RANGE: usize = 436;
 const SYSCALL_RT_SIGTIMEDWAIT: usize = 137;
 const SYSCALL_RT_SIGPENDING: usize = 136;
 pub(crate) const SYSCALL_RT_SIGSUSPEND: usize = 133;
@@ -170,12 +212,15 @@ const SYSCALL_CONDVAR_SIGNAL: usize = 1031;
 const SYSCALL_CONDVAR_WAIT: usize = 1032;
 
 pub(crate) mod epoll;
+pub(crate) mod eventfd;
 mod fs;
 pub(crate) mod futex;
+pub(crate) mod lock;
 mod net;
 mod process;
 pub mod signal;
 mod sync;
+pub(crate) mod sysvipc;
 mod thread;
 
 use fs::*;
@@ -230,9 +275,20 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         LAST_SYSCALLS[i].store(syscall_id, core::sync::atomic::Ordering::Relaxed);
     }
     match syscall_id {
+        SYSCALL_SETXATTR..=SYSCALL_FREMOVEXATTR => sys_xattr(syscall_id, args),
+        SYSCALL_EVENTFD2 => eventfd::sys_eventfd2(args[0] as u32, args[1] as u32),
         SYSCALL_EPOLL_CREATE1 => epoll::create(args),
         SYSCALL_EPOLL_CTL => epoll::ctl(args),
         SYSCALL_EPOLL_PWAIT | SYSCALL_EPOLL_PWAIT2 => epoll::wait(args, syscall_id == SYSCALL_EPOLL_PWAIT2),
+        SYSCALL_FLOCK => lock::sys_flock(args[0], args[1]),
+        SYSCALL_MKNODAT => sys_mknodat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3]),
+        SYSCALL_LINKAT => sys_linkat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as isize,
+            args[3] as *const u8,
+            args[4],
+        ),
         SYSCALL_FCNTL => sys_fcntl(args[0], args[1], args[2]),
         SYSCALL_UTIMENSAT => sys_utimensat(
             args[0] as isize,
@@ -277,6 +333,55 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             args[5],
         ),
         SYSCALL_PPOLL => sys_ppoll(args),
+        SYSCALL_SIGNALFD4 => eventfd::sys_signalfd4(args[0] as isize, args[1], args[2], args[3] as u32),
+        SYSCALL_VMSPLICE => sys_vmsplice(args[0], args[1] as *const u8, args[2], args[3] as u32),
+        SYSCALL_SPLICE => sys_splice(
+            args[0],
+            args[1] as *mut i64,
+            args[2],
+            args[3] as *mut i64,
+            args[4],
+            args[5] as u32,
+        ),
+        SYSCALL_TEE => sys_tee(args[0], args[1], args[2], args[3] as u32),
+        SYSCALL_SYNC_FILE_RANGE => sys_sync_file_range(args[0], args[1] as i64, args[2] as i64, args[3] as u32),
+        SYSCALL_TIMERFD_CREATE => eventfd::sys_timerfd_create(args[0] as i32, args[1] as u32),
+        SYSCALL_TIMERFD_SETTIME => eventfd::sys_timerfd_settime(args[0], args[1] as u32, args[2], args[3]),
+        SYSCALL_TIMERFD_GETTIME => eventfd::sys_timerfd_gettime(args[0], args[1]),
+        SYSCALL_ACCT => if crate::task::current_process().inner_exclusive_access().euid != 0 { -1 } else { -38 },
+        SYSCALL_WAITID => sys_waitid(args[0], args[1], args[2], args[3], args[4]),
+        SYSCALL_MSGGET => sysvipc::sys_msgget(args[0] as i32, args[1]),
+        SYSCALL_MSGCTL => sysvipc::sys_msgctl(args[0] as i32, args[1] as i32, args[2]),
+        SYSCALL_MSGRCV => sysvipc::sys_msgrcv(args[0] as i32, args[1], args[2], args[3] as isize, args[4]),
+        SYSCALL_MSGSND => sysvipc::sys_msgsnd(args[0] as i32, args[1], args[2], args[3]),
+        SYSCALL_SEMGET => sysvipc::sys_semget(args[0] as i32, args[1] as i32, args[2]),
+        SYSCALL_SEMCTL => sysvipc::sys_semctl(args[0] as i32, args[1] as i32, args[2] as i32, args[3]),
+        SYSCALL_SEMTIMEDOP => sysvipc::sys_semtimedop(args[0] as i32, args[1], args[2], args[3]),
+        SYSCALL_SEMOP => sysvipc::sys_semtimedop(args[0] as i32, args[1], args[2], 0),
+        SYSCALL_SHMGET => sysvipc::sys_shmget(args[0] as i32, args[1], args[2]),
+        SYSCALL_SHMCTL => sysvipc::sys_shmctl(args[0] as i32, args[1] as i32, args[2]),
+        SYSCALL_SHMAT => sysvipc::sys_shmat(args[0] as i32, args[1], args[2]),
+        SYSCALL_SHMDT => sysvipc::sys_shmdt(args[0]),
+        SYSCALL_FADVISE64 => sys_fadvise64(args[0], args[1] as i64, args[2] as i64, args[3]),
+        SYSCALL_MINCORE => sys_mincore(args[0], args[1], args[2] as *mut u8),
+        SYSCALL_GET_MEMPOLICY | 171 | 266 => -38,
+        SYSCALL_MEMFD_CREATE => eventfd::sys_memfd_create(args[0] as *const u8, args[1] as u32),
+        SYSCALL_EXECVEAT => sys_execveat(
+            args[0] as isize,
+            args[1] as *const u8,
+            args[2] as *const usize,
+            args[3] as *const usize,
+            args[4],
+        ),
+        SYSCALL_COPY_FILE_RANGE => sys_copy_file_range(
+            args[0],
+            args[1] as *mut i64,
+            args[2],
+            args[3] as *mut i64,
+            args[4],
+            args[5] as u32,
+        ),
+        SYSCALL_CLOSE_RANGE => sys_close_range(args[0] as u32, args[1] as u32, args[2] as u32),
         SYSCALL_SOCKET => net::socket(args),
         SYSCALL_SOCKETPAIR => net::socketpair(args),
         SYSCALL_BIND => net::bind(args),
@@ -293,7 +398,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SHUTDOWN => net::shutdown(args),
         SYSCALL_MADVISE => sys_madvise(args[0], args[1], args[2]),
         SYSCALL_CAPGET => sys_capget(args[0] as *mut u32, args[1] as *mut u32),
-        SYSCALL_CAPSET => -1,
+        SYSCALL_CAPSET => sys_capset(args[0] as *mut u32, args[1] as *const u32),
         SYSCALL_PERSONALITY => {
             let p = args[0] as u32;
             if p == u32::MAX || (p & 0xff) == 0 || (p & 0xff) == 8 { 0 } else { -22 }
@@ -301,7 +406,10 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SET_ROBUST_LIST => futex::sys_set_robust_list(args[0], args[1]),
         SYSCALL_SIGALTSTACK => signal::sys_sigaltstack(args[0], args[1]),
         SYSCALL_GET_ROBUST_LIST => futex::sys_get_robust_list(args[0] as i32, args[1], args[2]),
-        SYSCALL_GETRUSAGE => sys_getrusage(args[1] as *mut u8),
+        SYSCALL_REBOOT => if crate::task::current_process().inner_exclusive_access().euid != 0 { -1 } else { -22 },
+        SYSCALL_SETHOSTNAME => sys_sethostname(args[0] as *const u8, args[1]),
+        SYSCALL_SETDOMAINNAME => sys_setdomainname(args[0] as *const u8, args[1]),
+        SYSCALL_GETRUSAGE => sys_getrusage(args[0] as i32, args[1] as *mut u8),
         SYSCALL_GETRANDOM => sys_getrandom(args[0] as *mut u8, args[1], args[2] as u32),
         SYSCALL_MPROTECT => sys_mprotect(args[0], args[1], args[2]),
         SYSCALL_MSYNC => sys_msync(args[0], args[1], args[2]),
@@ -327,7 +435,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
             if cpu && node { 0 } else { -14 }
         }
         SYSCALL_UMASK => sys_umask(args[0] as u32),
-        SYSCALL_PRCTL => 0,
+        SYSCALL_PRCTL => sys_prctl(args[0], args[1], args[2], args[3], args[4]),
         SYSCALL_FCHMOD => sys_fchmod(args[0], args[1] as u32),
         SYSCALL_FCHMODAT => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32, 0),
         SYSCALL_FCHMODAT2 => sys_fchmodat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3]),
@@ -370,8 +478,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SIGPROCMASK => signal::sys_rt_sigprocmask(args[0], args[1], args[2], args[3]),
         SYSCALL_RT_SIGPENDING => signal::sys_rt_sigpending(args[0], args[1]),
         SYSCALL_RT_SIGSUSPEND => signal::sys_rt_sigsuspend(args[0], args[1]),
-        SYSCALL_GETPRIORITY => if args[0] > 2 { -22 } else { 20 },
-        SYSCALL_SETPRIORITY => 0,
+        SYSCALL_GETPRIORITY => sys_getpriority(args[0], args[1] as i32),
+        SYSCALL_SETPRIORITY => sys_setpriority(args[0], args[1] as i32, args[2] as i32),
         SYSCALL_SETREGID => sys_setregid(args[0] as u32, args[1] as u32),
         SYSCALL_SETGID => sys_setgid(args[0] as u32),
         SYSCALL_SETREUID => sys_setreuid(args[0] as u32, args[1] as u32),
@@ -406,6 +514,8 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SYMLINKAT => sys_symlinkat(args[0] as *const u8, args[1] as isize, args[2] as *const u8),
         SYSCALL_READLINKAT => sys_readlinkat(args[0] as isize, args[1] as *const u8, args[2] as *mut u8, args[3]),
         SYSCALL_CHDIR => sys_chdir(args[0] as *const u8),
+        SYSCALL_FCHDIR => sys_fchdir(args[0]),
+        SYSCALL_CHROOT => sys_chroot(args[0] as *const u8),
         SYSCALL_FSTAT => sys_fstat(args[0], args[1] as *mut u8),
         SYSCALL_OPEN => sys_openat(args[0] as isize, args[1] as *const u8, args[2] as u32, args[3] as u32),
         SYSCALL_CLOSE => sys_close(args[0]),
@@ -421,22 +531,29 @@ pub fn syscall(syscall_id: usize, args: [usize; 6]) -> isize {
         SYSCALL_SYSLOG => 0,
         SYSCALL_SETITIMER => signal::sys_setitimer(args[0], args[1] as *const u8, args[2] as *mut u8),
         SYSCALL_RT_SIGRETURN => signal::sys_rt_sigreturn(),
-        SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[1] as *mut u8),
-        SYSCALL_CLOCK_GETRES => sys_clock_getres(args[1] as *mut u8),
-        SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(args[1], args[2] as *const u8, args[3]),
+        SYSCALL_CLOCK_SETTIME => sys_clock_settime(args[0] as i32, args[1] as *const u8),
+        SYSCALL_CLOCK_GETTIME => sys_clock_gettime(args[0] as i32, args[1] as *mut u8),
+        SYSCALL_CLOCK_GETRES => sys_clock_getres(args[0] as i32, args[1] as *mut u8),
+        SYSCALL_CLOCK_NANOSLEEP => sys_clock_nanosleep(args[0] as i32, args[1], args[2] as *const u8, args[3]),
         SYSCALL_TIMES => sys_times(args[0] as *mut u8),
         SYSCALL_UNAME => sys_uname(args[0] as *mut u8),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_KILL => sys_kill(args[0], args[1] as u32),
-        SYSCALL_SCHED_SETPARAM | SYSCALL_SCHED_SETSCHEDULER | SYSCALL_SCHED_SETAFFINITY
-        | SYSCALL_MLOCK | SYSCALL_MUNLOCK | SYSCALL_MLOCKALL | SYSCALL_MUNLOCKALL => 0,
-        SYSCALL_SCHED_GETSCHEDULER => 0,
+        SYSCALL_SCHED_SETPARAM => sys_sched_setparam(args[0] as i32, args[1] as *const u8),
+        SYSCALL_SCHED_SETSCHEDULER => sys_sched_setscheduler(args[0] as i32, args[1] as i32, args[2] as *const u8),
+        SYSCALL_SCHED_GETSCHEDULER => sys_sched_getscheduler(args[0] as i32),
+        SYSCALL_SCHED_SETAFFINITY => sys_sched_setaffinity(args[0] as i32, args[1], args[2] as *const u8),
         SYSCALL_SCHED_GETAFFINITY => sys_sched_getaffinity(args[0] as i32, args[1], args[2] as *mut u8),
-        SYSCALL_SCHED_GETPARAM => sys_sched_getparam(args[1] as *mut u8),
-        SYSCALL_SCHED_PRIO_MAX => 99,
-        SYSCALL_SCHED_PRIO_MIN => 1,
-        SYSCALL_SCHED_RR_INTERVAL => 0,
-        SYSCALL_GET_TIME => sys_gettimeofday(args[0] as *mut u8),
+        SYSCALL_SCHED_GETPARAM => sys_sched_getparam(args[0] as i32, args[1] as *mut u8),
+        SYSCALL_SCHED_PRIO_MAX => sys_sched_get_priority_max(args[0] as i32),
+        SYSCALL_SCHED_PRIO_MIN => sys_sched_get_priority_min(args[0] as i32),
+        SYSCALL_SCHED_RR_INTERVAL => sys_sched_rr_get_interval(args[0] as i32, args[1] as *mut u8),
+        SYSCALL_MLOCK => sys_mlock2(args[0], args[1], 0),
+        SYSCALL_MLOCK2 => sys_mlock2(args[0], args[1], args[2] as u32),
+        SYSCALL_MUNLOCK => sys_munlock(args[0], args[1]),
+        SYSCALL_MLOCKALL => sys_mlockall(args[0] as u32),
+        SYSCALL_MUNLOCKALL => 0,
+        SYSCALL_GET_TIME => sys_gettimeofday(args[0] as *mut u8, args[1] as *mut u8),
         SYSCALL_BRK => sys_brk(args[0]),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),

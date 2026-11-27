@@ -38,6 +38,7 @@ SUITE=~/testsuits-pre-20250615 tools/oscomp/run_official_basic.sh ~/sdcard-rv.im
 
 - `--legacy-image`：复跑 2025 初赛原盘时启用（设置 `oscomp.legacy=1` / `opt/hexixi/oscomp.legacy=1`），开启旧镜像的 `mnt` 处理、脚本回退与 basic PIE 直启；内核默认使用标准路径语义。
 - `--strict`：要求所有选中组正常完成退出，且选中的 `basic` 组均达到 `102/102`。
+- `unixbench` 原脚本串行执行 27 项，采样参数合计 390 s。用 `--timeout 120` 比较矩阵覆盖范围时会截断。完整运行可为该组单独设置更长的宿主机超时。原盘还缺少三个 SHELL 用例依赖的 `sort.src`，可将测试套件的 `scripts/unixbench/sort.src` 放入诊断镜像副本的 `/musl` 和 `/glibc`，保留原脚本的采样参数。
 
 ```bash
 git -C ~/testsuits-pre-20250615 checkout 4b40ee92e8b594fb20e3957ebc2f79ad43aca538
@@ -73,6 +74,7 @@ QEMU_SMP=2 bash tools/oscomp/test_persistent_fs.sh riscv64 /tmp/hexixi-persisten
 ## 5. 已知限制
 
 - EXT4 为只读，根盘写入保存在内存 Overlay（与 `tmpfs` 共享 RAM/4 预算，上限 128 MiB，关机丢失）；持久化数据盘采用 EasyFS（无日志与自动回写），暂不支持可写 EXT4。
-- 网络支持 IPv4；`epoll` 支持水平触发与 `EPOLLONESHOT`（轮询驱动），边沿触发、临时信号掩码与部分 socket 选项（如 `TCP_INFO`）待实现。
+- 网络支持 IPv4 和本地 Unix 套接字。VirtIO 网络仍通过轮询驱动。
 - RISC-V64 SMP 使用全局内核锁串行化内核态，同一进程线程绑定在同一 hart；LoongArch64 仅支持单核。
-- robust futex owner-death 恢复与完整 siginfo 队列待实现。
+- 信号投递支持基础 `siginfo`，实时信号的完整排队语义仍待实现。
+- `mremap` 以现有 SysV 共享内存附件为源映射时返回 `EINVAL`。

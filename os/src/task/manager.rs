@@ -125,6 +125,16 @@ pub(crate) fn invalidate_file_pages(identity: (u64, u64), first_invalid: usize) 
     }
 }
 
+pub(crate) fn has_shared_writable_mapping(identity: (u64, u64)) -> bool {
+    for process in PID2PCB.exclusive_access().values() {
+        let inner = process.inner_exclusive_access();
+        if !inner.is_zombie && inner.memory_set.has_shared_writable_mapping(identity) {
+            return true;
+        }
+    }
+    false
+}
+
 fn path_within_mount(path: &str, target: &str) -> bool {
     path == target
         || path
